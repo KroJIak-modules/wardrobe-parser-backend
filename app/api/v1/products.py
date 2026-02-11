@@ -75,3 +75,5 @@ def delete_product(product_id: int, db: Session = Depends(get_db)) -> None:
         raise HTTPException(status_code=404, detail="Product not found")
     ProductRepository.soft_delete(db, product)
     db.commit()
+
+
