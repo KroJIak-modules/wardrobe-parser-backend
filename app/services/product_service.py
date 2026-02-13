@@ -6,6 +6,7 @@ from app.core.exceptions import ValidationError
 from app.models.product import Product
 from app.repositories.product_repository import ProductRepository
 from app.repositories.site_repository import SiteRepository
+from app.repositories.product_image_repository import ProductImageRepository
 
 
 class ProductService:
@@ -38,19 +39,26 @@ class ProductService:
                     "category": item.get("category"),
                     "price": item.get("price"),
                     "currency": item.get("currency"),
+                    "size": item.get("size"),
+                    "additional_info": item.get("additional_info"),
+                    "size_data": item.get("size_data"),
                     "product_url": item.get("product_url") or external_id,
                     "image_url": item.get("image_url"),
                     "description": item.get("description"),
-                    "raw_data": item.get("raw_data"),
                     "parser_updated_at": now,
                 }
+                image_urls = ProductService._extract_image_urls(item)
                 if existing is None:
-                    ProductRepository.create(db, **payload)
+                    created_product = ProductRepository.create(db, **payload)
+                    if image_urls:
+                        ProductImageRepository.replace_images(db, created_product.id, image_urls)
                     created += 1
                     continue
                 if existing.user_updated_at is not None:
                     continue
                 ProductRepository.update(db, existing, **payload)
+                if image_urls:
+                    ProductImageRepository.replace_images(db, existing.id, image_urls)
                 updated += 1
             db.commit()
         except Exception:
@@ -62,3 +70,11 @@ class ProductService:
     def mark_user_update(db: Session, product: Product) -> None:
         product.user_updated_at = datetime.now(timezone.utc)
         db.flush()
+
+    @staticmethod
+    def _extract_image_urls(item: dict) -> list[str]:
+        images = item.get("image_urls")
+        if isinstance(images, list):
+            return [str(url) for url in images if url]
+        fallback = item.get("image_url")
+        return [fallback] if fallback else []

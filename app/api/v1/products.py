@@ -31,10 +31,12 @@ def list_products(
         filter_key,
         filter_value,
     )
-    return CursorPage(
-        items=[ProductResponse.model_validate(item) for item in items],
-        next_cursor=next_cursor,
-    )
+    responses: list[ProductResponse] = []
+    for item in items:
+        response = ProductResponse.model_validate(item)
+        response.image_urls = [img.url for img in item.images] if item.images else None
+        responses.append(response)
+    return CursorPage(items=responses, next_cursor=next_cursor)
 
 
 @router.get("/{product_id}", response_model=ProductResponse, summary="Get product")
@@ -42,7 +44,9 @@ def get_product(product_id: int, db: Session = Depends(get_db)) -> ProductRespon
     product = ProductRepository.get_by_id(db, product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    return ProductResponse.model_validate(product)
+    response = ProductResponse.model_validate(product)
+    response.image_urls = [img.url for img in product.images] if product.images else None
+    return response
 
 
 @router.post("/", response_model=ProductResponse, status_code=201, summary="Create product")

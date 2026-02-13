@@ -48,6 +48,8 @@ class SiteService:
     def _parse_datetime(value: str | None) -> datetime | None:
         if not value:
             return None
+        if isinstance(value, datetime):
+            return value
         try:
             return datetime.fromisoformat(value)
         except ValueError:
