@@ -16,7 +16,6 @@ class Settings(BaseSettings):
     postgres_port: int = Field(default=5432, env="POSTGRES_PORT")
     postgres_db: str = Field(default="wardrobe", env="POSTGRES_DB")
     cors_allowed_origins: str = Field(default="", env="CORS_ALLOWED_ORIGINS")
-    service_token: str = Field(default="", env="SERVICE_TOKEN")
 
     @model_validator(mode="after")
     def build_database_url(self) -> "Settings":
