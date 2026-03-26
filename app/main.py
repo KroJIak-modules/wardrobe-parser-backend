@@ -28,16 +28,11 @@ def validation_handler(request: object, exc: ValidationError) -> None:
 def integrity_handler(request: object, exc: IntegrityError) -> None:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
-_local_origins = [
-    "http://localhost:10530",
-    "http://127.0.0.1:10530",
-]
-
-_extra_origins = [o.strip() for o in settings.cors_allowed_origins.split(",") if o.strip()]
+_allowed_origins = [o.strip() for o in settings.cors_allowed_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_local_origins + _extra_origins,
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
