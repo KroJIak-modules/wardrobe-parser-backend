@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     postgres_port: int = Field(default=5432, env="POSTGRES_PORT")
     postgres_db: str = Field(default="wardrobe", env="POSTGRES_DB")
     cors_allowed_origins: str = Field(default="", env="CORS_ALLOWED_ORIGINS")
+    app_title: str = Field(default="Wardrobe Parser Backend API", env="APP_TITLE")
+    health_status_value: str = Field(default="ok", env="HEALTH_STATUS_VALUE")
+    cors_allow_credentials: bool = Field(default=True, env="CORS_ALLOW_CREDENTIALS")
+    cors_allow_methods: str = Field(default="*", env="CORS_ALLOW_METHODS")
+    cors_allow_headers: str = Field(default="*", env="CORS_ALLOW_HEADERS")
 
     @model_validator(mode="after")
     def build_database_url(self) -> "Settings":
