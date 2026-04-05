@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette import status
 
+from app.api.v1 import api_router
 from app.core.config import settings
 from app.core.exceptions import IntegrityError, NotFoundError, ValidationError
 
@@ -51,6 +52,7 @@ def create_app() -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": settings.health_status_value}
 
+    app.include_router(api_router)
     _register_exception_handlers(app)
     _configure_cors(app)
     return app
