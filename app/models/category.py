@@ -17,6 +17,7 @@ class ParserCategory(Base):
     slug = Column(String(255), nullable=False)
     parent_id = Column(Integer, ForeignKey("parser_category.id"), nullable=True)
     is_fallback = Column(Boolean, nullable=False, default=False)
+    is_favorite = Column(Boolean, nullable=False, default=False)
 
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -31,6 +32,7 @@ class ParserCategory(Base):
         Index("idx_parser_category_parent_id", "parent_id"),
         Index("idx_parser_category_deleted_at", "deleted_at"),
         Index("idx_parser_category_is_fallback", "is_fallback"),
+        Index("idx_parser_category_is_favorite", "is_favorite"),
     )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import math
 import re
 from typing import Any
@@ -12,7 +13,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import ParserSupplier
+from app.core.config import settings as app_settings
+from app.models import ParserSource, ParserSupplier
 from app.repositories import ParserPricingSettingsRepository, ParserSourceRepository, ParserSupplierRepository
 from app.schemas.parser import (
     PricingSettingsResponse,
@@ -21,44 +23,157 @@ from app.schemas.parser import (
     PricingSupplierResponse,
     PricingSupplierUpdateRequest,
 )
+from app.services.settings.bybit_rate_provider import BybitP2PRateProvider
 
 _FORMULA_LINES = [
-    "CDT_EUR = max(0, (SP_EUR - THR_EUR)) * DUTY",
-    "STEP = ceil((WEIGHT_G * WT) / 500)",
-    "STC_RUB = SSR[SUPPLIER][STEP]",
-    "BSC_RUB = buyout surcharge in source currency converted to RUB",
-    "SP_AFTER_PROMO_RUB = SP_RUB * PROMO",
-    "TP_RUB = SP_AFTER_PROMO_RUB + BSC_RUB + CDT_RUB + SDC_RUB + STC_RUB",
-    "FP_RUB = ceil(TP_RUB * MP)",
+    "BFX = BBR + BEX",
+    "SPU = convert(SP, USD/EUR/GBP -> USD)",
+    "SPR = SPU * BFX",
+    "BUY = SPR * PRM + BSC",
+    "PFR = BUY * PFRP",
+    "INS = insurance tier by SPE",
+    "CDR = ((max(0, SPE - THR) * DUT) * (1 + CPR)) * (E2U * BFX) + CFX",
+    "SVC = service fee tier by BUY",
+    "SUB = BUY + PFR + INS + CDR + SDC + SSR[SUP,STP] + SVC",
+    "TAX = SUB * TXR",
+    "FPR = ceil(SUB + TAX)",
 ]
 
 _FORMULA_LATEX = (
-    r"\left\lceil\left(SP_{RUB}\cdot PROMO + BSC_{RUB} + \max(0,SP_{EUR}-THR_{EUR})\cdot DUTY\cdot EUR2RUB + "
-    r"SDC_{RUB} + SSR_{SUPPLIER,\left\lceil\frac{WEIGHT_G\cdot WT}{500}\right\rceil}\right)\cdot MP\right\rceil"
+    r"FPR=\left\lceil\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SDC+SSR[SUP,STP]+SVC\right)\cdot MP+\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SDC+SSR[SUP,STP]+SVC\right)\cdot MP\right)\cdot TXR\right\rceil"
 )
 
 _FORMULA_LEGEND = [
-    {"key": "SP", "description": "Seller price (исходная цена товара)"},
-    {"key": "SP_EUR", "description": "Цена товара, приведенная к EUR"},
-    {"key": "SP_RUB", "description": "Цена товара, приведенная к RUB"},
-    {"key": "THR_EUR", "description": "Порог для расчета пошлины в EUR"},
-    {"key": "DUTY", "description": "Ставка пошлины"},
-    {"key": "EUR2RUB", "description": "Курс EUR к RUB"},
-    {"key": "CDT_EUR", "description": "Пошлина в EUR"},
-    {"key": "CDT_RUB", "description": "Пошлина в RUB"},
-    {"key": "SDC_RUB", "description": "Доставка от продавца в RUB"},
-    {"key": "STC_RUB", "description": "Транспортировка поставщиком в RUB"},
-    {"key": "BSC_RUB", "description": "Доплата к стоимости выкупа в RUB"},
-    {"key": "MP", "description": "Коэффициент наценки"},
-    {"key": "WT", "description": "Коэффициент погрешности веса"},
-    {"key": "WEIGHT_G", "description": "Вес товара в граммах"},
-    {"key": "STEP", "description": "Вычисленный номер шага веса для SSR"},
-    {"key": "PROMO", "description": "Коэффициент промокода"},
-    {"key": "SUPPLIER", "description": "Поставщик, привязанный к источнику магазина"},
-    {"key": "SSR[SUPPLIER][STEP]", "description": "Тариф по таблице поставщика и шагу веса"},
-    {"key": "FP_RUB", "description": "Финальная цена для витрины"},
+    {"key": "SP", "description": "Цена товара в исходной валюте магазина."},
+    {"key": "SPU", "description": "Цена товара в USD."},
+    {"key": "SPE", "description": "Цена товара в EUR (для таможни и страхования)."},
+    {"key": "SPR", "description": "Цена товара в RUB по курсу Bybit."},
+    {"key": "BBR", "description": "Курс выбранного Bybit-ордера/бакета для суммы этого товара (USDT/RUB)."},
+    {"key": "BEX", "description": "Добавка к курсу Bybit."},
+    {"key": "BFX", "description": "Итоговый курс USDT/RUB: BBR + BEX."},
+    {"key": "E2U", "description": "Коэффициент EUR -> USD."},
+    {"key": "G2U", "description": "Коэффициент GBP -> USD."},
+    {"key": "PRM", "description": "Промо-коэффициент источника."},
+    {"key": "BSC", "description": "Доплата к выкупу."},
+    {"key": "BUY", "description": "Стоимость выкупа товара в RUB."},
+    {"key": "PFRP", "description": "Ставка комиссии платежки."},
+    {"key": "PFR", "description": "Комиссия платежки в RUB."},
+    {"key": "THR", "description": "Порог таможни в EUR."},
+    {"key": "DUT", "description": "Ставка пошлины на превышение порога."},
+    {"key": "CPR", "description": "Ставка обработки пошлины."},
+    {"key": "CFX", "description": "Фиксированная часть таможни в RUB."},
+    {"key": "CDR", "description": "Таможня в RUB."},
+    {"key": "SDC", "description": "Локальная доставка в RUB."},
+    {"key": "SSR", "description": "Доставка поставщика."},
+    {"key": "SUP", "description": "Поставщик."},
+    {"key": "STP", "description": "Шаг по 500г."},
+    {"key": "INS", "description": "Страховка в RUB."},
+    {"key": "SVC", "description": "Комиссия сервиса в RUB."},
+    {"key": "SUB", "description": "Сумма до налога в RUB."},
+    {"key": "TXR", "description": "Ставка налога."},
+    {"key": "TAX", "description": "Налог в RUB."},
+    {"key": "MP", "description": "Множитель наценки."},
+    {"key": "FPR", "description": "Финальная цена в RUB."},
 ]
 
+_DEFAULT_INSURANCE_RULES: list[dict[str, Any]] = [
+    {"min_eur": 0.0, "max_eur": 300.0, "mode": "percent", "value": 0.01},
+    {"min_eur": 300.0, "max_eur": 520.0, "mode": "fixed_rub", "value": 1000.0},
+    {"min_eur": 520.0, "max_eur": None, "mode": "fixed_rub", "value": 1300.0},
+]
+
+_DEFAULT_SERVICE_FEE_RULES: list[dict[str, Any]] = [
+    {"min_rub": 0.0, "max_rub": 7000.0, "mode": "percent", "value": 0.25},
+    {"min_rub": 7000.0, "max_rub": 10000.0, "mode": "fixed_rub", "value": 2500.0},
+    {"min_rub": 10000.0, "max_rub": 17000.0, "mode": "fixed_rub", "value": 3000.0},
+    {"min_rub": 17000.0, "max_rub": 20000.0, "mode": "fixed_rub", "value": 3500.0},
+    {"min_rub": 20000.0, "max_rub": 30000.0, "mode": "percent", "value": 0.20},
+    {"min_rub": 30000.0, "max_rub": 40000.0, "mode": "fixed_rub", "value": 6000.0},
+    {"min_rub": 40000.0, "max_rub": None, "mode": "percent", "value": 0.15},
+]
+
+_DEFAULT_SHIPPING_RULES: dict[str, dict[str, list[dict[str, Any]]]] = {
+    "US": {
+        "normal": [
+            {"kg": 0.5, "rub": 1400.0},
+            {"kg": 1.0, "rub": 1650.0},
+            {"kg": 1.5, "rub": 2250.0},
+            {"kg": 2.0, "rub": 2900.0},
+            {"kg": 2.5, "rub": 3500.0},
+            {"kg": 3.0, "rub": 4100.0},
+        ],
+        "alt": [
+            {"kg": 0.5, "rub": 1700.0},
+            {"kg": 1.0, "rub": 3350.0},
+            {"kg": 1.5, "rub": 4100.0},
+            {"kg": 2.0, "rub": 4950.0},
+            {"kg": 2.5, "rub": 5650.0},
+            {"kg": 3.0, "rub": 6500.0},
+        ],
+    },
+    "EU": {
+        "normal": [
+            {"kg": 0.5, "rub": 1100.0},
+            {"kg": 1.0, "rub": 1500.0},
+            {"kg": 1.5, "rub": 1900.0},
+            {"kg": 2.0, "rub": 2300.0},
+            {"kg": 2.5, "rub": 2700.0},
+            {"kg": 3.0, "rub": 3150.0},
+        ],
+        "alt": [
+            {"kg": 0.5, "rub": 2300.0},
+            {"kg": 1.0, "rub": 2750.0},
+            {"kg": 1.5, "rub": 3750.0},
+            {"kg": 2.0, "rub": 4800.0},
+            {"kg": 2.5, "rub": 5800.0},
+            {"kg": 3.0, "rub": 6800.0},
+        ],
+    },
+    "UK": {
+        "normal": [
+            {"kg": 0.5, "rub": 3400.0},
+            {"kg": 1.0, "rub": 3900.0},
+            {"kg": 1.5, "rub": 4400.0},
+            {"kg": 2.0, "rub": 4900.0},
+            {"kg": 2.5, "rub": 5450.0},
+            {"kg": 3.0, "rub": 5950.0},
+        ],
+        "alt": [],
+    },
+}
+
+_PRODUCTION_SUPPLIER_PRESETS: list[dict[str, Any]] = [
+    {
+        "legacy_keys": ["us-express-test", "us-main"],
+        "key": "us-main",
+        "name": "US Main",
+        "country_code": "US",
+        "country_name": "United States",
+        "rate_currency": "RUB",
+        "rate_per_500g_rub": 665.0,
+        "max_step_500g": 120,
+    },
+    {
+        "legacy_keys": ["eu-priority-test", "eu-main"],
+        "key": "eu-main",
+        "name": "EU Main",
+        "country_code": "EU",
+        "country_name": "Europe",
+        "rate_currency": "RUB",
+        "rate_per_500g_rub": 840.0,
+        "max_step_500g": 120,
+    },
+    {
+        "legacy_keys": ["eu-economy-test", "eu-alt"],
+        "key": "eu-alt",
+        "name": "EU Alt",
+        "country_code": "EU",
+        "country_name": "Europe",
+        "rate_currency": "RUB",
+        "rate_per_500g_rub": 630.0,
+        "max_step_500g": 120,
+    },
+]
 
 @dataclass(slots=True)
 class ProductPricingComputation:
@@ -90,6 +205,68 @@ class PricingSettingsService:
             )
             self.db.flush()
             changed = True
+        for preset in _PRODUCTION_SUPPLIER_PRESETS:
+            canonical = self.supplier_repo.get_by_key(str(preset["key"]))
+            legacy_items = [
+                item
+                for item in (self.supplier_repo.get_by_key(str(raw_key)) for raw_key in preset["legacy_keys"])
+                if item is not None
+            ]
+            target = canonical or (legacy_items[0] if legacy_items else None)
+            if target is None:
+                target = self.supplier_repo.create(
+                    key=str(preset["key"]),
+                    name=str(preset["name"]),
+                    country_code=str(preset["country_code"]),
+                    country_name=str(preset["country_name"]),
+                    rate_currency=str(preset["rate_currency"]),
+                )
+                self.supplier_repo.flush()
+                changed = True
+
+            for legacy in legacy_items:
+                if legacy.id == target.id:
+                    continue
+                self.db.query(ParserSource).filter(ParserSource.supplier_id == legacy.id).update(
+                    {ParserSource.supplier_id: target.id},
+                    synchronize_session=False,
+                )
+                self.db.delete(legacy)
+                changed = True
+
+            if target.key != preset["key"]:
+                target.key = str(preset["key"])
+                changed = True
+            if target.name != preset["name"]:
+                target.name = str(preset["name"])
+                changed = True
+            if target.country_code != preset["country_code"]:
+                target.country_code = str(preset["country_code"])
+                changed = True
+            if target.country_name != preset["country_name"]:
+                target.country_name = str(preset["country_name"])
+                changed = True
+            normalized_currency = self._normalize_currency(str(preset["rate_currency"]), default="RUB")
+            if target.rate_currency != normalized_currency:
+                target.rate_currency = normalized_currency
+                changed = True
+
+            current_rates = sorted(target.shipping_rates, key=lambda item: item.step_500g)
+            current_rate = 0.0
+            if current_rates:
+                first_step = max(1, int(current_rates[0].step_500g))
+                current_rate = float(current_rates[0].rate_rub) / float(first_step)
+            current_max_step = int(current_rates[-1].step_500g) if current_rates else 0
+            target_rate = float(preset["rate_per_500g_rub"])
+            target_max_step = int(preset["max_step_500g"])
+            if abs(current_rate - target_rate) > 1e-6 or current_max_step != target_max_step:
+                self.supplier_repo.ensure_linear_rates(
+                    supplier_id=target.id,
+                    per_500g_rub=target_rate,
+                    max_step_500g=target_max_step,
+                )
+                changed = True
+
         return changed
 
     @staticmethod
@@ -117,34 +294,340 @@ class PricingSettingsService:
             return float(value_rub) / float(usd_to_rub) if usd_to_rub > 0 else 0.0
         return float(value_rub) / float(eur_to_rub) if eur_to_rub > 0 else 0.0
 
-    def get_settings(self) -> PricingSettingsResponse:
+    @staticmethod
+    def _effective_fx_rates(
+        *,
+        bybit_usdt_to_rub: float,
+        bybit_extra_rub: float,
+        eur_to_usd_rate: float,
+    ) -> tuple[float, float]:
+        usd_to_rub = max(0.0, float(bybit_usdt_to_rub) + float(bybit_extra_rub))
+        eur_to_rub = max(0.0, float(eur_to_usd_rate) * usd_to_rub)
+        return usd_to_rub, eur_to_rub
+
+    @classmethod
+    def _effective_rates_from_entity(cls, entity) -> tuple[float, float]:
+        bybit = float(getattr(entity, "bybit_usdt_to_rub", 95.0) or 95.0)
+        extra = float(getattr(entity, "bybit_extra_rub", 1.0) or 1.0)
+        eur_to_usd = float(getattr(entity, "eur_to_usd_rate", 1.18) or 1.18)
+        return cls._effective_fx_rates(
+            bybit_usdt_to_rub=bybit,
+            bybit_extra_rub=extra,
+            eur_to_usd_rate=eur_to_usd,
+        )
+
+    @classmethod
+    def _effective_rates_from_settings(cls, settings: PricingSettingsResponse) -> tuple[float, float]:
+        return cls._effective_fx_rates(
+            bybit_usdt_to_rub=float(settings.bybit_usdt_to_rub),
+            bybit_extra_rub=float(settings.bybit_extra_rub),
+            eur_to_usd_rate=float(settings.eur_to_usd_rate),
+        )
+
+    @staticmethod
+    def _normalize_rule_mode(raw_mode: str | None, *, default: str = "fixed_rub") -> str:
+        mode = (raw_mode or default).strip().lower()
+        if mode not in {"fixed_rub", "percent"}:
+            return default
+        return mode
+
+    @staticmethod
+    def _normalize_range_rules(
+        raw_rules: Any,
+        *,
+        min_key: str,
+        max_key: str,
+        default_rules: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(raw_rules, list):
+            raw_rules = default_rules
+        normalized: list[dict[str, Any]] = []
+        for row in raw_rules:
+            if not isinstance(row, dict):
+                continue
+            min_raw = PricingSettingsService._safe_float(row.get(min_key))
+            max_raw = PricingSettingsService._safe_float(row.get(max_key))
+            mode = PricingSettingsService._normalize_rule_mode(str(row.get("mode") or "fixed_rub"))
+            value = max(0.0, float(PricingSettingsService._safe_float(row.get("value")) or 0.0))
+            normalized.append(
+                {
+                    min_key: min_raw if min_raw is None else float(min_raw),
+                    max_key: max_raw if max_raw is None else float(max_raw),
+                    "mode": mode,
+                    "value": value,
+                }
+            )
+        if not normalized:
+            return [dict(item) for item in default_rules]
+        normalized.sort(
+            key=lambda item: (
+                float(item.get(min_key) or 0.0),
+                float(item.get(max_key) or float("inf")) if item.get(max_key) is not None else float("inf"),
+            )
+        )
+        return normalized
+
+    @staticmethod
+    def _normalize_shipping_rows(rows: Any) -> list[dict[str, float]]:
+        if not isinstance(rows, list):
+            return []
+        normalized: list[dict[str, float]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            kg = PricingSettingsService._safe_float(row.get("kg"))
+            rub = PricingSettingsService._safe_float(row.get("rub"))
+            if kg is None or kg <= 0:
+                continue
+            normalized.append({"kg": float(kg), "rub": max(0.0, float(rub or 0.0))})
+        normalized.sort(key=lambda item: item["kg"])
+        return normalized
+
+    @staticmethod
+    def _normalize_shipping_rules(raw_rules: Any) -> dict[str, dict[str, list[dict[str, float]]]]:
+        rules = raw_rules if isinstance(raw_rules, dict) else {}
+        output: dict[str, dict[str, list[dict[str, float]]]] = {}
+        for region in ("US", "EU", "UK"):
+            region_payload = rules.get(region) if isinstance(rules.get(region), dict) else {}
+            output[region] = {
+                "normal": PricingSettingsService._normalize_shipping_rows(region_payload.get("normal")),
+                "alt": PricingSettingsService._normalize_shipping_rows(region_payload.get("alt")),
+            }
+        # Fill gaps by defaults to avoid broken calculations
+        for region, region_default in _DEFAULT_SHIPPING_RULES.items():
+            if not output[region]["normal"]:
+                output[region]["normal"] = [dict(row) for row in region_default.get("normal", [])]
+            if region in {"US", "EU"} and not output[region]["alt"]:
+                output[region]["alt"] = [dict(row) for row in region_default.get("alt", [])]
+            if region == "UK":
+                output[region]["alt"] = []
+        return output
+
+    @classmethod
+    def _coerce_settings_defaults(cls, entity) -> bool:
+        changed = False
+
+        if getattr(entity, "bybit_usdt_to_rub", None) is None:
+            entity.bybit_usdt_to_rub = 95.0
+            changed = True
+        if getattr(entity, "bybit_extra_rub", None) is None:
+            entity.bybit_extra_rub = 1.0
+            changed = True
+        if not isinstance(getattr(entity, "bybit_bucket_rates", None), list):
+            entity.bybit_bucket_rates = []
+            changed = True
+        if getattr(entity, "eur_to_usd_rate", None) is None:
+            entity.eur_to_usd_rate = 1.18
+            changed = True
+        if getattr(entity, "gbp_to_usd_rate", None) is None:
+            entity.gbp_to_usd_rate = 1.4
+            changed = True
+        if getattr(entity, "payment_fee_rate", None) is None:
+            entity.payment_fee_rate = 0.02
+            changed = True
+        if getattr(entity, "customs_processing_rate", None) is None:
+            entity.customs_processing_rate = 0.08
+            changed = True
+        if getattr(entity, "customs_fixed_rub", None) is None:
+            entity.customs_fixed_rub = 540.0
+            changed = True
+        if getattr(entity, "shipping_alt_threshold_eur", None) is None:
+            entity.shipping_alt_threshold_eur = 300.0
+            changed = True
+        if getattr(entity, "tax_rate", None) is None:
+            entity.tax_rate = 0.06
+            changed = True
+
+        normalized_insurance = cls._normalize_range_rules(
+            getattr(entity, "insurance_rules", None),
+            min_key="min_eur",
+            max_key="max_eur",
+            default_rules=_DEFAULT_INSURANCE_RULES,
+        )
+        if normalized_insurance != (getattr(entity, "insurance_rules", None) or []):
+            entity.insurance_rules = normalized_insurance
+            changed = True
+
+        normalized_fee = cls._normalize_range_rules(
+            getattr(entity, "service_fee_rules", None),
+            min_key="min_rub",
+            max_key="max_rub",
+            default_rules=_DEFAULT_SERVICE_FEE_RULES,
+        )
+        if normalized_fee != (getattr(entity, "service_fee_rules", None) or []):
+            entity.service_fee_rules = normalized_fee
+            changed = True
+
+        normalized_shipping = cls._normalize_shipping_rules(getattr(entity, "shipping_rules", None))
+        if normalized_shipping != (getattr(entity, "shipping_rules", None) or {}):
+            entity.shipping_rules = normalized_shipping
+            changed = True
+
+        return changed
+
+    @staticmethod
+    def _refresh_bybit_rate(entity) -> tuple[bool, str, Any | None, str | None]:
+        if not app_settings.pricing_bybit_rate_auto_enabled:
+            return False, "disabled", None, None
+        try:
+            snapshot = BybitP2PRateProvider.get_snapshot(
+                fiat=app_settings.pricing_bybit_fiat,
+                asset=app_settings.pricing_bybit_asset,
+                timeout_sec=app_settings.pricing_bybit_rate_timeout_sec,
+                cache_sec=app_settings.pricing_bybit_rate_cache_sec,
+                ads_limit=app_settings.pricing_bybit_ads_limit,
+                bucket_step_usdt=app_settings.pricing_bybit_bucket_step_usdt,
+                bucket_max_usdt=app_settings.pricing_bybit_bucket_max_usdt,
+                outlier_max_deviation_ratio=app_settings.pricing_bybit_outlier_max_deviation_ratio,
+            )
+            rate = float(snapshot.representative_rate)
+        except Exception as exc:
+            error_text = str(exc) or "Bybit fetch failed"
+            if getattr(entity, "bybit_last_error", None) != error_text:
+                entity.bybit_last_error = error_text[:1024]
+                return True, "fallback_stored", None, error_text
+            return False, "fallback_stored", None, error_text
+        if rate <= 0:
+            error_text = "Bybit returned non-positive rate"
+            if getattr(entity, "bybit_last_error", None) != error_text:
+                entity.bybit_last_error = error_text
+                return True, "fallback_stored", None, error_text
+            return False, "fallback_stored", None, error_text
+        bucket_rates = PricingSettingsService._normalize_bybit_bucket_rates(
+            getattr(snapshot, "bucket_quotes", None),
+            step_usdt=int(app_settings.pricing_bybit_bucket_step_usdt),
+            max_usdt=int(app_settings.pricing_bybit_bucket_max_usdt),
+        )
+        current = float(getattr(entity, "bybit_usdt_to_rub", 0.0) or 0.0)
+        changed = False
+        if abs(current - rate) > 1e-6:
+            entity.bybit_usdt_to_rub = float(rate)
+            changed = True
+        if (getattr(entity, "bybit_bucket_rates", None) or []) != bucket_rates:
+            entity.bybit_bucket_rates = bucket_rates
+            changed = True
+        if getattr(entity, "bybit_last_error", None):
+            entity.bybit_last_error = None
+            changed = True
+        entity.bybit_last_updated_at = datetime.now(timezone.utc)
+        changed = True
+        if not changed:
+            return False, "live_cached", snapshot, None
+        return True, "live_updated", snapshot, None
+
+    def get_settings(self, *, refresh_bybit: bool = True) -> PricingSettingsResponse:
         bootstrap_changed = self._bootstrap_suppliers()
         entity, created = self.repo.get_or_create_default()
-        if created or bootstrap_changed:
+        defaults_changed = self._coerce_settings_defaults(entity)
+        bybit_status = "skipped"
+        bybit_warning = None
+        bybit_snapshot = None
+        bybit_error = None
+        if refresh_bybit:
+            bybit_changed, bybit_status, bybit_snapshot, bybit_error = self._refresh_bybit_rate(entity)
+            if bybit_status == "fallback_stored":
+                bybit_warning = "WARN: Bybit временно недоступен, используется сохраненный курс."
+                if bybit_error:
+                    bybit_warning = f"{bybit_warning} Причина: {bybit_error}"
+        else:
+            bybit_changed = False
+            bybit_snapshot = None
+            bybit_error = str(getattr(entity, "bybit_last_error", "") or "") or None
+            if bybit_error:
+                bybit_warning = f"WARN: Bybit временно недоступен, используется сохраненный курс. Причина: {bybit_error}"
+        if created or bootstrap_changed or defaults_changed or bybit_changed:
             self.db.commit()
             self.db.refresh(entity)
         suppliers = self.supplier_repo.list_all_with_rates()
-        return self._to_response(entity, suppliers=suppliers)
+        return self._to_response(
+            entity,
+            suppliers=suppliers,
+            bybit_rate_status=bybit_status,
+            bybit_rate_warning=bybit_warning,
+            bybit_snapshot=bybit_snapshot,
+            bybit_last_error=bybit_error,
+        )
 
     def update_settings(self, payload: PricingSettingsUpdateRequest) -> PricingSettingsResponse:
-        self._bootstrap_suppliers()
+        bootstrap_changed = self._bootstrap_suppliers()
         entity, created = self.repo.get_or_create_default()
         patch = payload.model_dump(exclude_none=True)
+        for forbidden_key in ("usd_to_rub", "eur_to_rub", "bybit_usdt_to_rub"):
+            patch.pop(forbidden_key, None)
         if "customs_threshold_currency" in patch:
             patch["customs_threshold_currency"] = self._normalize_currency(
                 patch.get("customs_threshold_currency"),
                 default=self._normalize_currency(getattr(entity, "customs_threshold_currency", None), default="EUR"),
             )
+        if "insurance_rules" in patch:
+            patch["insurance_rules"] = self._normalize_range_rules(
+                patch.get("insurance_rules"),
+                min_key="min_eur",
+                max_key="max_eur",
+                default_rules=_DEFAULT_INSURANCE_RULES,
+            )
+        if "service_fee_rules" in patch:
+            patch["service_fee_rules"] = self._normalize_range_rules(
+                patch.get("service_fee_rules"),
+                min_key="min_rub",
+                max_key="max_rub",
+                default_rules=_DEFAULT_SERVICE_FEE_RULES,
+            )
+        if "shipping_rules" in patch:
+            patch["shipping_rules"] = self._normalize_shipping_rules(patch.get("shipping_rules"))
         for key, value in patch.items():
             setattr(entity, key, value)
+        defaults_changed = self._coerce_settings_defaults(entity)
         self.db.commit()
-        if created or patch:
+        if created or patch or defaults_changed or bootstrap_changed:
             self.db.refresh(entity)
         suppliers = self.supplier_repo.list_all_with_rates()
         return self._to_response(entity, suppliers=suppliers)
 
     @staticmethod
-    def _to_response(entity, *, suppliers: list[ParserSupplier]) -> PricingSettingsResponse:
+    def _to_response(
+        entity,
+        *,
+        suppliers: list[ParserSupplier],
+        bybit_rate_status: str = "unknown",
+        bybit_rate_warning: str | None = None,
+        bybit_snapshot: Any | None = None,
+        bybit_last_error: str | None = None,
+    ) -> PricingSettingsResponse:
+        normalized_insurance = PricingSettingsService._normalize_range_rules(
+            getattr(entity, "insurance_rules", None),
+            min_key="min_eur",
+            max_key="max_eur",
+            default_rules=_DEFAULT_INSURANCE_RULES,
+        )
+        normalized_service_fee = PricingSettingsService._normalize_range_rules(
+            getattr(entity, "service_fee_rules", None),
+            min_key="min_rub",
+            max_key="max_rub",
+            default_rules=_DEFAULT_SERVICE_FEE_RULES,
+        )
+        normalized_shipping = PricingSettingsService._normalize_shipping_rules(getattr(entity, "shipping_rules", None))
+        bybit_bucket_rates = PricingSettingsService._normalize_bybit_bucket_rates(
+            getattr(entity, "bybit_bucket_rates", None),
+            step_usdt=int(app_settings.pricing_bybit_bucket_step_usdt),
+            max_usdt=int(app_settings.pricing_bybit_bucket_max_usdt),
+        )
+        if not bybit_bucket_rates:
+            bybit_bucket_rates = PricingSettingsService._normalize_bybit_bucket_rates(
+                getattr(bybit_snapshot, "bucket_quotes", None),
+                step_usdt=int(app_settings.pricing_bybit_bucket_step_usdt),
+                max_usdt=int(app_settings.pricing_bybit_bucket_max_usdt),
+            )
+        entity_last_updated = getattr(entity, "bybit_last_updated_at", None)
+        bybit_last_updated_at = entity_last_updated.isoformat() if entity_last_updated else None
+        if bybit_last_updated_at is None:
+            bybit_last_updated_at = PricingSettingsService._format_epoch_iso(
+                PricingSettingsService._safe_float(getattr(bybit_snapshot, "fetched_at", None))
+            )
+        bybit_last_error_value = bybit_last_error or str(getattr(entity, "bybit_last_error", "") or "") or None
+        if bybit_last_error_value is None and bybit_rate_status == "fallback_stored":
+            bybit_last_error_value = "Bybit fetch failed"
+        effective_usd_to_rub, effective_eur_to_rub = PricingSettingsService._effective_rates_from_entity(entity)
         return PricingSettingsResponse(
             markup_multiplier=float(entity.markup_multiplier),
             weight_tolerance=float(entity.weight_tolerance),
@@ -156,13 +639,32 @@ class PricingSettingsService:
             ),
             customs_duty_rate=float(entity.customs_duty_rate),
             seller_delivery_rub=float(entity.seller_delivery_rub),
-            usd_to_rub=float(entity.usd_to_rub),
-            eur_to_rub=float(entity.eur_to_rub),
+            bybit_usdt_to_rub=float(getattr(entity, "bybit_usdt_to_rub", 95.0) or 95.0),
+            bybit_extra_rub=float(getattr(entity, "bybit_extra_rub", 1.0)),
+            eur_to_usd_rate=float(getattr(entity, "eur_to_usd_rate", 1.18)),
+            gbp_to_usd_rate=float(getattr(entity, "gbp_to_usd_rate", 1.4)),
+            payment_fee_rate=float(getattr(entity, "payment_fee_rate", 0.02)),
+            customs_processing_rate=float(getattr(entity, "customs_processing_rate", 0.08)),
+            customs_fixed_rub=float(getattr(entity, "customs_fixed_rub", 540.0)),
+            shipping_alt_threshold_eur=float(getattr(entity, "shipping_alt_threshold_eur", 300.0)),
+            tax_rate=float(getattr(entity, "tax_rate", 0.06)),
+            insurance_rules=normalized_insurance,
+            service_fee_rules=normalized_service_fee,
+            shipping_rules=normalized_shipping,
+            bybit_rate_status=bybit_rate_status,
+            bybit_rate_warning=bybit_rate_warning,
+            bybit_bucket_step_usdt=int(app_settings.pricing_bybit_bucket_step_usdt),
+            bybit_bucket_max_usdt=int(app_settings.pricing_bybit_bucket_max_usdt),
+            bybit_bucket_rates=bybit_bucket_rates,
+            bybit_worker_auto_enabled=bool(app_settings.pricing_bybit_rate_auto_enabled),
+            bybit_worker_interval_sec=int(app_settings.pricing_bybit_worker_interval_sec),
+            bybit_last_updated_at=bybit_last_updated_at,
+            bybit_last_error=bybit_last_error_value,
             suppliers=[
                 PricingSettingsService._supplier_to_response(
                     item,
-                    usd_to_rub=float(entity.usd_to_rub),
-                    eur_to_rub=float(entity.eur_to_rub),
+                    usd_to_rub=effective_usd_to_rub,
+                    eur_to_rub=effective_eur_to_rub,
                 )
                 for item in suppliers
             ],
@@ -213,6 +715,7 @@ class PricingSettingsService:
 
         patch = payload.model_dump(exclude_none=True)
         settings_entity, _ = self.repo.get_or_create_default()
+        usd_to_rub_effective, eur_to_rub_effective = self._effective_rates_from_entity(settings_entity)
         for key in ("name", "country_code", "country_name"):
             if key in patch:
                 setattr(supplier, key, patch[key])
@@ -234,8 +737,8 @@ class PricingSettingsService:
             target_rate_per_500g = self._to_rub(
                 float(patch.get("rate_per_500g_value")),
                 active_currency,
-                usd_to_rub=float(settings_entity.usd_to_rub),
-                eur_to_rub=float(settings_entity.eur_to_rub),
+                usd_to_rub=usd_to_rub_effective,
+                eur_to_rub=eur_to_rub_effective,
             )
         else:
             target_rate_per_500g = float(patch.get("rate_per_500g_rub", current_rate_per_500g))
@@ -254,8 +757,8 @@ class PricingSettingsService:
         self.db.refresh(refreshed)
         return self._supplier_to_response(
             refreshed,
-            usd_to_rub=float(settings_entity.usd_to_rub),
-            eur_to_rub=float(settings_entity.eur_to_rub),
+            usd_to_rub=usd_to_rub_effective,
+            eur_to_rub=eur_to_rub_effective,
         )
 
     def create_supplier(self, payload: PricingSupplierCreateRequest) -> PricingSupplierResponse:
@@ -293,11 +796,12 @@ class PricingSettingsService:
         )
         self.supplier_repo.flush()
         settings_entity, _ = self.repo.get_or_create_default()
+        usd_to_rub_effective, eur_to_rub_effective = self._effective_rates_from_entity(settings_entity)
         per_500g_rub = self._to_rub(
             float(payload.rate_per_500g_value),
             self._normalize_currency(payload.rate_currency, default="RUB"),
-            usd_to_rub=float(settings_entity.usd_to_rub),
-            eur_to_rub=float(settings_entity.eur_to_rub),
+            usd_to_rub=usd_to_rub_effective,
+            eur_to_rub=eur_to_rub_effective,
         )
         self.supplier_repo.ensure_linear_rates(
             supplier_id=supplier.id,
@@ -310,8 +814,8 @@ class PricingSettingsService:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Не удалось создать поставщика")
         return self._supplier_to_response(
             created,
-            usd_to_rub=float(settings_entity.usd_to_rub),
-            eur_to_rub=float(settings_entity.eur_to_rub),
+            usd_to_rub=usd_to_rub_effective,
+            eur_to_rub=eur_to_rub_effective,
         )
 
     def delete_supplier(self, supplier_id: int) -> dict[str, str]:
@@ -339,7 +843,8 @@ class PricingSettingsService:
     def _resolve_supplier_rate(
         *,
         supplier_id: int | None,
-        shipping_steps: int,
+        billable_kg: float,
+        use_alt_rate: bool,
         settings: PricingSettingsResponse,
     ) -> tuple[float, dict[str, Any]]:
         suppliers = settings.suppliers or []
@@ -347,31 +852,121 @@ class PricingSettingsService:
         if selected is None and suppliers:
             selected = next((item for item in suppliers if item.key == "default"), suppliers[0])
         if selected is None:
-            return 0.0, {"supplier_id": supplier_id, "supplier_key": None, "supplier_name": None, "rate_mode": "missing_supplier"}
-
-        rates = {int(item.step_500g): float(item.rate_rub) for item in selected.rates}
-        if shipping_steps in rates:
-            return rates[shipping_steps], {
-                "supplier_id": selected.id,
-                "supplier_key": selected.key,
-                "supplier_name": selected.name,
-                "rate_mode": "exact_step",
-                "supplier_rate_step_500g": shipping_steps,
+            return 0.0, {
+                "supplier_id": supplier_id,
+                "supplier_key": None,
+                "supplier_name": None,
+                "shipping_region": "EU",
+                "shipping_mode": "normal",
+                "shipping_billable_kg": round(float(billable_kg), 4),
+                "shipping_rate_mode": "missing_supplier",
             }
 
-        rate_per_500g = float(selected.rate_per_500g_rub)
-        if rate_per_500g <= 0 and rates:
-            smallest_step = min(rates.keys())
-            rate_per_500g = float(rates[smallest_step]) / float(max(1, smallest_step))
-        estimated = float(shipping_steps) * max(0.0, rate_per_500g)
-        return estimated, {
+        region = PricingSettingsService._infer_shipping_region(selected.country_code)
+        mode = "alt" if use_alt_rate and region in {"US", "EU"} else "normal"
+        region_rules = (settings.shipping_rules or {}).get(region) or {}
+        rows = region_rules.get(mode) or []
+        if not rows and mode == "alt":
+            rows = region_rules.get("normal") or []
+
+        shipping_rub, shipping_meta = PricingSettingsService._resolve_tariff_by_weight(
+            rows=rows,
+            billable_kg=billable_kg,
+        )
+        return shipping_rub, {
             "supplier_id": selected.id,
             "supplier_key": selected.key,
             "supplier_name": selected.name,
-            "rate_mode": "estimated_linear",
-            "supplier_rate_step_500g": shipping_steps,
-            "supplier_rate_per_500g_rub": round(rate_per_500g, 4),
+            "shipping_region": region,
+            "shipping_mode": mode,
+            "shipping_billable_kg": round(float(billable_kg), 4),
+            **shipping_meta,
         }
+
+    @staticmethod
+    def _infer_shipping_region(country_code: str | None) -> str:
+        raw = (country_code or "").strip().upper()
+        if raw in {"US", "USA"}:
+            return "US"
+        if raw in {"GB", "UK", "GBR", "UNITED KINGDOM"}:
+            return "UK"
+        return "EU"
+
+    @staticmethod
+    def _resolve_tariff_by_weight(*, rows: list[dict[str, Any]], billable_kg: float) -> tuple[float, dict[str, Any]]:
+        normalized_rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            kg = PricingSettingsService._safe_float(row.get("kg"))
+            rub = PricingSettingsService._safe_float(row.get("rub"))
+            if kg is None or kg <= 0:
+                continue
+            normalized_rows.append((float(kg), max(0.0, float(rub or 0.0))))
+        normalized_rows.sort(key=lambda item: item[0])
+        if not normalized_rows:
+            return 0.0, {"shipping_rate_mode": "missing_tariff", "shipping_tariff_kg": None}
+
+        target_kg = max(0.5, float(billable_kg))
+        for kg, rub in normalized_rows:
+            if target_kg <= kg:
+                return rub, {
+                    "shipping_rate_mode": "table_match",
+                    "shipping_tariff_kg": kg,
+                    "shipping_tariff_rub": rub,
+                }
+
+        if len(normalized_rows) == 1:
+            kg, rub = normalized_rows[0]
+            return rub, {
+                "shipping_rate_mode": "single_tariff_clamped",
+                "shipping_tariff_kg": kg,
+                "shipping_tariff_rub": rub,
+            }
+
+        prev_kg, prev_rub = normalized_rows[-2]
+        last_kg, last_rub = normalized_rows[-1]
+        delta_kg = max(0.1, last_kg - prev_kg)
+        slope_per_kg = (last_rub - prev_rub) / delta_kg
+        extrapolated = last_rub + max(0.0, target_kg - last_kg) * slope_per_kg
+        return max(0.0, float(extrapolated)), {
+            "shipping_rate_mode": "extrapolated",
+            "shipping_tariff_kg": target_kg,
+            "shipping_tariff_rub": max(0.0, float(extrapolated)),
+            "shipping_slope_per_kg_rub": round(float(slope_per_kg), 4),
+        }
+
+    @staticmethod
+    def _pick_range_rule(
+        *,
+        value: float,
+        rules: list[dict[str, Any]],
+        min_key: str,
+        max_key: str,
+    ) -> dict[str, Any] | None:
+        target = float(value)
+        for row in rules:
+            if not isinstance(row, dict):
+                continue
+            min_raw = PricingSettingsService._safe_float(row.get(min_key))
+            max_raw = PricingSettingsService._safe_float(row.get(max_key))
+            min_ok = True if min_raw is None else target >= float(min_raw)
+            max_ok = True if max_raw is None else target <= float(max_raw)
+            if min_ok and max_ok:
+                return row
+        return None
+
+    @staticmethod
+    def _compute_rule_amount(base_value: float, rule: dict[str, Any] | None) -> tuple[float, dict[str, Any]]:
+        if not isinstance(rule, dict):
+            return 0.0, {"mode": "missing_rule", "value": 0.0}
+        mode = PricingSettingsService._normalize_rule_mode(str(rule.get("mode") or "fixed_rub"))
+        value = max(0.0, float(PricingSettingsService._safe_float(rule.get("value")) or 0.0))
+        if mode == "percent":
+            amount = float(base_value) * value
+        else:
+            amount = value
+        return max(0.0, float(amount)), {"mode": mode, "value": value}
 
     @staticmethod
     def _safe_float(value: Any) -> float | None:
@@ -388,6 +983,156 @@ class PricingSettingsService:
             except ValueError:
                 return None
         return None
+
+    @staticmethod
+    def _format_epoch_iso(epoch_sec: float | None) -> str | None:
+        if epoch_sec is None or epoch_sec <= 0:
+            return None
+        try:
+            dt = datetime.fromtimestamp(float(epoch_sec), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            return None
+        return dt.isoformat()
+
+    @staticmethod
+    def _normalize_bybit_bucket_rates(
+        raw_quotes: Any,
+        *,
+        step_usdt: int,
+        max_usdt: int,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(raw_quotes, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for quote in raw_quotes:
+            if isinstance(quote, dict):
+                bucket_raw = quote.get("bucket_usdt")
+                rate_raw = quote.get("rate_rub_per_usdt")
+                pay_raw = quote.get("pay_rub")
+                source_raw = quote.get("source")
+                order_raw = quote.get("order_id")
+                nick_raw = quote.get("nickname")
+                min_raw = quote.get("min_rub")
+                max_raw = quote.get("max_rub")
+                qty_raw = quote.get("quantity_usdt")
+                legs_raw = quote.get("legs")
+            else:
+                bucket_raw = getattr(quote, "bucket_usdt", None)
+                rate_raw = getattr(quote, "rate_rub_per_usdt", None)
+                pay_raw = getattr(quote, "pay_rub", None)
+                source_raw = getattr(quote, "source", None)
+                order_raw = getattr(quote, "order_id", None)
+                nick_raw = getattr(quote, "nickname", None)
+                min_raw = getattr(quote, "min_rub", None)
+                max_raw = getattr(quote, "max_rub", None)
+                qty_raw = getattr(quote, "quantity_usdt", None)
+                legs_raw = getattr(quote, "legs", None)
+            bucket_usdt = PricingSettingsService._safe_float(bucket_raw)
+            rate_rub_per_usdt = PricingSettingsService._safe_float(rate_raw)
+            pay_rub = PricingSettingsService._safe_float(pay_raw)
+            if bucket_usdt is None or bucket_usdt <= 0:
+                continue
+            if rate_rub_per_usdt is None or rate_rub_per_usdt <= 0:
+                continue
+            if pay_rub is None or pay_rub <= 0:
+                pay_rub = bucket_usdt * rate_rub_per_usdt
+            normalized.append(
+                {
+                    "bucket_usdt": round(float(bucket_usdt), 4),
+                    "rate_rub_per_usdt": round(float(rate_rub_per_usdt), 6),
+                    "pay_rub": round(float(pay_rub), 2),
+                    "source": str(source_raw or "single_ad"),
+                    "order_id": str(order_raw or "") or None,
+                    "nickname": str(nick_raw or "") or None,
+                    "min_rub": PricingSettingsService._safe_float(min_raw),
+                    "max_rub": PricingSettingsService._safe_float(max_raw),
+                    "quantity_usdt": PricingSettingsService._safe_float(qty_raw),
+                    "legs": legs_raw if isinstance(legs_raw, list) else [],
+                }
+            )
+        normalized.sort(key=lambda item: float(item.get("bucket_usdt") or 0.0))
+        if step_usdt <= 0 or max_usdt <= 0:
+            return normalized
+        # Clamp oversized ranges from stale caches with different env.
+        output = [
+            row
+            for row in normalized
+            if float(row.get("bucket_usdt") or 0.0) <= float(max_usdt)
+            and float(row.get("bucket_usdt") or 0.0) % float(step_usdt) <= 1e-6
+        ]
+        return output
+
+    @staticmethod
+    def _pick_bybit_bucket_quote(
+        *,
+        target_usdt: float,
+        settings: PricingSettingsResponse,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        safe_target_usdt = max(1.0, float(target_usdt))
+        rows: list[tuple[float, dict[str, Any]]] = []
+        for row in settings.bybit_bucket_rates or []:
+            if not isinstance(row, dict):
+                continue
+            bucket_usdt = PricingSettingsService._safe_float(row.get("bucket_usdt"))
+            rate = PricingSettingsService._safe_float(row.get("rate_rub_per_usdt"))
+            if bucket_usdt is None or bucket_usdt <= 0:
+                continue
+            if rate is None or rate <= 0:
+                continue
+            rows.append((float(bucket_usdt), row))
+        rows.sort(key=lambda item: item[0])
+        if not rows:
+            return None, {
+                "bybit_bucket_target_usdt": round(safe_target_usdt, 4),
+                "bybit_bucket_selected_usdt": None,
+                "bybit_bucket_strategy": "flat_rate",
+                "bybit_bucket_source": "flat_rate",
+                "bybit_bucket_order_id": None,
+                "bybit_bucket_order_nickname": None,
+                "bybit_bucket_pay_rub": None,
+                "bybit_bucket_legs_count": 0,
+            }
+
+        selected_row: dict[str, Any] | None = None
+        selected_bucket_usdt: float | None = None
+        strategy = "nearest_up"
+        for bucket_usdt, row in rows:
+            if bucket_usdt + 1e-9 >= safe_target_usdt:
+                selected_row = row
+                selected_bucket_usdt = bucket_usdt
+                break
+        if selected_row is None:
+            selected_bucket_usdt, selected_row = rows[-1]
+            strategy = "max_available"
+
+        return selected_row, {
+            "bybit_bucket_target_usdt": round(safe_target_usdt, 4),
+            "bybit_bucket_selected_usdt": round(float(selected_bucket_usdt or 0.0), 4) if selected_bucket_usdt else None,
+            "bybit_bucket_strategy": strategy,
+            "bybit_bucket_source": str(selected_row.get("source") or "single_ad"),
+            "bybit_bucket_order_id": selected_row.get("order_id"),
+            "bybit_bucket_order_nickname": selected_row.get("nickname"),
+            "bybit_bucket_pay_rub": selected_row.get("pay_rub"),
+            "bybit_bucket_legs_count": len(selected_row.get("legs") or []),
+        }
+
+    @staticmethod
+    def _pick_bybit_bucket_rate(
+        *,
+        target_usdt: float,
+        settings: PricingSettingsResponse,
+    ) -> tuple[float, dict[str, Any]]:
+        base_rate = max(0.0, float(settings.bybit_usdt_to_rub))
+        selected_row, bucket_meta = PricingSettingsService._pick_bybit_bucket_quote(
+            target_usdt=target_usdt,
+            settings=settings,
+        )
+        if selected_row is None:
+            return base_rate, bucket_meta
+        selected_rate = PricingSettingsService._safe_float(selected_row.get("rate_rub_per_usdt"))
+        if selected_rate is None or selected_rate <= 0:
+            return base_rate, bucket_meta
+        return float(selected_rate), bucket_meta
 
     @staticmethod
     def _has_discount_in_variants(variants: list[dict[str, Any]] | None) -> bool:
@@ -428,19 +1173,26 @@ class PricingSettingsService:
                 {"source_price": float(source_price), "source_currency": currency or None},
             )
 
-        sp_rub: float | None = None
-        sp_eur: float | None = None
-        if currency == "RUB":
-            sp_rub = float(source_price)
-            if settings.eur_to_rub > 0:
-                sp_eur = sp_rub / settings.eur_to_rub
-        elif currency == "USD":
-            sp_rub = float(source_price) * settings.usd_to_rub
-            if settings.eur_to_rub > 0:
-                sp_eur = sp_rub / settings.eur_to_rub
+        base_usdt_to_rub = max(0.0, float(settings.bybit_usdt_to_rub))
+        bybit_extra_rub = max(0.0, float(settings.bybit_extra_rub))
+        eur_to_usd_rate = max(0.0001, float(settings.eur_to_usd_rate))
+        gbp_to_usd_rate = max(0.0001, float(settings.gbp_to_usd_rate))
+        if base_usdt_to_rub <= 0:
+            return ProductPricingComputation(
+                None,
+                True,
+                "invalid_fx_settings",
+                {"source_price": float(source_price), "source_currency": currency or None},
+            )
+
+        if currency == "USD":
+            sp_usd = float(source_price)
         elif currency == "EUR":
-            sp_eur = float(source_price)
-            sp_rub = sp_eur * settings.eur_to_rub
+            sp_usd = float(source_price) * eur_to_usd_rate
+        elif currency == "GBP":
+            sp_usd = float(source_price) * gbp_to_usd_rate
+        elif currency == "RUB":
+            sp_usd = float(source_price) / base_usdt_to_rub
         else:
             return ProductPricingComputation(
                 None,
@@ -449,16 +1201,30 @@ class PricingSettingsService:
                 {"source_price": float(source_price), "source_currency": currency or None},
             )
 
-        if sp_rub is None or sp_eur is None:
+        bybit_bucket_rate, bybit_bucket_meta = PricingSettingsService._pick_bybit_bucket_rate(
+            target_usdt=max(1.0, sp_usd),
+            settings=settings,
+        )
+        if bybit_bucket_rate <= 0:
+            bybit_bucket_rate = base_usdt_to_rub
+        effective_usdt_to_rub = bybit_bucket_rate + bybit_extra_rub
+        eur_to_rub_effective = eur_to_usd_rate * effective_usdt_to_rub
+        if effective_usdt_to_rub <= 0 or eur_to_rub_effective <= 0:
             return ProductPricingComputation(
                 None,
                 True,
                 "invalid_fx_settings",
                 {"source_price": float(source_price), "source_currency": currency or None},
             )
+        if currency == "RUB":
+            sp_usd = float(source_price) / effective_usdt_to_rub
+
+        sp_rub = sp_usd * effective_usdt_to_rub
+        sp_eur = sp_usd / eur_to_usd_rate
 
         effective_weight_grams = max(1.0, float(weight_grams) * settings.weight_tolerance)
-        shipping_steps = max(1, math.ceil(effective_weight_grams / 500.0))
+        billable_half_kg_steps = max(1, math.ceil((effective_weight_grams / 1000.0) / 0.5))
+        billable_kg = float(billable_half_kg_steps) * 0.5
         effective_buyout_surcharge_value = max(0.0, float(buyout_surcharge_value or 0.0))
         effective_buyout_surcharge_currency = PricingSettingsService._normalize_currency(
             buyout_surcharge_currency,
@@ -467,10 +1233,10 @@ class PricingSettingsService:
         buyout_surcharge_rub = PricingSettingsService._to_rub(
             effective_buyout_surcharge_value,
             effective_buyout_surcharge_currency,
-            usd_to_rub=float(settings.usd_to_rub),
-            eur_to_rub=float(settings.eur_to_rub),
+            usd_to_rub=effective_usdt_to_rub,
+            eur_to_rub=eur_to_rub_effective,
         )
-        buyout_surcharge_eur = buyout_surcharge_rub / settings.eur_to_rub if settings.eur_to_rub > 0 else 0.0
+        buyout_surcharge_eur = buyout_surcharge_rub / eur_to_rub_effective if eur_to_rub_effective > 0 else 0.0
 
         effective_seller_delivery_rub = float(settings.seller_delivery_rub if seller_delivery_rub is None else seller_delivery_rub)
         effective_seller_delivery_rub = max(0.0, effective_seller_delivery_rub)
@@ -479,17 +1245,50 @@ class PricingSettingsService:
         has_source_discount = PricingSettingsService._has_discount_in_variants(variants)
         promo_applied_factor = 1.0 if promo_only_no_discount_enabled and has_source_discount else effective_promo_factor
 
-        cdt_eur = max(0.0, sp_eur - settings.customs_threshold_eur) * settings.customs_duty_rate
-        cdt_rub = cdt_eur * settings.eur_to_rub
-        stc_rub, supplier_meta = PricingSettingsService._resolve_supplier_rate(
+        sp_after_promo_rub = sp_rub * promo_applied_factor
+        sp_after_promo_eur = sp_after_promo_rub / eur_to_rub_effective if eur_to_rub_effective > 0 else sp_eur
+        buyout_rub = sp_after_promo_rub + buyout_surcharge_rub
+
+        payment_fee_rub = buyout_rub * max(0.0, float(settings.payment_fee_rate))
+
+        insurance_rule = PricingSettingsService._pick_range_rule(
+            value=sp_after_promo_eur,
+            rules=settings.insurance_rules,
+            min_key="min_eur",
+            max_key="max_eur",
+        )
+        insurance_rub, insurance_meta = PricingSettingsService._compute_rule_amount(sp_after_promo_rub, insurance_rule)
+
+        customs_excess_eur = max(0.0, sp_after_promo_eur - float(settings.customs_threshold_eur))
+        customs_duty_eur = customs_excess_eur * max(0.0, float(settings.customs_duty_rate))
+        customs_processing_eur = customs_duty_eur * max(0.0, float(settings.customs_processing_rate))
+        customs_base_rub = (customs_duty_eur + customs_processing_eur) * eur_to_rub_effective
+        customs_fixed_rub = max(0.0, float(settings.customs_fixed_rub)) if customs_duty_eur > 0 else 0.0
+        customs_rub = customs_base_rub + customs_fixed_rub
+
+        use_alt_shipping = sp_after_promo_eur > max(0.0, float(settings.shipping_alt_threshold_eur))
+        supplier_shipping_rub, supplier_meta = PricingSettingsService._resolve_supplier_rate(
             supplier_id=supplier_id,
-            shipping_steps=shipping_steps,
+            billable_kg=billable_kg,
+            use_alt_rate=use_alt_shipping,
             settings=settings,
         )
+        delivery_rub = effective_seller_delivery_rub + supplier_shipping_rub
 
-        sp_after_promo_rub = sp_rub * promo_applied_factor
-        tp_rub = sp_after_promo_rub + buyout_surcharge_rub + cdt_rub + effective_seller_delivery_rub + stc_rub
-        final_price_rub = float(math.ceil(tp_rub * settings.markup_multiplier))
+        service_fee_rule = PricingSettingsService._pick_range_rule(
+            value=buyout_rub,
+            rules=settings.service_fee_rules,
+            min_key="min_rub",
+            max_key="max_rub",
+        )
+        service_fee_rub, service_fee_meta = PricingSettingsService._compute_rule_amount(buyout_rub, service_fee_rule)
+        subtotal_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub + service_fee_rub
+        markup_multiplier = max(0.0, float(settings.markup_multiplier))
+        subtotal_after_markup_rub = subtotal_rub * markup_multiplier
+        tax_rub = subtotal_after_markup_rub * max(0.0, float(settings.tax_rate))
+        pass_through_costs_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub
+        margin_rub = subtotal_after_markup_rub - pass_through_costs_rub
+        final_price_rub = float(math.ceil(subtotal_after_markup_rub + tax_rub))
 
         return ProductPricingComputation(
             final_price_rub=final_price_rub,
@@ -498,6 +1297,7 @@ class PricingSettingsService:
             components={
                 "source_price": round(float(source_price), 4),
                 "source_currency": currency,
+                "source_price_usd": round(sp_usd, 4),
                 "source_price_rub": round(sp_rub, 4),
                 "source_price_eur": round(sp_eur, 4),
                 "buyout_surcharge_value": round(effective_buyout_surcharge_value, 4),
@@ -509,20 +1309,51 @@ class PricingSettingsService:
                 "promo_only_no_discount": promo_only_no_discount_enabled,
                 "has_source_discount": has_source_discount,
                 "sp_after_promo_rub": round(sp_after_promo_rub, 4),
+                "sp_after_promo_eur": round(sp_after_promo_eur, 4),
+                "buyout_rub": round(buyout_rub, 4),
+                "payment_fee_rate": round(float(settings.payment_fee_rate), 6),
+                "payment_fee_rub": round(payment_fee_rub, 4),
+                "insurance_rub": round(insurance_rub, 4),
+                "insurance_mode": insurance_meta.get("mode"),
+                "insurance_value": insurance_meta.get("value"),
                 "customs_threshold_eur": round(settings.customs_threshold_eur, 4),
                 "customs_threshold_currency": settings.customs_threshold_currency,
                 "customs_duty_rate": round(settings.customs_duty_rate, 6),
-                "customs_duty_eur": round(cdt_eur, 4),
-                "customs_duty_rub": round(cdt_rub, 4),
+                "customs_processing_rate": round(float(settings.customs_processing_rate), 6),
+                "customs_duty_eur": round(customs_duty_eur, 4),
+                "customs_processing_eur": round(customs_processing_eur, 4),
+                "customs_fixed_rub": round(customs_fixed_rub, 4),
+                "customs_duty_rub": round(customs_rub, 4),
                 "weight_grams": round(float(weight_grams), 4),
                 "weight_tolerance": round(settings.weight_tolerance, 6),
                 "effective_weight_grams": round(effective_weight_grams, 4),
-                "shipping_steps_500g": shipping_steps,
-                "supplier_transport_rub": round(stc_rub, 4),
+                "shipping_steps_500g": int(billable_half_kg_steps),
+                "billable_weight_kg": round(billable_kg, 4),
+                "supplier_transport_rub": round(supplier_shipping_rub, 4),
                 "seller_delivery_rub": round(effective_seller_delivery_rub, 4),
-                "markup_multiplier": round(settings.markup_multiplier, 6),
-                "tp_rub": round(tp_rub, 4),
+                "delivery_rub": round(delivery_rub, 4),
+                "service_fee_rub": round(service_fee_rub, 4),
+                "service_fee_mode": service_fee_meta.get("mode"),
+                "service_fee_value": service_fee_meta.get("value"),
+                "tax_rate": round(float(settings.tax_rate), 6),
+                "tax_rub": round(tax_rub, 4),
+                "subtotal_rub": round(subtotal_rub, 4),
+                "subtotal_after_markup_rub": round(subtotal_after_markup_rub, 4),
+                "pass_through_costs_rub": round(pass_through_costs_rub, 4),
+                "margin_rub": round(margin_rub, 4),
+                "tp_rub": round(subtotal_rub, 4),
+                "markup_multiplier": round(markup_multiplier, 6),
+                "bybit_usdt_to_rub": round(float(settings.bybit_usdt_to_rub), 6),
+                "bybit_extra_rub": round(float(settings.bybit_extra_rub), 6),
+                "bybit_bucket_rate_rub": round(float(bybit_bucket_rate), 6),
+                "bybit_bucket_step_usdt": int(settings.bybit_bucket_step_usdt),
+                "bybit_bucket_max_usdt": int(settings.bybit_bucket_max_usdt),
+                "effective_usdt_to_rub": round(effective_usdt_to_rub, 6),
+                "eur_to_usd_rate": round(float(settings.eur_to_usd_rate), 6),
+                "gbp_to_usd_rate": round(float(settings.gbp_to_usd_rate), 6),
+                "eur_to_rub_effective": round(eur_to_rub_effective, 6),
                 "final_price_rub": final_price_rub,
+                **bybit_bucket_meta,
                 **supplier_meta,
             },
         )

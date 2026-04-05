@@ -1,10 +1,82 @@
 """Pricing and supplier models for final customer price formula."""
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Index, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, Column, DateTime, Float, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from app.core.database import Base
+
+
+def _default_insurance_rules() -> list[dict]:
+    return [
+        {"min_eur": 0.0, "max_eur": 300.0, "mode": "percent", "value": 0.01},
+        {"min_eur": 300.0, "max_eur": 520.0, "mode": "fixed_rub", "value": 1000.0},
+        {"min_eur": 520.0, "max_eur": None, "mode": "fixed_rub", "value": 1300.0},
+    ]
+
+
+def _default_service_fee_rules() -> list[dict]:
+    return [
+        {"min_rub": 0.0, "max_rub": 7000.0, "mode": "percent", "value": 0.25},
+        {"min_rub": 7000.0, "max_rub": 10000.0, "mode": "fixed_rub", "value": 2500.0},
+        {"min_rub": 10000.0, "max_rub": 17000.0, "mode": "fixed_rub", "value": 3000.0},
+        {"min_rub": 17000.0, "max_rub": 20000.0, "mode": "fixed_rub", "value": 3500.0},
+        {"min_rub": 20000.0, "max_rub": 30000.0, "mode": "percent", "value": 0.20},
+        {"min_rub": 30000.0, "max_rub": 40000.0, "mode": "fixed_rub", "value": 6000.0},
+        {"min_rub": 40000.0, "max_rub": None, "mode": "percent", "value": 0.15},
+    ]
+
+
+def _default_shipping_rules() -> dict:
+    return {
+        "US": {
+            "normal": [
+                {"kg": 0.5, "rub": 1400.0},
+                {"kg": 1.0, "rub": 1650.0},
+                {"kg": 1.5, "rub": 2250.0},
+                {"kg": 2.0, "rub": 2900.0},
+                {"kg": 2.5, "rub": 3500.0},
+                {"kg": 3.0, "rub": 4100.0},
+            ],
+            "alt": [
+                {"kg": 0.5, "rub": 1700.0},
+                {"kg": 1.0, "rub": 3350.0},
+                {"kg": 1.5, "rub": 4100.0},
+                {"kg": 2.0, "rub": 4950.0},
+                {"kg": 2.5, "rub": 5650.0},
+                {"kg": 3.0, "rub": 6500.0},
+            ],
+        },
+        "EU": {
+            "normal": [
+                {"kg": 0.5, "rub": 1100.0},
+                {"kg": 1.0, "rub": 1500.0},
+                {"kg": 1.5, "rub": 1900.0},
+                {"kg": 2.0, "rub": 2300.0},
+                {"kg": 2.5, "rub": 2700.0},
+                {"kg": 3.0, "rub": 3150.0},
+            ],
+            "alt": [
+                {"kg": 0.5, "rub": 2300.0},
+                {"kg": 1.0, "rub": 2750.0},
+                {"kg": 1.5, "rub": 3750.0},
+                {"kg": 2.0, "rub": 4800.0},
+                {"kg": 2.5, "rub": 5800.0},
+                {"kg": 3.0, "rub": 6800.0},
+            ],
+        },
+        "UK": {
+            "normal": [
+                {"kg": 0.5, "rub": 3400.0},
+                {"kg": 1.0, "rub": 3900.0},
+                {"kg": 1.5, "rub": 4400.0},
+                {"kg": 2.0, "rub": 4900.0},
+                {"kg": 2.5, "rub": 5450.0},
+                {"kg": 3.0, "rub": 5950.0},
+            ],
+            "alt": [],
+        },
+    }
 
 
 class ParserSupplier(Base):
@@ -71,6 +143,21 @@ class ParserPricingSettings(Base):
     seller_delivery_rub = Column(Float, nullable=False, default=0.0)
     usd_to_rub = Column(Float, nullable=False, default=95.0)
     eur_to_rub = Column(Float, nullable=False, default=105.0)
+    bybit_usdt_to_rub = Column(Float, nullable=False, default=95.0)
+    bybit_extra_rub = Column(Float, nullable=False, default=1.0)
+    bybit_bucket_rates = Column(JSON, nullable=False, default=list)
+    bybit_last_updated_at = Column(DateTime(timezone=True), nullable=True)
+    bybit_last_error = Column(String(1024), nullable=True)
+    eur_to_usd_rate = Column(Float, nullable=False, default=1.18)
+    gbp_to_usd_rate = Column(Float, nullable=False, default=1.4)
+    payment_fee_rate = Column(Float, nullable=False, default=0.02)
+    customs_processing_rate = Column(Float, nullable=False, default=0.08)
+    customs_fixed_rub = Column(Float, nullable=False, default=540.0)
+    shipping_alt_threshold_eur = Column(Float, nullable=False, default=300.0)
+    tax_rate = Column(Float, nullable=False, default=0.06)
+    insurance_rules = Column(JSON, nullable=False, default=_default_insurance_rules)
+    service_fee_rules = Column(JSON, nullable=False, default=_default_service_fee_rules)
+    shipping_rules = Column(JSON, nullable=False, default=_default_shipping_rules)
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

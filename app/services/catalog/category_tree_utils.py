@@ -7,7 +7,11 @@ from app.repositories import ParserCategoryKeywordRepository
 from app.schemas.parser import CategoryTreeNodeResponse
 
 
-def build_tree(categories: list[ParserCategory], keyword_repo: ParserCategoryKeywordRepository) -> list[CategoryTreeNodeResponse]:
+def build_tree(
+    categories: list[ParserCategory],
+    keyword_repo: ParserCategoryKeywordRepository,
+    product_counts: dict[int, int] | None = None,
+) -> list[CategoryTreeNodeResponse]:
     by_parent: dict[int | None, list[ParserCategory]] = {}
     for category in categories:
         by_parent.setdefault(category.parent_id, []).append(category)
@@ -16,7 +20,7 @@ def build_tree(categories: list[ParserCategory], keyword_repo: ParserCategoryKey
         nodes.sort(key=lambda c: (not c.is_fallback, c.name.lower()))
 
     def walk(node: ParserCategory, inherited: list[str]) -> CategoryTreeNodeResponse:
-        own_keywords = [] if node.is_fallback else [item.keyword for item in keyword_repo.get_by_category(node.id)]
+        own_keywords = [] if node.is_fallback or bool(getattr(node, "is_favorite", False)) else [item.keyword for item in keyword_repo.get_by_category(node.id)]
         effective = sorted(set([*inherited, *own_keywords]))
         children = [walk(child, effective) for child in by_parent.get(node.id, [])]
         return CategoryTreeNodeResponse(
@@ -25,6 +29,8 @@ def build_tree(categories: list[ParserCategory], keyword_repo: ParserCategoryKey
             slug=node.slug,
             parent_id=node.parent_id,
             is_fallback=node.is_fallback,
+            is_favorite=bool(getattr(node, "is_favorite", False)),
+            product_count=(product_counts or {}).get(node.id, 0),
             keywords=own_keywords,
             effective_keywords=effective,
             children=children,
@@ -73,6 +79,8 @@ def build_single_node_response(
         slug=category.slug,
         parent_id=category.parent_id,
         is_fallback=category.is_fallback,
+        is_favorite=bool(getattr(category, "is_favorite", False)),
+        product_count=0,
         keywords=own_keywords,
         effective_keywords=own_keywords,
         children=[],

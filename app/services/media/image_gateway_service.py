@@ -47,10 +47,10 @@ class ImageGatewayService:
         if not asset.source_url:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image source URL is missing")
 
-        ensure_allowed_url(asset.source_url)
+        normalized_source_url = ensure_allowed_url(asset.source_url)
 
         body, media_type = fetch_image_bytes(
-            source_url=asset.source_url,
+            source_url=normalized_source_url,
             timeout_sec=settings.image_proxy_timeout_sec,
             max_bytes=settings.image_proxy_max_bytes,
         )

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from itertools import combinations
+from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.repositories import ParserDedupDecisionRepository, ParserProductRepository
+from app.repositories import ParserDedupDecisionRepository, ParserProductRepository, ParserSourceRepository
 from app.schemas.parser import (
     DedupCandidateListResponse,
     DedupCandidateResponse,
@@ -19,6 +20,7 @@ from app.schemas.parser import (
 )
 from app.services.moderation.dedup_decision import upsert_merge_decision, upsert_reject_decision
 from app.services.moderation.dedup_scoring import candidate_score, normalize_title, normalize_vendor, pair_key
+from app.services.settings.pricing_service import PricingSettingsService
 
 
 class DedupService:
@@ -28,9 +30,94 @@ class DedupService:
         self.db = db
         self.product_repo = ParserProductRepository(db)
         self.decision_repo = ParserDedupDecisionRepository(db)
+        self.source_repo = ParserSourceRepository(db)
+
+    @staticmethod
+    def _normalize_legacy_source_price(price: float | None, currency: str | None) -> float | None:
+        if price is None:
+            return None
+        normalized_currency = (currency or "").upper()
+        normalized_price = float(price)
+        # Legacy guard: historical bug could persist non-RUB prices in cents (e.g. 43140 instead of 431.40).
+        if (
+            normalized_currency in {"USD", "EUR", "GBP"}
+            and normalized_price >= 10_000
+            and normalized_price.is_integer()
+        ):
+            return normalized_price / 100.0
+        return normalized_price
+
+    def _build_effective_prices(self, products: list[Any]) -> dict[int, float | None]:
+        if not products:
+            return {}
+
+        settings_service = PricingSettingsService(self.db)
+        pricing_settings = settings_service.get_settings(refresh_bybit=False)
+        source_ids = {int(item.source_id) for item in products if getattr(item, "source_id", None) is not None}
+        source_profile_map = {
+            int(source.id): source
+            for source in self.source_repo.get_active_by_ids(source_ids)
+        }
+
+        effective_prices: dict[int, float | None] = {}
+        for product in products:
+            source_profile = source_profile_map.get(int(product.source_id))
+            source_price = self._normalize_legacy_source_price(product.price, product.currency)
+            source_currency = str(product.currency or "").upper() or None
+            pricing = settings_service.calculate_for_product(
+                source_price=source_price,
+                source_currency=source_currency,
+                weight_grams=product.weight_grams,
+                supplier_id=(
+                    int(source_profile.supplier_id)
+                    if source_profile is not None and source_profile.supplier_id is not None
+                    else None
+                ),
+                seller_delivery_rub=(
+                    float(source_profile.seller_delivery_rub)
+                    if source_profile is not None and getattr(source_profile, "seller_delivery_rub", None) is not None
+                    else None
+                ),
+                promo_factor=(
+                    float(source_profile.promo_factor)
+                    if source_profile is not None and getattr(source_profile, "promo_factor", None) is not None
+                    else None
+                ),
+                promo_only_no_discount=(
+                    bool(source_profile.promo_only_no_discount)
+                    if source_profile is not None and getattr(source_profile, "promo_only_no_discount", None) is not None
+                    else None
+                ),
+                buyout_surcharge_value=(
+                    float(source_profile.buyout_surcharge_value)
+                    if source_profile is not None and getattr(source_profile, "buyout_surcharge_value", None) is not None
+                    else None
+                ),
+                buyout_surcharge_currency=(
+                    str(source_profile.buyout_surcharge_currency)
+                    if source_profile is not None and getattr(source_profile, "buyout_surcharge_currency", None) is not None
+                    else None
+                ),
+                variants=product.variants if isinstance(product.variants, list) else [],
+                settings=pricing_settings,
+            )
+            if pricing.final_price_rub is not None:
+                effective_prices[int(product.id)] = float(pricing.final_price_rub)
+            else:
+                effective_prices[int(product.id)] = source_price
+        return effective_prices
+
+    @staticmethod
+    def _product_response_with_effective_price(product: Any, effective_price_rub: float | None) -> ProductResponse:
+        payload = ProductResponse.model_validate(product)
+        if effective_price_rub is not None:
+            payload.price = float(round(effective_price_rub, 2))
+            payload.currency = "RUB"
+        return payload
 
     def get_candidates(self, limit: int = settings.dedup_candidates_default_limit) -> DedupCandidateListResponse:
         products = self.product_repo.filter_products(limit=settings.dedup_scan_limit)
+        effective_prices = self._build_effective_prices(products)
         buckets: dict[tuple[str, str], list] = {}
         for product in products:
             key = (normalize_title(product.title), normalize_vendor(product.vendor))
@@ -44,7 +131,12 @@ class DedupService:
                 key = pair_key(left.id, right.id)
                 if self.decision_repo.get_by_pair_key(key):
                     continue
-                score, reasons = candidate_score(left, right)
+                score, reasons = candidate_score(
+                    left,
+                    right,
+                    left_price=effective_prices.get(int(left.id)),
+                    right_price=effective_prices.get(int(right.id)),
+                )
                 if score < settings.dedup_score_threshold:
                     continue
                 candidates.append(
@@ -52,8 +144,14 @@ class DedupService:
                         pair_key=key,
                         score=score,
                         reasons=reasons,
-                        left=ProductResponse.model_validate(left),
-                        right=ProductResponse.model_validate(right),
+                        left=self._product_response_with_effective_price(
+                            left,
+                            effective_prices.get(int(left.id)),
+                        ),
+                        right=self._product_response_with_effective_price(
+                            right,
+                            effective_prices.get(int(right.id)),
+                        ),
                     )
                 )
                 if len(candidates) >= limit:

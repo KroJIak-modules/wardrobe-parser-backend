@@ -7,12 +7,20 @@ from datetime import datetime, timezone
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.repositories import ParserCategoryKeywordRepository, ParserCategoryRepository
+from app.repositories import (
+    ParserCategoryKeywordRepository,
+    ParserCategoryRepository,
+    ParserFavoriteProductRepository,
+    ParserProductRepository,
+)
 from app.schemas.parser import CategoryCreateRequest, CategoryKeywordRequest, CategoryTreeNodeResponse, CategoryUpdateRequest
+from app.services.catalog.category_assignment import CategoryAssigner, aggregate_tree_counts
 from app.services.catalog.category_tree_rules import (
     build_unique_slug,
     ensure_fallback,
+    ensure_favorite,
     normalize_keyword,
+    purge_favorite_keywords,
     purge_fallback_keywords,
     validate_parent_for_create,
     validate_parent_for_update,
@@ -25,16 +33,28 @@ class CategoryTreeService:
         self.db = db
         self.category_repo = ParserCategoryRepository(db)
         self.keyword_repo = ParserCategoryKeywordRepository(db)
+        self.favorite_repo = ParserFavoriteProductRepository(db)
+        self.product_repo = ParserProductRepository(db)
 
     def get_category_tree(self) -> list[CategoryTreeNodeResponse]:
         fallback = ensure_fallback(self.category_repo)
+        favorite = ensure_favorite(self.category_repo)
         purge_fallback_keywords(db=self.db, keyword_repo=self.keyword_repo, fallback=fallback)
+        purge_favorite_keywords(db=self.db, keyword_repo=self.keyword_repo, favorite=favorite)
         self.db.commit()
+
         categories = self.category_repo.get_all_active()
-        return build_tree(categories, self.keyword_repo)
+        base_tree = build_tree(categories, self.keyword_repo)
+        assigner = CategoryAssigner(base_tree)
+        products = self.product_repo.list_active_for_category_counts()
+        favorite_product_ids = self.favorite_repo.get_product_id_set()
+        direct_counts = assigner.direct_counts(products, favorite_product_ids)
+        aggregated_counts = aggregate_tree_counts(base_tree, direct_counts)
+        return build_tree(categories, self.keyword_repo, product_counts=aggregated_counts)
 
     def create_category(self, payload: CategoryCreateRequest) -> CategoryTreeNodeResponse:
         ensure_fallback(self.category_repo)
+        ensure_favorite(self.category_repo)
         validate_parent_for_create(category_repo=self.category_repo, parent_id=payload.parent_id)
         slug = build_unique_slug(name=payload.name, category_repo=self.category_repo)
         category = self.category_repo.create(
@@ -42,6 +62,7 @@ class CategoryTreeService:
             slug=slug,
             parent_id=payload.parent_id,
             is_fallback=False,
+            is_favorite=False,
         )
         self.category_repo.flush()
         self.db.commit()
@@ -65,6 +86,8 @@ class CategoryTreeService:
                 )
 
         if "parent_id" in payload.model_fields_set:
+            if (category.is_fallback or category.is_favorite) and payload.parent_id is not None:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Системную категорию нельзя делать дочерней")
             validate_parent_for_update(category=category, parent_id=payload.parent_id, category_repo=self.category_repo)
 
         self.db.commit()
@@ -79,6 +102,8 @@ class CategoryTreeService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Категория не найдена")
         if category.is_fallback:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Категорию 'Прочее' нельзя удалить")
+        if category.is_favorite:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Категорию 'Избранное' нельзя удалить")
         if self.category_repo.get_children(category_id):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Нельзя удалить категорию с дочерними категориями")
 
@@ -90,7 +115,7 @@ class CategoryTreeService:
         category = self.category_repo.get_by_id(category_id)
         if not category or category.deleted_at is not None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Категория не найдена")
-        if category.is_fallback:
+        if category.is_fallback or category.is_favorite:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="У системной категории не может быть ключевых слов")
 
         keyword = normalize_keyword(payload.keyword)
@@ -105,6 +130,8 @@ class CategoryTreeService:
         category = self.category_repo.get_by_id(category_id)
         if not category or category.deleted_at is not None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Категория не найдена")
+        if category.is_fallback or category.is_favorite:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="У системной категории нет управляемых ключей")
 
         normalized = keyword.strip().lower()
         entity = self.keyword_repo.get_exact(category_id, normalized)

@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     image_proxy_max_bytes: int = Field(default=8_000_000, env="IMAGE_PROXY_MAX_BYTES")
     image_cache_max_age_sec: int = Field(default=86_400, env="IMAGE_CACHE_MAX_AGE_SEC")
     image_rate_limit_per_minute: int = Field(default=120, env="IMAGE_RATE_LIMIT_PER_MINUTE")
+    weight_default_fallback_grams: int = Field(default=1000, env="DEFAULT_FALLBACK_WEIGHT_GRAMS")
     dedup_scan_limit: int = Field(default=2000, ge=10, le=100000, env="DEDUP_SCAN_LIMIT")
     dedup_score_threshold: float = Field(default=0.55, ge=0.0, le=1.0, env="DEDUP_SCORE_THRESHOLD")
     dedup_title_match_weight: float = Field(default=0.55, ge=0.0, le=1.0, env="DEDUP_TITLE_MATCH_WEIGHT")
@@ -40,6 +41,26 @@ class Settings(BaseSettings):
     dedup_score_cap: float = Field(default=0.99, ge=0.0, le=1.0, env="DEDUP_SCORE_CAP")
     dedup_candidates_default_limit: int = Field(default=30, ge=1, le=1000, env="DEDUP_CANDIDATES_DEFAULT_LIMIT")
     dedup_candidates_max_limit: int = Field(default=200, ge=1, le=5000, env="DEDUP_CANDIDATES_MAX_LIMIT")
+    pricing_bybit_rate_auto_enabled: bool = Field(default=True, env="PRICING_BYBIT_RATE_AUTO_ENABLED")
+    pricing_bybit_rate_cache_sec: int = Field(default=300, ge=30, le=86400, env="PRICING_BYBIT_RATE_CACHE_SEC")
+    pricing_bybit_rate_timeout_sec: float = Field(default=12.0, ge=1.0, le=60.0, env="PRICING_BYBIT_RATE_TIMEOUT_SEC")
+    pricing_bybit_fiat: str = Field(default="RUB", env="PRICING_BYBIT_FIAT")
+    pricing_bybit_asset: str = Field(default="USDT", env="PRICING_BYBIT_ASSET")
+    pricing_bybit_ads_limit: int = Field(default=60, ge=10, le=200, env="PRICING_BYBIT_ADS_LIMIT")
+    pricing_bybit_bucket_step_usdt: int = Field(default=50, ge=10, le=1000, env="PRICING_BYBIT_BUCKET_STEP_USDT")
+    pricing_bybit_bucket_max_usdt: int = Field(default=5000, ge=50, le=20000, env="PRICING_BYBIT_BUCKET_MAX_USDT")
+    pricing_bybit_outlier_max_deviation_ratio: float = Field(
+        default=0.08,
+        ge=0.0,
+        le=0.5,
+        env="PRICING_BYBIT_OUTLIER_MAX_DEVIATION_RATIO",
+    )
+    pricing_bybit_worker_interval_sec: int = Field(
+        default=1800,
+        ge=30,
+        le=86400,
+        env="PRICING_BYBIT_WORKER_INTERVAL_SEC",
+    )
 
     @model_validator(mode="after")
     def build_database_url(self) -> "Settings":

@@ -27,6 +27,8 @@ class CategoryTreeNodeResponse(BaseModel):
     slug: str
     parent_id: int | None = None
     is_fallback: bool
+    is_favorite: bool = False
+    product_count: int = 0
     keywords: list[str] = Field(default_factory=list)
     effective_keywords: list[str] = Field(default_factory=list)
     children: list["CategoryTreeNodeResponse"] = Field(default_factory=list)
@@ -72,8 +74,17 @@ class PricingSettingsUpdateRequest(BaseModel):
     customs_threshold_currency: str | None = Field(default=None, min_length=3, max_length=3)
     customs_duty_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     seller_delivery_rub: float | None = Field(default=None, ge=0.0, le=1000000.0)
-    usd_to_rub: float | None = Field(default=None, ge=0.01, le=100000.0)
-    eur_to_rub: float | None = Field(default=None, ge=0.01, le=100000.0)
+    bybit_extra_rub: float | None = Field(default=None, ge=0.0, le=1000.0)
+    eur_to_usd_rate: float | None = Field(default=None, ge=0.01, le=1000.0)
+    gbp_to_usd_rate: float | None = Field(default=None, ge=0.01, le=1000.0)
+    payment_fee_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    customs_processing_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    customs_fixed_rub: float | None = Field(default=None, ge=0.0, le=1_000_000.0)
+    shipping_alt_threshold_eur: float | None = Field(default=None, ge=0.0, le=100_000.0)
+    tax_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    insurance_rules: list[dict] | None = None
+    service_fee_rules: list[dict] | None = None
+    shipping_rules: dict[str, dict[str, list[dict]]] | None = None
 
 
 class PricingSupplierRateResponse(BaseModel):
@@ -122,8 +133,27 @@ class PricingSettingsResponse(BaseModel):
     customs_threshold_currency: str
     customs_duty_rate: float
     seller_delivery_rub: float
-    usd_to_rub: float
-    eur_to_rub: float
+    bybit_usdt_to_rub: float
+    bybit_extra_rub: float
+    eur_to_usd_rate: float
+    gbp_to_usd_rate: float
+    payment_fee_rate: float
+    customs_processing_rate: float
+    customs_fixed_rub: float
+    shipping_alt_threshold_eur: float
+    tax_rate: float
+    insurance_rules: list[dict] = Field(default_factory=list)
+    service_fee_rules: list[dict] = Field(default_factory=list)
+    shipping_rules: dict[str, dict[str, list[dict]]] = Field(default_factory=dict)
+    bybit_rate_status: str = "unknown"
+    bybit_rate_warning: str | None = None
+    bybit_bucket_step_usdt: int = 0
+    bybit_bucket_max_usdt: int = 0
+    bybit_bucket_rates: list[dict] = Field(default_factory=list)
+    bybit_worker_auto_enabled: bool = True
+    bybit_worker_interval_sec: int = 0
+    bybit_last_updated_at: str | None = None
+    bybit_last_error: str | None = None
     suppliers: list[PricingSupplierResponse] = Field(default_factory=list)
     formula_latex: str = ""
     formula_lines: list[str] = Field(default_factory=list)
@@ -150,6 +180,10 @@ class ProductResponse(BaseModel):
     weight_value: float | None = None
     weight_unit: str | None = None
     variants: list[dict] = Field(default_factory=list)
+    is_favorite: bool = False
+    internal_category_id: int | None = None
+    internal_category_name: str | None = None
+    internal_category_slug: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

@@ -13,8 +13,53 @@ from app.repositories import ParserCategoryKeywordRepository, ParserCategoryRepo
 from app.services.catalog.category_tree_utils import is_descendant
 
 
+_CYRILLIC_TO_LATIN = {
+    "а": "a",
+    "б": "b",
+    "в": "v",
+    "г": "g",
+    "д": "d",
+    "е": "e",
+    "ё": "e",
+    "ж": "zh",
+    "з": "z",
+    "и": "i",
+    "й": "y",
+    "к": "k",
+    "л": "l",
+    "м": "m",
+    "н": "n",
+    "о": "o",
+    "п": "p",
+    "р": "r",
+    "с": "s",
+    "т": "t",
+    "у": "u",
+    "ф": "f",
+    "х": "h",
+    "ц": "ts",
+    "ч": "ch",
+    "ш": "sh",
+    "щ": "sch",
+    "ъ": "",
+    "ы": "y",
+    "ь": "",
+    "э": "e",
+    "ю": "yu",
+    "я": "ya",
+}
+
+
+def _transliterate(value: str) -> str:
+    chunks: list[str] = []
+    for char in value.lower():
+        chunks.append(_CYRILLIC_TO_LATIN.get(char, char))
+    return "".join(chunks)
+
+
 def slugify(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    latin = _transliterate(value)
+    slug = re.sub(r"[^a-z0-9]+", "-", latin).strip("-")
     return slug or "category"
 
 
@@ -35,8 +80,31 @@ def ensure_fallback(category_repo: ParserCategoryRepository) -> ParserCategory:
     return created
 
 
+def ensure_favorite(category_repo: ParserCategoryRepository) -> ParserCategory:
+    favorite = category_repo.get_favorite()
+    if favorite:
+        return favorite
+    created = category_repo.create(
+        name="Избранное",
+        slug="izbrannoe",
+        parent_id=None,
+        is_fallback=False,
+        is_favorite=True,
+    )
+    category_repo.flush()
+    return created
+
+
 def purge_fallback_keywords(*, db: Session, keyword_repo: ParserCategoryKeywordRepository, fallback: ParserCategory) -> None:
     stale = keyword_repo.get_by_category(fallback.id)
+    if not stale:
+        return
+    for item in stale:
+        db.delete(item)
+
+
+def purge_favorite_keywords(*, db: Session, keyword_repo: ParserCategoryKeywordRepository, favorite: ParserCategory) -> None:
+    stale = keyword_repo.get_by_category(favorite.id)
     if not stale:
         return
     for item in stale:

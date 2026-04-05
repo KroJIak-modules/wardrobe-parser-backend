@@ -9,6 +9,7 @@ import re
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings as app_settings
 from app.models import ParserProduct, ParserSource, ParserWeightRule
 from app.repositories import ParserWeightKeywordRepository, ParserWeightRuleRepository
 from app.schemas.parser import (
@@ -43,25 +44,391 @@ def _normalize_match_haystack(*parts: str | None) -> str:
 
 
 DEFAULT_WEIGHT_RULES: list[tuple[int, list[str]]] = [
-    (80, ["ring", "earring", "brooch", "pin badge", "cufflink"]),
-    (130, ["necklace", "chain", "pendant", "bracelet", "anklet"]),
-    (190, ["wallet", "card holder", "passport holder", "coin purse"]),
-    (240, ["cap", "beanie", "bucket hat", "scarf", "belt", "gloves"]),
-    (300, ["tank top", "cami", "bodysuit", "corset"]),
-    (360, ["t shirt", "tee", "top"]),
-    (440, ["shirt", "polo shirt", "blouse"]),
-    (540, ["shorts", "skirt"]),
-    (680, ["pants", "trousers", "jeans", "joggers", "leggings"]),
-    (820, ["sweatshirt", "sweater", "cardigan"]),
-    (960, ["hoodie", "vest"]),
-    (1120, ["jacket", "blazer", "outerwear"]),
-    (1380, ["coat", "parka", "puffer"]),
-    (1560, ["sneakers", "shoes", "loafers", "sandals"]),
-    (1860, ["boots"]),
-    (2300, ["bag", "tote bag", "crossbody bag"]),
-    (2850, ["backpack", "duffle bag"]),
-    (3800, ["suitcase", "carry on"]),
+    (
+        80,
+        [
+            "ring",
+            "rings",
+            "earring",
+            "earrings",
+            "brooch",
+            "pin badge",
+            "pin",
+            "lapel pin",
+            "cufflink",
+            "cufflinks",
+            "ear cuff",
+            "earcuff",
+            "stud earring",
+            "stud",
+            "studs",
+            "hoop earring",
+            "hoop",
+            "hoops",
+            "ear hoop",
+            "nose ring",
+            "tie clip",
+            "charm",
+            "jewelry",
+        ],
+    ),
+    (
+        130,
+        [
+            "necklace",
+            "chain",
+            "pendant",
+            "bracelet",
+            "anklet",
+            "bangle",
+            "body chain",
+            "wallet chain",
+            "key chain",
+            "keychain",
+        ],
+    ),
+    (
+        190,
+        [
+            "wallet",
+            "wallets",
+            "card holder",
+            "cardholders",
+            "card wallet",
+            "passport holder",
+            "coin purse",
+            "coin pouch",
+            "phone pouch",
+            "mini pouch",
+            "pouch",
+            "glasses case",
+            "sunglasses",
+            "glasses",
+            "eyewear",
+            "aviator sunglasses",
+            "cat eye sunglasses",
+            "rectangular sunglasses",
+            "oval sunglasses",
+            "shield sunglasses",
+            "gift card",
+            "airpods case",
+            "iphone case",
+            "carabiner",
+        ],
+    ),
+    (
+        240,
+        [
+            "cap",
+            "beanie",
+            "bucket hat",
+            "scarf",
+            "belt",
+            "gloves",
+            "mittens",
+            "tie",
+            "necktie",
+            "mask",
+            "headband",
+            "hair clip",
+            "barrette",
+            "tiara",
+            "wristband",
+            "snood",
+            "neck gaiter",
+            "leg warmers",
+            "arm warmers",
+            "lighter",
+            "lighter holder",
+            "candle",
+            "candles",
+            "perfume",
+            "parfum",
+            "eau de parfum",
+            "fragrance",
+            "room spray",
+            "diffuser",
+            "pot pourri",
+            "refill perfume oil",
+            "vase",
+            "beach towel",
+            "towel",
+            "book",
+            "magazine",
+        ],
+    ),
+    (
+        300,
+        [
+            "tank top",
+            "cami",
+            "camisole",
+            "bodysuit",
+            "corset",
+            "corset top",
+            "bra top",
+            "bralette",
+            "bra",
+            "bikini",
+            "swimsuit",
+            "one piece swimsuit",
+            "one piece",
+            "tube top",
+        ],
+    ),
+    (
+        360,
+        [
+            "t shirt",
+            "tee",
+            "graphic tee",
+            "jersey tee",
+            "thermal tee",
+            "top",
+            "tops",
+            "long sleeve tee",
+            "polo tee",
+            "raglan tee",
+            "rib tee",
+        ],
+    ),
+    (
+        440,
+        [
+            "shirt",
+            "shirts",
+            "polo shirt",
+            "blouse",
+            "button up",
+            "button down",
+            "dress shirt",
+            "denim shirt",
+            "flannel shirt",
+            "oxford shirt",
+            "tunic",
+        ],
+    ),
+    (
+        540,
+        [
+            "shorts",
+            "short",
+            "skirt",
+            "mini skirt",
+            "midi skirt",
+            "maxi skirt",
+            "skort",
+            "bermuda",
+            "cargo shorts",
+            "denim shorts",
+            "boxer shorts",
+            "jorts",
+            "trunks",
+        ],
+    ),
+    (
+        680,
+        [
+            "pants",
+            "pant",
+            "trousers",
+            "trouser",
+            "jeans",
+            "joggers",
+            "leggings",
+            "sweatpants",
+            "cargo pants",
+            "track pants",
+            "capri pants",
+            "chinos",
+            "slacks",
+            "bottom",
+            "bottoms",
+            "culottes",
+        ],
+    ),
+    (
+        700,
+        [
+            "dress",
+            "dresses",
+            "maxi dress",
+            "midi dress",
+            "mini dress",
+            "slip dress",
+            "cut out dress",
+            "gown",
+            "nightgown",
+            "jumpsuit",
+            "romper",
+            "playsuit",
+            "leotard",
+            "catsuit",
+            "stocking",
+            "stockings",
+            "tights",
+            "stirrup tights",
+            "bodice",
+            "chemise",
+            "bloomer",
+            "knickers",
+            "briefs",
+            "boxers",
+            "thong",
+            "undie",
+            "overall",
+            "overalls",
+        ],
+    ),
+    (
+        820,
+        [
+            "sweatshirt",
+            "sweater",
+            "cardigan",
+            "jumper",
+            "knit",
+            "knitwear",
+            "crewneck",
+            "pullover",
+            "zip sweater",
+            "turtleneck",
+            "skivvy",
+        ],
+    ),
+    (
+        960,
+        [
+            "hoodie",
+            "zip hoodie",
+            "hooded sweatshirt",
+            "vest",
+            "down vest",
+            "puffer vest",
+            "waistcoat",
+            "gilet",
+            "quarter zip",
+            "poncho",
+            "arm sleeve",
+            "sleeves",
+        ],
+    ),
+    (
+        1120,
+        [
+            "jacket",
+            "blazer",
+            "outerwear",
+            "denim jacket",
+            "rain jacket",
+            "shell jacket",
+            "bomber",
+            "windbreaker",
+            "overshirt",
+            "varsity jacket",
+            "trucker jacket",
+            "blouson",
+            "fleece",
+            "bolero",
+        ],
+    ),
+    (
+        1380,
+        [
+            "coat",
+            "parka",
+            "puffer",
+            "puffer jacket",
+            "down jacket",
+            "overcoat",
+            "trench coat",
+            "duffle coat",
+            "pea coat",
+            "wool coat",
+            "fur coat",
+            "mouton",
+        ],
+    ),
+    (
+        1560,
+        [
+            "sneakers",
+            "sneaker",
+            "shoes",
+            "shoe",
+            "loafers",
+            "loafer",
+            "sandals",
+            "sandal",
+            "running shoes",
+            "running shoe",
+            "trainers",
+            "derby",
+            "derbies",
+            "oxford shoes",
+            "mule",
+            "moccasin",
+            "flats",
+            "ballet flats",
+            "heels",
+            "heel",
+            "kitten heel",
+            "pumps",
+            "pump",
+            "slippers",
+            "slipper",
+            "slides",
+            "slide",
+            "wedge",
+            "platform shoes",
+            "runners",
+        ],
+    ),
+    (
+        1860,
+        [
+            "boots",
+            "boot",
+            "ankle boots",
+            "chelsea boots",
+            "combat boots",
+            "cowboy boots",
+            "hiking boots",
+            "platform boots",
+            "prosthetic boots",
+        ],
+    ),
+    (
+        2300,
+        [
+            "bag",
+            "bags",
+            "tote bag",
+            "crossbody bag",
+            "shoulder bag",
+            "handbag",
+            "messenger bag",
+            "satchel",
+            "sling bag",
+            "waist bag",
+            "belt bag",
+            "fanny pack",
+            "hobo bag",
+            "clutch bag",
+            "clutch",
+            "pochette",
+            "messenger",
+            "banane",
+            "ceinture",
+            "porte",
+        ],
+    ),
+    (2850, ["backpack", "duffle bag", "duffel bag", "rucksack", "travel bag", "weekender bag", "gym bag", "garment bag"]),
+    (3800, ["suitcase", "carry on", "hard case luggage", "trolley case", "trunk case"]),
 ]
+
+DEFAULT_FALLBACK_WEIGHT_GRAMS = max(1, int(app_settings.weight_default_fallback_grams))
+DEFAULT_FALLBACK_MATCH_KEYWORD = "fallback_default"
 
 
 class WeightRuleService:
@@ -225,6 +592,17 @@ class WeightRuleService:
         return unresolved
 
     @staticmethod
+    def _resolve_fallback_weight(rules: list[WeightRuleResponse]) -> float | None:
+        if not rules:
+            return None
+        weights = sorted({int(rule.weight_grams) for rule in rules if int(rule.weight_grams) > 0})
+        if not weights:
+            return None
+        if DEFAULT_FALLBACK_WEIGHT_GRAMS in weights:
+            return float(DEFAULT_FALLBACK_WEIGHT_GRAMS)
+        return float(weights[len(weights) // 2])
+
+    @staticmethod
     def match_weight_from_rules(
         *,
         rules: list[WeightRuleResponse],
@@ -237,7 +615,10 @@ class WeightRuleService:
             return WeightMatchResult(weight_grams=None, matched_keyword=None)
         haystack = _normalize_match_haystack(title, vendor, product_type, handle)
         if not haystack:
-            return WeightMatchResult(weight_grams=None, matched_keyword=None)
+            fallback_weight = WeightRuleService._resolve_fallback_weight(rules)
+            if fallback_weight is None:
+                return WeightMatchResult(weight_grams=None, matched_keyword=None)
+            return WeightMatchResult(weight_grams=fallback_weight, matched_keyword=DEFAULT_FALLBACK_MATCH_KEYWORD)
 
         best_rule_weight: int | None = None
         best_keyword: str | None = None
@@ -255,7 +636,10 @@ class WeightRuleService:
                         best_keyword = normalized_keyword
 
         if best_rule_weight is None:
-            return WeightMatchResult(weight_grams=None, matched_keyword=None)
+            fallback_weight = WeightRuleService._resolve_fallback_weight(rules)
+            if fallback_weight is None:
+                return WeightMatchResult(weight_grams=None, matched_keyword=None)
+            return WeightMatchResult(weight_grams=fallback_weight, matched_keyword=DEFAULT_FALLBACK_MATCH_KEYWORD)
         return WeightMatchResult(weight_grams=float(best_rule_weight), matched_keyword=best_keyword)
 
     def match_weight_by_keywords(

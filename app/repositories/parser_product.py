@@ -20,3 +20,19 @@ class ParserProductRepository(BaseRepository[ParserProduct]):
             .limit(limit)
             .all()
         )
+
+    def get_active_by_id(self, product_id: int) -> ParserProduct | None:
+        return (
+            self.query()
+            .filter(ParserProduct.id == product_id)
+            .filter(ParserProduct.deleted_at.is_(None))
+            .first()
+        )
+
+    def list_active_for_category_counts(self) -> list[ParserProduct]:
+        return (
+            self.query()
+            .filter(ParserProduct.deleted_at.is_(None))
+            .filter(ParserProduct.status == "available")
+            .all()
+        )

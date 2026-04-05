@@ -61,6 +61,22 @@ class ParserProduct(Base):
     source = relationship("ParserSource", back_populates="products")
 
 
+class ParserFavoriteProduct(Base):
+    """Manual 'favorite' mark for parser products."""
+
+    __tablename__ = "parser_favorite_product"
+
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, ForeignKey("parser_product.id", ondelete="CASCADE"), nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    product = relationship("ParserProduct")
+
+    __table_args__ = (
+        Index("idx_parser_favorite_product_product_id", "product_id"),
+    )
+
+
 class ParserDedupDecision(Base):
     """Stored moderator decision for a pair of products."""
 

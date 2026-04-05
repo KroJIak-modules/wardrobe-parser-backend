@@ -15,9 +15,17 @@ _RATE_LIMITER_LOCK = Lock()
 _RATE_LIMITER_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
 
 
-def ensure_allowed_url(source_url: str) -> None:
+def normalize_source_url(source_url: str) -> str:
+    normalized = (source_url or "").strip()
+    if normalized.startswith("//"):
+        return f"https:{normalized}"
+    return normalized
+
+
+def ensure_allowed_url(source_url: str) -> str:
     """Reject non-http(s) and private/reserved hosts to mitigate SSRF."""
-    parsed = urlparse(source_url)
+    normalized_url = normalize_source_url(source_url)
+    parsed = urlparse(normalized_url)
     if parsed.scheme not in {"http", "https"}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported image URL scheme")
 
@@ -40,6 +48,8 @@ def ensure_allowed_url(source_url: str) -> None:
             or resolved_ip.is_reserved
         ):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Blocked image host address")
+
+    return normalized_url
 
 
 def check_rate_limit(client_ip: str, *, per_minute_limit: int) -> None:
