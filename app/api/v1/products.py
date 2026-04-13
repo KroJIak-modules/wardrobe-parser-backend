@@ -142,11 +142,6 @@ def _apply_backend_pricing_to_item(
         source_currency=source_currency,
         weight_grams=weight_grams,
         supplier_id=int(source_profile.supplier_id) if source_profile and source_profile.supplier_id is not None else None,
-        seller_delivery_rub=(
-            float(source_profile.seller_delivery_rub)
-            if source_profile is not None and getattr(source_profile, "seller_delivery_rub", None) is not None
-            else None
-        ),
         promo_factor=(
             float(source_profile.promo_factor)
             if source_profile is not None and getattr(source_profile, "promo_factor", None) is not None

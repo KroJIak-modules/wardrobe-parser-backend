@@ -87,8 +87,7 @@ class ParserSupplier(Base):
     id = Column(Integer, primary_key=True)
     key = Column(String(64), nullable=False, unique=True)
     name = Column(String(255), nullable=False)
-    country_code = Column(String(16), nullable=False, default="N/A")
-    country_name = Column(String(255), nullable=False, default="Unknown")
+    category = Column(String(16), nullable=False, default="main")
     rate_currency = Column(String(3), nullable=False, default="RUB")
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -103,7 +102,7 @@ class ParserSupplier(Base):
 
     __table_args__ = (
         Index("idx_parser_supplier_key", "key"),
-        Index("idx_parser_supplier_country_code", "country_code"),
+        Index("idx_parser_supplier_category", "category"),
     )
 
 
@@ -140,7 +139,6 @@ class ParserPricingSettings(Base):
     customs_threshold_eur = Column(Float, nullable=False, default=200.0)
     customs_threshold_currency = Column(String(3), nullable=False, default="EUR")
     customs_duty_rate = Column(Float, nullable=False, default=0.15)
-    seller_delivery_rub = Column(Float, nullable=False, default=0.0)
     usd_to_rub = Column(Float, nullable=False, default=95.0)
     eur_to_rub = Column(Float, nullable=False, default=105.0)
     bybit_usdt_to_rub = Column(Float, nullable=False, default=95.0)

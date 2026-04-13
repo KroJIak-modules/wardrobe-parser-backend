@@ -73,11 +73,6 @@ class DedupService:
                     if source_profile is not None and source_profile.supplier_id is not None
                     else None
                 ),
-                seller_delivery_rub=(
-                    float(source_profile.seller_delivery_rub)
-                    if source_profile is not None and getattr(source_profile, "seller_delivery_rub", None) is not None
-                    else None
-                ),
                 promo_factor=(
                     float(source_profile.promo_factor)
                     if source_profile is not None and getattr(source_profile, "promo_factor", None) is not None

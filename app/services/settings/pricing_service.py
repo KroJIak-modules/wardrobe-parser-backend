@@ -34,13 +34,13 @@ _FORMULA_LINES = [
     "INS = insurance tier by SPE",
     "CDR = ((max(0, SPE - THR) * DUT) * (1 + CPR)) * (E2U * BFX) + CFX",
     "SVC = service fee tier by BUY",
-    "SUB = BUY + PFR + INS + CDR + SDC + SSR[SUP,STP] + SVC",
+    "SUB = BUY + PFR + INS + CDR + SSR[SUP,STP] + SVC",
     "TAX = SUB * TXR",
     "FPR = ceil(SUB + TAX)",
 ]
 
 _FORMULA_LATEX = (
-    r"FPR=\left\lceil\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SDC+SSR[SUP,STP]+SVC\right)\cdot MP+\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SDC+SSR[SUP,STP]+SVC\right)\cdot MP\right)\cdot TXR\right\rceil"
+    r"\left\lceil\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,STP]+SVC\right)\cdot MP+\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,STP]+SVC\right)\cdot MP\right)\cdot TXR\right\rceil"
 )
 
 _FORMULA_LEGEND = [
@@ -49,7 +49,7 @@ _FORMULA_LEGEND = [
     {"key": "SPE", "description": "Цена товара в EUR (для таможни и страхования)."},
     {"key": "SPR", "description": "Цена товара в RUB по курсу Bybit."},
     {"key": "BBR", "description": "Курс выбранного Bybit-ордера/бакета для суммы этого товара (USDT/RUB)."},
-    {"key": "BEX", "description": "Добавка к курсу Bybit."},
+    {"key": "BEX", "description": "Надбавка к курсу Bybit."},
     {"key": "BFX", "description": "Итоговый курс USDT/RUB: BBR + BEX."},
     {"key": "E2U", "description": "Коэффициент EUR -> USD."},
     {"key": "G2U", "description": "Коэффициент GBP -> USD."},
@@ -63,7 +63,6 @@ _FORMULA_LEGEND = [
     {"key": "CPR", "description": "Ставка обработки пошлины."},
     {"key": "CFX", "description": "Фиксированная часть таможни в RUB."},
     {"key": "CDR", "description": "Таможня в RUB."},
-    {"key": "SDC", "description": "Локальная доставка в RUB."},
     {"key": "SSR", "description": "Доставка поставщика."},
     {"key": "SUP", "description": "Поставщик."},
     {"key": "STP", "description": "Шаг по 500г."},
@@ -146,9 +145,8 @@ _PRODUCTION_SUPPLIER_PRESETS: list[dict[str, Any]] = [
     {
         "legacy_keys": ["us-express-test", "us-main"],
         "key": "us-main",
-        "name": "US Main",
-        "country_code": "US",
-        "country_name": "United States",
+        "name": "US",
+        "category": "main",
         "rate_currency": "RUB",
         "rate_per_500g_rub": 665.0,
         "max_step_500g": 120,
@@ -156,9 +154,8 @@ _PRODUCTION_SUPPLIER_PRESETS: list[dict[str, Any]] = [
     {
         "legacy_keys": ["eu-priority-test", "eu-main"],
         "key": "eu-main",
-        "name": "EU Main",
-        "country_code": "EU",
-        "country_name": "Europe",
+        "name": "EU",
+        "category": "main",
         "rate_currency": "RUB",
         "rate_per_500g_rub": 840.0,
         "max_step_500g": 120,
@@ -166,9 +163,8 @@ _PRODUCTION_SUPPLIER_PRESETS: list[dict[str, Any]] = [
     {
         "legacy_keys": ["eu-economy-test", "eu-alt"],
         "key": "eu-alt",
-        "name": "EU Alt",
-        "country_code": "EU",
-        "country_name": "Europe",
+        "name": "EU",
+        "category": "alt",
         "rate_currency": "RUB",
         "rate_per_500g_rub": 630.0,
         "max_step_500g": 120,
@@ -217,8 +213,7 @@ class PricingSettingsService:
                 target = self.supplier_repo.create(
                     key=str(preset["key"]),
                     name=str(preset["name"]),
-                    country_code=str(preset["country_code"]),
-                    country_name=str(preset["country_name"]),
+                    category=self._normalize_supplier_category(str(preset.get("category") or "main")),
                     rate_currency=str(preset["rate_currency"]),
                 )
                 self.supplier_repo.flush()
@@ -240,11 +235,9 @@ class PricingSettingsService:
             if target.name != preset["name"]:
                 target.name = str(preset["name"])
                 changed = True
-            if target.country_code != preset["country_code"]:
-                target.country_code = str(preset["country_code"])
-                changed = True
-            if target.country_name != preset["country_name"]:
-                target.country_name = str(preset["country_name"])
+            target_category = self._normalize_supplier_category(str(preset.get("category") or "main"))
+            if target.category != target_category:
+                target.category = target_category
                 changed = True
             normalized_currency = self._normalize_currency(str(preset["rate_currency"]), default="RUB")
             if target.rate_currency != normalized_currency:
@@ -270,9 +263,19 @@ class PricingSettingsService:
         return changed
 
     @staticmethod
-    def _normalize_currency(raw: str | None, *, default: str = "RUB") -> str:
+    def _normalize_currency(raw: str | None, *, default: str = "RUB", allow_gbp: bool = False) -> str:
         value = (raw or default).strip().upper()
-        if value not in {"RUB", "USD", "EUR"}:
+        allowed = {"RUB", "USD", "EUR"}
+        if allow_gbp:
+            allowed.add("GBP")
+        if value not in allowed:
+            return default
+        return value
+
+    @staticmethod
+    def _normalize_supplier_category(raw: str | None, *, default: str = "main") -> str:
+        value = (raw or default).strip().lower()
+        if value not in {"main", "alt"}:
             return default
         return value
 
@@ -557,7 +560,12 @@ class PricingSettingsService:
         if "customs_threshold_currency" in patch:
             patch["customs_threshold_currency"] = self._normalize_currency(
                 patch.get("customs_threshold_currency"),
-                default=self._normalize_currency(getattr(entity, "customs_threshold_currency", None), default="EUR"),
+                default=self._normalize_currency(
+                    getattr(entity, "customs_threshold_currency", None),
+                    default="EUR",
+                    allow_gbp=True,
+                ),
+                allow_gbp=True,
             )
         if "insurance_rules" in patch:
             patch["insurance_rules"] = self._normalize_range_rules(
@@ -636,9 +644,9 @@ class PricingSettingsService:
             customs_threshold_currency=PricingSettingsService._normalize_currency(
                 getattr(entity, "customs_threshold_currency", None),
                 default="EUR",
+                allow_gbp=True,
             ),
             customs_duty_rate=float(entity.customs_duty_rate),
-            seller_delivery_rub=float(entity.seller_delivery_rub),
             bybit_usdt_to_rub=float(getattr(entity, "bybit_usdt_to_rub", 95.0) or 95.0),
             bybit_extra_rub=float(getattr(entity, "bybit_extra_rub", 1.0)),
             eur_to_usd_rate=float(getattr(entity, "eur_to_usd_rate", 1.18)),
@@ -698,8 +706,7 @@ class PricingSettingsService:
             id=int(supplier.id),
             key=supplier.key,
             name=supplier.name,
-            country_code=supplier.country_code,
-            country_name=supplier.country_name,
+            category=PricingSettingsService._normalize_supplier_category(getattr(supplier, "category", None)),
             rate_currency=rate_currency,
             rate_per_500g_value=rate_per_500g_value,
             rate_per_500g_rub=rate_per_500g,
@@ -716,9 +723,11 @@ class PricingSettingsService:
         patch = payload.model_dump(exclude_none=True)
         settings_entity, _ = self.repo.get_or_create_default()
         usd_to_rub_effective, eur_to_rub_effective = self._effective_rates_from_entity(settings_entity)
-        for key in ("name", "country_code", "country_name"):
+        for key in ("name",):
             if key in patch:
                 setattr(supplier, key, patch[key])
+        if "category" in patch:
+            supplier.category = self._normalize_supplier_category(patch.get("category"), default=supplier.category)
         if "rate_currency" in patch:
             supplier.rate_currency = self._normalize_currency(patch.get("rate_currency"), default=supplier.rate_currency)
 
@@ -790,8 +799,7 @@ class PricingSettingsService:
         supplier = self.supplier_repo.create(
             key=key,
             name=payload.name.strip(),
-            country_code=payload.country_code.strip().upper(),
-            country_name=payload.country_name.strip(),
+            category=self._normalize_supplier_category(payload.category, default="main"),
             rate_currency=self._normalize_currency(payload.rate_currency, default="RUB"),
         )
         self.supplier_repo.flush()
@@ -862,7 +870,7 @@ class PricingSettingsService:
                 "shipping_rate_mode": "missing_supplier",
             }
 
-        region = PricingSettingsService._infer_shipping_region(selected.country_code)
+        region = PricingSettingsService._infer_shipping_region(selected.name, selected.key)
         mode = "alt" if use_alt_rate and region in {"US", "EU"} else "normal"
         region_rules = (settings.shipping_rules or {}).get(region) or {}
         rows = region_rules.get(mode) or []
@@ -884,11 +892,12 @@ class PricingSettingsService:
         }
 
     @staticmethod
-    def _infer_shipping_region(country_code: str | None) -> str:
-        raw = (country_code or "").strip().upper()
-        if raw in {"US", "USA"}:
+    def _infer_shipping_region(supplier_name: str | None, supplier_key: str | None) -> str:
+        name_value = (supplier_name or "").strip().upper()
+        key_value = (supplier_key or "").strip().lower()
+        if name_value == "US" or key_value.startswith("us-"):
             return "US"
-        if raw in {"GB", "UK", "GBR", "UNITED KINGDOM"}:
+        if name_value in {"UK", "GB"} or key_value.startswith("uk-") or key_value.startswith("gb-"):
             return "UK"
         return "EU"
 
@@ -1154,7 +1163,6 @@ class PricingSettingsService:
         source_currency: str | None,
         weight_grams: float | None,
         supplier_id: int | None,
-        seller_delivery_rub: float | None,
         promo_factor: float | None,
         promo_only_no_discount: bool | None,
         buyout_surcharge_value: float | None,
@@ -1228,18 +1236,19 @@ class PricingSettingsService:
         effective_buyout_surcharge_value = max(0.0, float(buyout_surcharge_value or 0.0))
         effective_buyout_surcharge_currency = PricingSettingsService._normalize_currency(
             buyout_surcharge_currency,
-            default=currency if currency in {"RUB", "USD", "EUR"} else "RUB",
+            default=currency if currency in {"RUB", "USD", "EUR", "GBP"} else "RUB",
+            allow_gbp=True,
         )
-        buyout_surcharge_rub = PricingSettingsService._to_rub(
-            effective_buyout_surcharge_value,
-            effective_buyout_surcharge_currency,
-            usd_to_rub=effective_usdt_to_rub,
-            eur_to_rub=eur_to_rub_effective,
-        )
+        if effective_buyout_surcharge_currency == "GBP":
+            buyout_surcharge_rub = effective_buyout_surcharge_value * gbp_to_usd_rate * effective_usdt_to_rub
+        else:
+            buyout_surcharge_rub = PricingSettingsService._to_rub(
+                effective_buyout_surcharge_value,
+                effective_buyout_surcharge_currency,
+                usd_to_rub=effective_usdt_to_rub,
+                eur_to_rub=eur_to_rub_effective,
+            )
         buyout_surcharge_eur = buyout_surcharge_rub / eur_to_rub_effective if eur_to_rub_effective > 0 else 0.0
-
-        effective_seller_delivery_rub = float(settings.seller_delivery_rub if seller_delivery_rub is None else seller_delivery_rub)
-        effective_seller_delivery_rub = max(0.0, effective_seller_delivery_rub)
         effective_promo_factor = max(0.0, float(settings.promo_factor if promo_factor is None else promo_factor))
         promo_only_no_discount_enabled = bool(promo_only_no_discount)
         has_source_discount = PricingSettingsService._has_discount_in_variants(variants)
@@ -1273,7 +1282,7 @@ class PricingSettingsService:
             use_alt_rate=use_alt_shipping,
             settings=settings,
         )
-        delivery_rub = effective_seller_delivery_rub + supplier_shipping_rub
+        delivery_rub = supplier_shipping_rub
 
         service_fee_rule = PricingSettingsService._pick_range_rule(
             value=buyout_rub,
@@ -1330,7 +1339,6 @@ class PricingSettingsService:
                 "shipping_steps_500g": int(billable_half_kg_steps),
                 "billable_weight_kg": round(billable_kg, 4),
                 "supplier_transport_rub": round(supplier_shipping_rub, 4),
-                "seller_delivery_rub": round(effective_seller_delivery_rub, 4),
                 "delivery_rub": round(delivery_rub, 4),
                 "service_fee_rub": round(service_fee_rub, 4),
                 "service_fee_mode": service_fee_meta.get("mode"),

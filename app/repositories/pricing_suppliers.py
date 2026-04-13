@@ -23,8 +23,7 @@ class ParserSupplierRepository(BaseRepository[ParserSupplier]):
             id=1,
             key="default",
             name="Default Supplier",
-            country_code="N/A",
-            country_name="Default",
+            category="main",
         )
         self.flush()
         return supplier

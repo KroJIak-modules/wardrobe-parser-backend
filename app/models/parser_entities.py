@@ -17,7 +17,6 @@ class ParserSource(Base):
     url = Column(String(2048), nullable=False)
     enabled = Column(Boolean, nullable=False, default=True)
     supplier_id = Column(Integer, ForeignKey("parser_supplier.id", ondelete="RESTRICT"), nullable=False)
-    seller_delivery_rub = Column(Float, nullable=False, default=0.0)
     promo_factor = Column(Float, nullable=False, default=1.0)
     promo_only_no_discount = Column(Boolean, nullable=False, default=False)
     buyout_surcharge_value = Column(Float, nullable=False, default=0.0)
