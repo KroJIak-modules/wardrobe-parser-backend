@@ -33,24 +33,22 @@ def _register_exception_handlers(app: FastAPI) -> None:
 
 def _configure_cors(app: FastAPI) -> None:
     allowed_origins = [origin.strip() for origin in settings.cors_allowed_origins.split(",") if origin.strip()]
-    allow_methods = [item.strip() for item in settings.cors_allow_methods.split(",") if item.strip()]
-    allow_headers = [item.strip() for item in settings.cors_allow_headers.split(",") if item.strip()]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
-        allow_credentials=settings.cors_allow_credentials,
-        allow_methods=allow_methods or ["*"],
-        allow_headers=allow_headers or ["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
 
 def create_app() -> FastAPI:
     """Create and configure FastAPI application instance."""
-    app = FastAPI(title=settings.app_title)
+    app = FastAPI(title="Wardrobe Parser Backend API")
 
     @app.get("/health", summary="Health check")
     def health() -> dict[str, str]:
-        return {"status": settings.health_status_value}
+        return {"status": "ok"}
 
     app.include_router(api_router)
     _register_exception_handlers(app)
