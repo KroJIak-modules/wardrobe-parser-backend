@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -26,6 +27,7 @@ from app.services.settings.weight_rule_service import WeightRuleService
 
 
 router = APIRouter(tags=["products"])
+LOGGER = logging.getLogger(__name__)
 _PROXY_ROOT_METHODS = ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 _PROXY_PATH_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 _JSON_UNSAFE_HEADERS = {"content-length", "content-encoding", "transfer-encoding"}
@@ -194,6 +196,31 @@ def _apply_backend_pricing_to_item(
     return item
 
 
+def _safe_apply_backend_pricing_to_item(
+    *,
+    item: dict[str, Any],
+    settings_service: PricingSettingsService,
+    settings,
+    source_profile_map: dict[int, Any],
+    weight_rules: list[Any],
+    category_assigner: CategoryAssigner | None = None,
+    is_favorite: bool = False,
+) -> dict[str, Any]:
+    try:
+        return _apply_backend_pricing_to_item(
+            item=item,
+            settings_service=settings_service,
+            settings=settings,
+            source_profile_map=source_profile_map,
+            weight_rules=weight_rules,
+            category_assigner=category_assigner,
+            is_favorite=is_favorite,
+        )
+    except Exception:
+        LOGGER.exception("Failed to enrich product item", extra={"product_id": item.get("id")})
+        return item
+
+
 @router.get("/products")
 async def get_products(request: Request, db: Session = Depends(get_db)) -> Response:
     upstream = forward_service_request(request=request, path="products", body=b"")
@@ -210,7 +237,11 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
-    weight_rules = WeightRuleService(db).get_matching_rules()
+    try:
+        weight_rules = WeightRuleService(db).get_matching_rules()
+    except Exception:
+        LOGGER.exception("Failed to load weight rules for /products; fallback to empty rules")
+        weight_rules = []
     source_repo = ParserSourceRepository(db)
     source_ids = {
         source_id
@@ -234,7 +265,7 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
     favorite_product_ids = favorite_repo.get_product_id_set_for_ids(product_ids)
 
     payload["items"] = [
-        _apply_backend_pricing_to_item(
+        _safe_apply_backend_pricing_to_item(
             item=item,
             settings_service=settings_service,
             settings=settings,
@@ -266,7 +297,11 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
-    weight_rules = WeightRuleService(db).get_matching_rules()
+    try:
+        weight_rules = WeightRuleService(db).get_matching_rules()
+    except Exception:
+        LOGGER.exception("Failed to load weight rules for /products/{product_id}; fallback to empty rules")
+        weight_rules = []
     source_repo = ParserSourceRepository(db)
     source_id = _safe_int(payload.get("source_id"))
     source_profile = source_repo.get_active_by_id(source_id) if source_id is not None else None
@@ -277,7 +312,7 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
     category_assigner = CategoryAssigner(category_tree)
     favorite_repo = ParserFavoriteProductRepository(db)
     favorite_product_ids = favorite_repo.get_product_id_set_for_ids({int(product_id)})
-    priced = _apply_backend_pricing_to_item(
+    priced = _safe_apply_backend_pricing_to_item(
         item=payload,
         settings_service=settings_service,
         settings=settings,

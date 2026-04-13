@@ -1,5 +1,7 @@
 """API endpoints for parser/admin settings."""
 
+import logging
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -20,6 +22,7 @@ from app.services.settings.pricing_service import PricingSettingsService
 from app.services.settings.weight_rule_service import WeightRuleService
 
 router = APIRouter(prefix="/settings", tags=["settings"])
+LOGGER = logging.getLogger(__name__)
 
 
 @router.get("/pricing", response_model=PricingSettingsResponse)
@@ -49,12 +52,20 @@ def delete_pricing_supplier(supplier_id: int, db: Session = Depends(get_db)):
 
 @router.get("/weight-rules", response_model=list[WeightRuleResponse])
 def list_weight_rules(db: Session = Depends(get_db)):
-    return WeightRuleService(db).list_rules()
+    try:
+        return WeightRuleService(db).list_rules()
+    except Exception:
+        LOGGER.exception("Failed to load weight rules, returning empty list")
+        return []
 
 
 @router.get("/weight-rules/missing-products", response_model=list[WeightMissingProductResponse])
 def list_missing_weight_products(limit: int = 500, db: Session = Depends(get_db)):
-    return WeightRuleService(db).list_missing_weight_products(limit=limit)
+    try:
+        return WeightRuleService(db).list_missing_weight_products(limit=limit)
+    except Exception:
+        LOGGER.exception("Failed to load missing weight products, returning empty list")
+        return []
 
 
 @router.post("/weight-rules", response_model=WeightRuleResponse)

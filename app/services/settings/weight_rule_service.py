@@ -43,6 +43,18 @@ def _normalize_match_haystack(*parts: str | None) -> str:
     return " ".join(normalized.split())
 
 
+def _unique_normalized_keywords(keywords: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for keyword in keywords:
+        normalized = _normalize_keyword(keyword)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+    return unique
+
+
 DEFAULT_WEIGHT_RULES: list[tuple[int, list[str]]] = [
     (
         80,
@@ -466,8 +478,8 @@ class WeightRuleService:
             for index, (weight_grams, keywords) in enumerate(DEFAULT_WEIGHT_RULES, start=1):
                 created = self.rule_repo.create(weight_grams=weight_grams, sort_order=index)
                 self.rule_repo.flush()
-                for keyword in keywords:
-                    self.keyword_repo.create(rule_id=created.id, keyword=_normalize_keyword(keyword))
+                for normalized in _unique_normalized_keywords(keywords):
+                    self.keyword_repo.create(rule_id=created.id, keyword=normalized)
             changed = True
             active = self.rule_repo.get_all_active()
 
@@ -487,8 +499,7 @@ class WeightRuleService:
                 changed = True
 
             existing = {item.keyword for item in self.keyword_repo.get_by_rule(rule.id)}
-            for keyword in keywords:
-                normalized = _normalize_keyword(keyword)
+            for normalized in _unique_normalized_keywords(keywords):
                 if normalized not in existing:
                     self.keyword_repo.create(rule_id=rule.id, keyword=normalized)
                     existing.add(normalized)
