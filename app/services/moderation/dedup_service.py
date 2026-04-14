@@ -34,18 +34,10 @@ class DedupService:
 
     @staticmethod
     def _normalize_legacy_source_price(price: float | None, currency: str | None) -> float | None:
+        _ = currency
         if price is None:
             return None
-        normalized_currency = (currency or "").upper()
-        normalized_price = float(price)
-        # Legacy guard: historical bug could persist non-RUB prices in cents (e.g. 43140 instead of 431.40).
-        if (
-            normalized_currency in {"USD", "EUR", "GBP"}
-            and normalized_price >= 10_000
-            and normalized_price.is_integer()
-        ):
-            return normalized_price / 100.0
-        return normalized_price
+        return float(price)
 
     def _build_effective_prices(self, products: list[Any]) -> dict[int, float | None]:
         if not products:

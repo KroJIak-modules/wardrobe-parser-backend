@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -16,7 +15,6 @@ from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
     ParserCategoryRepository,
-    ParserFavoriteProductRepository,
     ParserProductRepository,
     ParserSourceRepository,
 )
@@ -77,25 +75,8 @@ def _json_response_headers(upstream: Response) -> dict[str, str]:
 
 
 def _normalize_legacy_source_price(raw_price: Any, currency: str | None) -> float | None:
-    parsed = _safe_float(raw_price)
-    if parsed is None:
-        return None
-    normalized_currency = (currency or "").upper()
-    if normalized_currency not in {"USD", "EUR", "GBP"}:
-        return parsed
-    if parsed < 10_000:
-        return parsed
-    if isinstance(raw_price, str):
-        stripped = raw_price.strip().replace(",", ".")
-        # Do not touch normal decimal representation, only integer-like legacy cents.
-        if "." in stripped:
-            return parsed
-        if stripped.isdigit():
-            return parsed / 100.0
-        return parsed
-    if isinstance(raw_price, (int, float)) and float(raw_price).is_integer():
-        return parsed / 100.0
-    return parsed
+    _ = currency
+    return _safe_float(raw_price)
 
 
 def _price_input_from_item(item: dict[str, Any]) -> tuple[float | None, str | None]:
@@ -118,7 +99,6 @@ def _apply_backend_pricing_to_item(
     source_profile_map: dict[int, Any],
     weight_rules: list[Any],
     category_assigner: CategoryAssigner | None = None,
-    is_favorite: bool = False,
 ) -> dict[str, Any]:
     source_id = _safe_int(item.get("source_id"))
     source_profile = source_profile_map.get(source_id) if source_id is not None else None
@@ -184,9 +164,9 @@ def _apply_backend_pricing_to_item(
         item["price"] = source_price
         item["currency"] = source_currency
     if category_assigner is not None:
-        matches = category_assigner.match_many(item, is_favorite=is_favorite)
+        matches = category_assigner.match_many(item)
         primary = matches[0] if matches else None
-        item["is_favorite"] = bool(is_favorite)
+        item["is_favorite"] = False
         item["internal_category_ids"] = [match.category_id for match in matches if match.category_id > 0]
         item["internal_category_names"] = [match.category_name for match in matches if match.category_id > 0]
         item["internal_category_slugs"] = [match.category_slug for match in matches if match.category_id > 0]
@@ -204,7 +184,6 @@ def _safe_apply_backend_pricing_to_item(
     source_profile_map: dict[int, Any],
     weight_rules: list[Any],
     category_assigner: CategoryAssigner | None = None,
-    is_favorite: bool = False,
 ) -> dict[str, Any]:
     try:
         return _apply_backend_pricing_to_item(
@@ -214,7 +193,6 @@ def _safe_apply_backend_pricing_to_item(
             source_profile_map=source_profile_map,
             weight_rules=weight_rules,
             category_assigner=category_assigner,
-            is_favorite=is_favorite,
         )
     except Exception:
         LOGGER.exception("Failed to enrich product item", extra={"product_id": item.get("id")})
@@ -256,7 +234,6 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
     manual_repo = ParserCategoryManualProductRepository(db)
-    favorite_repo = ParserFavoriteProductRepository(db)
     product_ids = {
         product_id
         for product_id in (_safe_int(item.get("id")) for item in items if isinstance(item, dict))
@@ -264,7 +241,6 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
     }
     manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
     category_assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
-    favorite_product_ids = favorite_repo.get_product_id_set_for_ids(product_ids)
 
     payload["items"] = [
         _safe_apply_backend_pricing_to_item(
@@ -274,7 +250,6 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
             source_profile_map=source_profile_map,
             weight_rules=weight_rules,
             category_assigner=category_assigner,
-            is_favorite=(_safe_int(item.get("id")) in favorite_product_ids if isinstance(item, dict) else False),
         )
         if isinstance(item, dict)
         else item
@@ -314,8 +289,6 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
     manual_repo = ParserCategoryManualProductRepository(db)
     manual_map = manual_repo.get_grouped_by_product_ids({int(product_id)})
     category_assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
-    favorite_repo = ParserFavoriteProductRepository(db)
-    favorite_product_ids = favorite_repo.get_product_id_set_for_ids({int(product_id)})
     priced = _safe_apply_backend_pricing_to_item(
         item=payload,
         settings_service=settings_service,
@@ -323,7 +296,6 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
         source_profile_map=source_profile_map,
         weight_rules=weight_rules,
         category_assigner=category_assigner,
-        is_favorite=int(product_id) in favorite_product_ids,
     )
     return JSONResponse(
         content=priced,
@@ -336,38 +308,6 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
 async def proxy_products_root(request: Request) -> Response:
     body = await request.body()
     return forward_service_request(request=request, path="products", body=body)
-
-
-@router.post("/products/{product_id}/favorite")
-def add_product_favorite(product_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
-    product_repo = ParserProductRepository(db)
-    product = product_repo.get_active_by_id(product_id)
-    if product is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
-
-    favorite_repo = ParserFavoriteProductRepository(db)
-    existing = favorite_repo.get_by_product_id(product_id)
-    if existing is None:
-        favorite_repo.create(product_id=product_id)
-    product.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    return {"ok": True, "product_id": product_id, "is_favorite": True}
-
-
-@router.delete("/products/{product_id}/favorite")
-def remove_product_favorite(product_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
-    product_repo = ParserProductRepository(db)
-    product = product_repo.get_active_by_id(product_id)
-    if product is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
-
-    favorite_repo = ParserFavoriteProductRepository(db)
-    existing = favorite_repo.get_by_product_id(product_id)
-    if existing is not None:
-        db.delete(existing)
-    product.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    return {"ok": True, "product_id": product_id, "is_favorite": False}
 
 
 @router.api_route("/products/{path:path}", methods=_PROXY_PATH_METHODS)

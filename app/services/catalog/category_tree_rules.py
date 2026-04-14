@@ -80,32 +80,8 @@ def ensure_fallback(category_repo: ParserCategoryRepository) -> ParserCategory:
     return created
 
 
-def ensure_favorite(category_repo: ParserCategoryRepository) -> ParserCategory:
-    favorite = category_repo.get_favorite()
-    if favorite:
-        return favorite
-    created = category_repo.create(
-        name="Избранное",
-        slug="izbrannoe",
-        parent_id=None,
-        is_fallback=False,
-        is_favorite=True,
-        is_enabled=True,
-    )
-    category_repo.flush()
-    return created
-
-
 def purge_fallback_keywords(*, db: Session, keyword_repo: ParserCategoryKeywordRepository, fallback: ParserCategory) -> None:
     stale = keyword_repo.get_by_category(fallback.id)
-    if not stale:
-        return
-    for item in stale:
-        db.delete(item)
-
-
-def purge_favorite_keywords(*, db: Session, keyword_repo: ParserCategoryKeywordRepository, favorite: ParserCategory) -> None:
-    stale = keyword_repo.get_by_category(favorite.id)
     if not stale:
         return
     for item in stale:

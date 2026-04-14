@@ -13,7 +13,6 @@ from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
     ParserCategoryRepository,
-    ParserFavoriteProductRepository,
     ParserProductRepository,
 )
 from app.schemas.parser import (
@@ -27,7 +26,6 @@ from app.services.catalog.category_assignment import CategoryAssigner, aggregate
 from app.services.catalog.category_tree_rules import (
     build_unique_slug,
     ensure_fallback,
-    ensure_favorite,
     normalize_keyword,
     validate_parent_for_create,
     validate_parent_for_update,
@@ -46,7 +44,6 @@ class CategoryTreeService:
         self.category_repo = ParserCategoryRepository(db)
         self.keyword_repo = ParserCategoryKeywordRepository(db)
         self.manual_product_repo = ParserCategoryManualProductRepository(db)
-        self.favorite_repo = ParserFavoriteProductRepository(db)
         self.product_repo = ParserProductRepository(db)
 
     def _build_tree(self, categories: list[ParserCategory], designers_root: ParserCategory | None) -> list[CategoryTreeNodeResponse]:
@@ -63,9 +60,8 @@ class CategoryTreeService:
         products = self.product_repo.list_active_for_category_counts()
         product_ids = {int(item.id) for item in products}
         manual_map = self.manual_product_repo.get_grouped_by_product_ids(product_ids)
-        favorite_ids = self.favorite_repo.get_product_id_set_for_ids(product_ids)
         assigner = CategoryAssigner(base_tree, manual_category_ids_by_product=manual_map)
-        direct_counts = assigner.direct_counts(products, favorite_product_ids=favorite_ids)
+        direct_counts = assigner.direct_counts(products)
         aggregated_counts = aggregate_tree_counts(base_tree, direct_counts)
         return build_tree(
             categories,
@@ -140,7 +136,7 @@ class CategoryTreeService:
             node = by_id.get(int(category_id))
             if not node:
                 continue
-            if node.is_fallback or bool(getattr(node, "is_favorite", False)):
+            if node.is_fallback:
                 continue
             if node.deleted_at is None:
                 node.deleted_at = now
@@ -234,10 +230,13 @@ class CategoryTreeService:
     def _prepare_categories(self, *, sync_designers: bool) -> tuple[list[ParserCategory], ParserCategory | None, set[int]]:
         changed = False
         fallback = ensure_fallback(self.category_repo)
-        favorite = ensure_favorite(self.category_repo)
+        favorite = self.category_repo.get_favorite()
+        if favorite is not None and favorite.deleted_at is None:
+            favorite.deleted_at = datetime.now(timezone.utc)
+            changed = True
 
-        # Track cleanup changes for fallback/favorite explicitly.
-        if self._purge_keywords({int(fallback.id), int(favorite.id)}):
+        # Track cleanup changes for fallback explicitly.
+        if self._purge_keywords({int(fallback.id)}):
             changed = True
 
         categories = self.category_repo.get_all_active()
@@ -280,7 +279,7 @@ class CategoryTreeService:
 
     @staticmethod
     def _assert_keywords_editable(category: ParserCategory, has_children: bool, in_designers_branch: bool) -> None:
-        if category.is_fallback or bool(getattr(category, "is_favorite", False)) or in_designers_branch:
+        if category.is_fallback or in_designers_branch:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="У системной категории ключевые слова недоступны",
@@ -305,11 +304,7 @@ class CategoryTreeService:
         validate_parent_for_create(category_repo=self.category_repo, parent_id=payload.parent_id)
         if payload.parent_id is not None:
             parent = self.category_repo.get_by_id(payload.parent_id)
-            if parent is not None and (
-                parent.is_fallback
-                or bool(getattr(parent, "is_favorite", False))
-                or int(parent.id) in designers_branch_ids
-            ):
+            if parent is not None and (parent.is_fallback or int(parent.id) in designers_branch_ids):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Создание дочерних категорий в системной ветке запрещено",
@@ -336,7 +331,7 @@ class CategoryTreeService:
         if not category or category.deleted_at is not None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Категория не найдена")
         in_designers_branch = int(category.id) in designers_branch_ids
-        is_system = bool(category.is_fallback) or bool(getattr(category, "is_favorite", False)) or in_designers_branch
+        is_system = bool(category.is_fallback) or in_designers_branch
 
         if payload.name is not None:
             if is_system:
@@ -354,16 +349,12 @@ class CategoryTreeService:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Системную категорию нельзя перемещать в дереве")
             if payload.parent_id is not None:
                 parent = self.category_repo.get_by_id(payload.parent_id)
-                if parent is not None and (
-                    parent.is_fallback
-                    or bool(getattr(parent, "is_favorite", False))
-                    or int(parent.id) in designers_branch_ids
-                ):
+                if parent is not None and (parent.is_fallback or int(parent.id) in designers_branch_ids):
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
                         detail="Нельзя переместить категорию в системную ветку",
                     )
-            if (category.is_fallback or category.is_favorite) and payload.parent_id is not None:
+            if category.is_fallback and payload.parent_id is not None:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Системную категорию нельзя делать дочерней")
             validate_parent_for_update(category=category, parent_id=payload.parent_id, category_repo=self.category_repo)
 
@@ -383,8 +374,6 @@ class CategoryTreeService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Категория не найдена")
         if category.is_fallback:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Категорию 'Прочее' нельзя удалить")
-        if category.is_favorite:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Категорию 'Избранное' нельзя удалить")
         if int(category.id) in designers_branch_ids:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ветка «Дизайнеры» синхронизируется автоматически и не удаляется вручную")
         if self.category_repo.get_children(category_id):

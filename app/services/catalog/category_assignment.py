@@ -14,7 +14,6 @@ class CategoryMatch:
     category_name: str
     category_slug: str
     is_fallback: bool
-    is_favorite: bool
 
 
 class CategoryAssigner:
@@ -22,7 +21,6 @@ class CategoryAssigner:
         self._tree = tree
         self._flat = self._flatten(tree)
         self._fallback = next((node for node in self._flat if node.is_fallback), None)
-        self._favorite = next((node for node in self._flat if getattr(node, "is_favorite", False)), None)
         self._by_id = {int(node.id): node for node in self._flat}
         self._manual_category_ids_by_product = manual_category_ids_by_product or {}
 
@@ -63,12 +61,9 @@ class CategoryAssigner:
             category_name=node.name,
             category_slug=node.slug,
             is_fallback=bool(node.is_fallback),
-            is_favorite=bool(getattr(node, "is_favorite", False)),
         )
 
-    def match_many(self, item: Any, *, is_favorite: bool = False) -> list[CategoryMatch]:
-        if is_favorite and self._favorite is not None:
-            return [self._to_category_match(self._favorite)]
+    def match_many(self, item: Any) -> list[CategoryMatch]:
 
         if isinstance(item, dict):
             product_id_raw = item.get("id")
@@ -84,7 +79,7 @@ class CategoryAssigner:
         matched_nodes: list[tuple[int, int, CategoryTreeNodeResponse]] = []
 
         for node in self._flat:
-            if node.is_fallback or getattr(node, "is_favorite", False):
+            if node.is_fallback:
                 continue
             if not bool(getattr(node, "is_enabled", True)):
                 continue
@@ -136,29 +131,18 @@ class CategoryAssigner:
                         category_name="Прочее",
                         category_slug="prochee",
                         is_fallback=True,
-                        is_favorite=False,
                     )
                 ]
             return [self._to_category_match(self._fallback)]
         return ordered
 
-    def match(self, item: Any, *, is_favorite: bool = False) -> CategoryMatch:
-        return self.match_many(item, is_favorite=is_favorite)[0]
+    def match(self, item: Any) -> CategoryMatch:
+        return self.match_many(item)[0]
 
-    def direct_counts(self, items: list[Any], favorite_product_ids: set[int] | None = None) -> dict[int, int]:
+    def direct_counts(self, items: list[Any]) -> dict[int, int]:
         direct: dict[int, int] = {}
-        favorite_set = favorite_product_ids or set()
         for item in items:
-            if isinstance(item, dict):
-                product_id_raw = item.get("id")
-            else:
-                product_id_raw = getattr(item, "id", None)
-            try:
-                product_id = int(product_id_raw) if product_id_raw is not None else None
-            except (TypeError, ValueError):
-                product_id = None
-            is_favorite = product_id is not None and product_id in favorite_set
-            matched_categories = self.match_many(item, is_favorite=is_favorite)
+            matched_categories = self.match_many(item)
             for matched in matched_categories:
                 if matched.category_id <= 0:
                     continue
