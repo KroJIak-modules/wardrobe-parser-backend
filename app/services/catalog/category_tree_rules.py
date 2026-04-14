@@ -75,7 +75,7 @@ def ensure_fallback(category_repo: ParserCategoryRepository) -> ParserCategory:
     fallback = category_repo.get_fallback()
     if fallback:
         return fallback
-    created = category_repo.create(name="Прочее", slug="prochee", parent_id=None, is_fallback=True)
+    created = category_repo.create(name="Прочее", slug="prochee", parent_id=None, is_fallback=True, is_enabled=True)
     category_repo.flush()
     return created
 
@@ -90,6 +90,7 @@ def ensure_favorite(category_repo: ParserCategoryRepository) -> ParserCategory:
         parent_id=None,
         is_fallback=False,
         is_favorite=True,
+        is_enabled=True,
     )
     category_repo.flush()
     return created

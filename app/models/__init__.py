@@ -1,5 +1,5 @@
 from app.models.image_asset import ImageAsset
-from app.models.category import ParserCategory, ParserCategoryKeyword
+from app.models.category import ParserCategory, ParserCategoryKeyword, ParserCategoryManualProduct
 from app.models.parser_entities import ParserDedupDecision, ParserFavoriteProduct, ParserProduct, ParserSource
 from app.models.pricing import ParserPricingSettings, ParserSupplier, ParserSupplierShippingRate
 from app.models.product import Product
@@ -11,6 +11,7 @@ __all__ = [
     "ImageAsset",
     "ParserCategory",
     "ParserCategoryKeyword",
+    "ParserCategoryManualProduct",
     "ParserDedupDecision",
     "ParserFavoriteProduct",
     "ParserPricingSettings",

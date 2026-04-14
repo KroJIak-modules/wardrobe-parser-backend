@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.repositories import (
     ParserCategoryKeywordRepository,
+    ParserCategoryManualProductRepository,
     ParserCategoryRepository,
     ParserFavoriteProductRepository,
     ParserProductRepository,
@@ -183,11 +184,15 @@ def _apply_backend_pricing_to_item(
         item["price"] = source_price
         item["currency"] = source_currency
     if category_assigner is not None:
-        matched = category_assigner.match(item, is_favorite=is_favorite)
+        matches = category_assigner.match_many(item, is_favorite=is_favorite)
+        primary = matches[0] if matches else None
         item["is_favorite"] = bool(is_favorite)
-        item["internal_category_id"] = matched.category_id
-        item["internal_category_name"] = matched.category_name
-        item["internal_category_slug"] = matched.category_slug
+        item["internal_category_ids"] = [match.category_id for match in matches if match.category_id > 0]
+        item["internal_category_names"] = [match.category_name for match in matches if match.category_id > 0]
+        item["internal_category_slugs"] = [match.category_slug for match in matches if match.category_id > 0]
+        item["internal_category_id"] = primary.category_id if primary is not None else None
+        item["internal_category_name"] = primary.category_name if primary is not None else None
+        item["internal_category_slug"] = primary.category_slug if primary is not None else None
     return item
 
 
@@ -250,13 +255,15 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
     category_repo = ParserCategoryRepository(db)
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
-    category_assigner = CategoryAssigner(category_tree)
+    manual_repo = ParserCategoryManualProductRepository(db)
     favorite_repo = ParserFavoriteProductRepository(db)
     product_ids = {
         product_id
         for product_id in (_safe_int(item.get("id")) for item in items if isinstance(item, dict))
         if product_id is not None
     }
+    manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
+    category_assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
     favorite_product_ids = favorite_repo.get_product_id_set_for_ids(product_ids)
 
     payload["items"] = [
@@ -304,7 +311,9 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
     category_repo = ParserCategoryRepository(db)
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
-    category_assigner = CategoryAssigner(category_tree)
+    manual_repo = ParserCategoryManualProductRepository(db)
+    manual_map = manual_repo.get_grouped_by_product_ids({int(product_id)})
+    category_assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
     favorite_repo = ParserFavoriteProductRepository(db)
     favorite_product_ids = favorite_repo.get_product_id_set_for_ids({int(product_id)})
     priced = _safe_apply_backend_pricing_to_item(

@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 
 class CategoryKeywordRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=255)
+    scope: Literal["local", "title"] = "local"
+
+
+class CategoryManualProductRequest(BaseModel):
+    product_id: int
+
+
+class CategoryManualProductResponse(BaseModel):
+    product_id: int
+    source_id: int
+    source_name: str | None = None
+    title: str
+    url: str
+    status: str
+    image_url: str | None = None
+    category_names: list[str] = Field(default_factory=list)
 
 
 class CategoryCreateRequest(BaseModel):
@@ -19,6 +36,7 @@ class CategoryCreateRequest(BaseModel):
 class CategoryUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     parent_id: int | None = None
+    is_enabled: bool | None = None
 
 
 class CategoryTreeNodeResponse(BaseModel):
@@ -28,8 +46,16 @@ class CategoryTreeNodeResponse(BaseModel):
     parent_id: int | None = None
     is_fallback: bool
     is_favorite: bool = False
+    is_enabled: bool = True
+    is_system: bool = False
+    has_children: bool = False
+    keywords_editable: bool = True
+    keywords_locked_reason: str | None = None
+    is_designers_root: bool = False
+    is_in_designers_branch: bool = False
     product_count: int = 0
     keywords: list[str] = Field(default_factory=list)
+    title_keywords: list[str] = Field(default_factory=list)
     effective_keywords: list[str] = Field(default_factory=list)
     children: list["CategoryTreeNodeResponse"] = Field(default_factory=list)
 
@@ -76,11 +102,13 @@ class PricingSettingsUpdateRequest(BaseModel):
     bybit_extra_rub: float | None = Field(default=None, ge=0.0, le=1000.0)
     eur_to_usd_rate: float | None = Field(default=None, ge=0.01, le=1000.0)
     gbp_to_usd_rate: float | None = Field(default=None, ge=0.01, le=1000.0)
+    final_rounding_mode: str | None = Field(default=None, min_length=1, max_length=32)
     payment_fee_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     customs_processing_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     customs_fixed_rub: float | None = Field(default=None, ge=0.0, le=1_000_000.0)
     shipping_alt_threshold_eur: float | None = Field(default=None, ge=0.0, le=100_000.0)
     tax_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    svc_rules: list[dict] | None = None
     insurance_rules: list[dict] | None = None
     service_fee_rules: list[dict] | None = None
     shipping_rules: dict[str, dict[str, list[dict]]] | None = None
@@ -132,11 +160,13 @@ class PricingSettingsResponse(BaseModel):
     bybit_extra_rub: float
     eur_to_usd_rate: float
     gbp_to_usd_rate: float
+    final_rounding_mode: str
     payment_fee_rate: float
     customs_processing_rate: float
     customs_fixed_rub: float
     shipping_alt_threshold_eur: float
     tax_rate: float
+    svc_rules: list[dict] = Field(default_factory=list)
     insurance_rules: list[dict] = Field(default_factory=list)
     service_fee_rules: list[dict] = Field(default_factory=list)
     shipping_rules: dict[str, dict[str, list[dict]]] = Field(default_factory=dict)
@@ -179,6 +209,9 @@ class ProductResponse(BaseModel):
     internal_category_id: int | None = None
     internal_category_name: str | None = None
     internal_category_slug: str | None = None
+    internal_category_ids: list[int] = Field(default_factory=list)
+    internal_category_names: list[str] = Field(default_factory=list)
+    internal_category_slugs: list[str] = Field(default_factory=list)
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

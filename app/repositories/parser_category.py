@@ -16,7 +16,8 @@ class ParserCategoryRepository(BaseRepository[ParserCategory]):
         return (
             self.query()
             .filter(ParserCategory.deleted_at.is_(None))
-            .order_by(ParserCategory.parent_id.asc().nullsfirst(), ParserCategory.name.asc())
+            # Keep explicit UI/menu order stable by creation order inside each parent.
+            .order_by(ParserCategory.parent_id.asc().nullsfirst(), ParserCategory.id.asc())
             .all()
         )
 
@@ -57,18 +58,36 @@ class ParserCategoryKeywordRepository(BaseRepository[ParserCategoryKeyword]):
     def __init__(self, session: Session):
         super().__init__(session, ParserCategoryKeyword)
 
-    def get_by_category(self, category_id: int) -> list[ParserCategoryKeyword]:
-        return (
-            self.query()
-            .filter(ParserCategoryKeyword.category_id == category_id)
-            .order_by(ParserCategoryKeyword.keyword.asc())
-            .all()
-        )
+    @staticmethod
+    def _normalize_scope(scope: str | None) -> str:
+        return "title" if (scope or "").strip().lower() == "title" else "local"
 
-    def get_exact(self, category_id: int, keyword: str) -> ParserCategoryKeyword | None:
+    def get_by_category(self, category_id: int, scope: str | None = None) -> list[ParserCategoryKeyword]:
+        normalized_scope = self._normalize_scope(scope) if scope is not None else None
+        query = self.query().filter(ParserCategoryKeyword.category_id == category_id)
+        if normalized_scope is not None:
+            query = query.filter(ParserCategoryKeyword.keyword_scope == normalized_scope)
+        return query.order_by(ParserCategoryKeyword.keyword.asc()).all()
+
+    def get_exact(self, category_id: int, keyword: str, scope: str | None = "local") -> ParserCategoryKeyword | None:
+        normalized_scope = self._normalize_scope(scope)
         return (
             self.query()
             .filter(ParserCategoryKeyword.category_id == category_id)
             .filter(ParserCategoryKeyword.keyword == keyword)
+            .filter(ParserCategoryKeyword.keyword_scope == normalized_scope)
             .first()
         )
+
+    def get_grouped_keywords(self, scope: str | None = "local") -> dict[int, list[str]]:
+        normalized_scope = self._normalize_scope(scope)
+        grouped: dict[int, list[str]] = {}
+        rows = (
+            self.query()
+            .filter(ParserCategoryKeyword.keyword_scope == normalized_scope)
+            .order_by(ParserCategoryKeyword.category_id.asc(), ParserCategoryKeyword.keyword.asc())
+            .all()
+        )
+        for row in rows:
+            grouped.setdefault(int(row.category_id), []).append(str(row.keyword))
+        return grouped

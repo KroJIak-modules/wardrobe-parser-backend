@@ -111,7 +111,11 @@ class DedupService:
         return payload
 
     def get_candidates(self, limit: int = settings.dedup_candidates_default_limit) -> DedupCandidateListResponse:
-        products = self.product_repo.filter_products(limit=settings.dedup_scan_limit)
+        products = [
+            item
+            for item in self.product_repo.filter_products(limit=settings.dedup_scan_limit)
+            if str(getattr(item, "status", "") or "").lower() == "available"
+        ]
         effective_prices = self._build_effective_prices(products)
         buckets: dict[tuple[str, str], list] = {}
         for product in products:

@@ -27,7 +27,7 @@ LOGGER = logging.getLogger(__name__)
 
 @router.get("/pricing", response_model=PricingSettingsResponse)
 def get_pricing_settings(db: Session = Depends(get_db)):
-    return PricingSettingsService(db).get_settings()
+    return PricingSettingsService(db).get_settings(refresh_bybit=False)
 
 
 @router.patch("/pricing", response_model=PricingSettingsResponse)

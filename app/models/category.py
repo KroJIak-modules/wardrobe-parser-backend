@@ -18,6 +18,7 @@ class ParserCategory(Base):
     parent_id = Column(Integer, ForeignKey("parser_category.id"), nullable=True)
     is_fallback = Column(Boolean, nullable=False, default=False)
     is_favorite = Column(Boolean, nullable=False, default=False)
+    is_enabled = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -33,6 +34,7 @@ class ParserCategory(Base):
         Index("idx_parser_category_deleted_at", "deleted_at"),
         Index("idx_parser_category_is_fallback", "is_fallback"),
         Index("idx_parser_category_is_favorite", "is_favorite"),
+        Index("idx_parser_category_is_enabled", "is_enabled"),
     )
 
 
@@ -44,12 +46,31 @@ class ParserCategoryKeyword(Base):
     id = Column(Integer, primary_key=True)
     category_id = Column(Integer, ForeignKey("parser_category.id", ondelete="CASCADE"), nullable=False)
     keyword = Column(String(255), nullable=False)
+    keyword_scope = Column(String(16), nullable=False, default="local", server_default="local")
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     category = relationship("ParserCategory", back_populates="keywords")
 
     __table_args__ = (
-        UniqueConstraint("category_id", "keyword", name="uq_parser_category_keyword"),
+        UniqueConstraint("category_id", "keyword", "keyword_scope", name="uq_parser_category_keyword_scope"),
         Index("idx_parser_category_keyword_category", "category_id"),
         Index("idx_parser_category_keyword_keyword", "keyword"),
+        Index("idx_parser_category_keyword_scope", "keyword_scope"),
+    )
+
+
+class ParserCategoryManualProduct(Base):
+    """Manual product-to-category assignments."""
+
+    __tablename__ = "parser_category_manual_product"
+
+    id = Column(Integer, primary_key=True)
+    category_id = Column(Integer, ForeignKey("parser_category.id", ondelete="CASCADE"), nullable=False)
+    product_id = Column(Integer, ForeignKey("parser_product.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("category_id", "product_id", name="uq_parser_category_manual_product"),
+        Index("idx_parser_category_manual_category", "category_id"),
+        Index("idx_parser_category_manual_product", "product_id"),
     )

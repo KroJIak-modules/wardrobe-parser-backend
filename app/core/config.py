@@ -51,7 +51,7 @@ class Settings(BaseSettings):
         env="PRICING_BYBIT_OUTLIER_MAX_DEVIATION_RATIO",
     )
     pricing_bybit_worker_interval_sec: int = Field(
-        default=1800,
+        default=10800,
         ge=30,
         le=86400,
         env="PRICING_BYBIT_WORKER_INTERVAL_SEC",

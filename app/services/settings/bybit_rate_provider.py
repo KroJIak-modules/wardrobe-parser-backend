@@ -76,6 +76,9 @@ class BybitP2PRateProvider:
 
     _cache: dict[str, CachedSnapshot] = {}
     _lock = threading.Lock()
+    _ADEQUATE_MIN_RANGE_RUB = 5_000.0
+    _ADEQUATE_MIN_MAX_RUB = 20_000.0
+    _ADEQUATE_MIN_USDT_LIQUIDITY = 100.0
 
     @classmethod
     def get_rate(
@@ -206,9 +209,12 @@ class BybitP2PRateProvider:
             ads=ads,
             max_deviation_ratio=outlier_max_deviation_ratio,
         )
-        representative_rate = cls._representative_rate(filtered_ads)
+        adequate_ads = cls._filter_adequate_ads(filtered_ads)
+        if not adequate_ads:
+            adequate_ads = list(filtered_ads)
+        representative_rate = cls._representative_rate(adequate_ads)
         bucket_quotes = cls._build_bucket_quotes(
-            ads=filtered_ads,
+            ads=adequate_ads,
             bucket_step_usdt=bucket_step_usdt,
             bucket_max_usdt=bucket_max_usdt,
         )
@@ -217,7 +223,7 @@ class BybitP2PRateProvider:
             bucket_quotes=bucket_quotes,
             fetched_at=time.time(),
             ads_total=len(ads),
-            ads_used=len(filtered_ads),
+            ads_used=len(adequate_ads),
             outliers_dropped=outliers_dropped,
         )
 
@@ -278,11 +284,34 @@ class BybitP2PRateProvider:
 
     @classmethod
     def _representative_rate(cls, ads: list[BybitAd]) -> float:
-        prices = sorted(item.price_rub_per_usdt for item in ads if item.price_rub_per_usdt > 0)
-        if not prices:
+        first_adequate = next((item for item in ads if item.price_rub_per_usdt > 0), None)
+        if first_adequate is None:
             raise RuntimeError("Bybit snapshot has no usable prices")
-        top = prices[: min(10, len(prices))]
-        return float(median(top))
+        return float(first_adequate.price_rub_per_usdt)
+
+    @classmethod
+    def _filter_adequate_ads(cls, ads: list[BybitAd]) -> list[BybitAd]:
+        output: list[BybitAd] = []
+        for ad in ads:
+            if ad.price_rub_per_usdt <= 0:
+                continue
+            if ad.max_rub == float("inf"):
+                max_rub = ad.quantity_usdt * ad.price_rub_per_usdt
+            else:
+                max_rub = float(ad.max_rub)
+            min_rub = max(0.0, float(ad.min_rub))
+            limit_range = max_rub - min_rub
+            max_usdt_by_amount = max_rub / ad.price_rub_per_usdt if max_rub > 0 else 0.0
+            effective_usdt = min(float(ad.quantity_usdt), max_usdt_by_amount)
+            if limit_range < cls._ADEQUATE_MIN_RANGE_RUB:
+                continue
+            if max_rub < cls._ADEQUATE_MIN_MAX_RUB:
+                continue
+            if effective_usdt < cls._ADEQUATE_MIN_USDT_LIQUIDITY:
+                continue
+            output.append(ad)
+        output.sort(key=lambda item: item.price_rub_per_usdt)
+        return output
 
     @classmethod
     def _build_bucket_quotes(

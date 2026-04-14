@@ -18,11 +18,13 @@ class CategoryMatch:
 
 
 class CategoryAssigner:
-    def __init__(self, tree: list[CategoryTreeNodeResponse]):
+    def __init__(self, tree: list[CategoryTreeNodeResponse], manual_category_ids_by_product: dict[int, list[int]] | None = None):
         self._tree = tree
         self._flat = self._flatten(tree)
         self._fallback = next((node for node in self._flat if node.is_fallback), None)
         self._favorite = next((node for node in self._flat if getattr(node, "is_favorite", False)), None)
+        self._by_id = {int(node.id): node for node in self._flat}
+        self._manual_category_ids_by_product = manual_category_ids_by_product or {}
 
     @staticmethod
     def _flatten(nodes: list[CategoryTreeNodeResponse]) -> list[CategoryTreeNodeResponse]:
@@ -38,66 +40,110 @@ class CategoryAssigner:
             return ""
         return str(value).strip()
 
-    def _haystack(self, item: Any) -> str:
+    def _local_haystack(self, item: Any) -> str:
         if isinstance(item, dict):
-            title = self._as_text(item.get("title"))
             vendor = self._as_text(item.get("vendor"))
             product_type = self._as_text(item.get("product_type"))
-            handle = self._as_text(item.get("handle"))
         else:
-            title = self._as_text(getattr(item, "title", None))
             vendor = self._as_text(getattr(item, "vendor", None))
             product_type = self._as_text(getattr(item, "product_type", None))
-            handle = self._as_text(getattr(item, "handle", None))
-        return " ".join([title, vendor, product_type, handle]).lower()
+        return " ".join([vendor, product_type]).lower()
 
-    def match(self, item: Any, *, is_favorite: bool = False) -> CategoryMatch:
+    def _title_haystack(self, item: Any) -> str:
+        if isinstance(item, dict):
+            title = self._as_text(item.get("title"))
+        else:
+            title = self._as_text(getattr(item, "title", None))
+        return title.lower()
+
+    @staticmethod
+    def _to_category_match(node: CategoryTreeNodeResponse) -> CategoryMatch:
+        return CategoryMatch(
+            category_id=node.id,
+            category_name=node.name,
+            category_slug=node.slug,
+            is_fallback=bool(node.is_fallback),
+            is_favorite=bool(getattr(node, "is_favorite", False)),
+        )
+
+    def match_many(self, item: Any, *, is_favorite: bool = False) -> list[CategoryMatch]:
         if is_favorite and self._favorite is not None:
-            return CategoryMatch(
-                category_id=self._favorite.id,
-                category_name=self._favorite.name,
-                category_slug=self._favorite.slug,
-                is_fallback=False,
-                is_favorite=True,
-            )
+            return [self._to_category_match(self._favorite)]
 
-        haystack = self._haystack(item)
-        best_node: CategoryTreeNodeResponse | None = None
-        best_score = 0
+        if isinstance(item, dict):
+            product_id_raw = item.get("id")
+        else:
+            product_id_raw = getattr(item, "id", None)
+        try:
+            product_id = int(product_id_raw) if product_id_raw is not None else None
+        except (TypeError, ValueError):
+            product_id = None
+
+        local_haystack = self._local_haystack(item)
+        title_haystack = self._title_haystack(item)
+        matched_nodes: list[tuple[int, int, CategoryTreeNodeResponse]] = []
 
         for node in self._flat:
             if node.is_fallback or getattr(node, "is_favorite", False):
                 continue
-            if not node.effective_keywords:
+            if not bool(getattr(node, "is_enabled", True)):
+                continue
+            local_keywords = list(getattr(node, "keywords", []) or [])
+            title_keywords = list(getattr(node, "title_keywords", []) or [])
+            if not local_keywords and not title_keywords:
                 continue
             score = 0
-            for keyword in node.effective_keywords:
+            for keyword in local_keywords:
                 normalized = keyword.strip().lower()
                 if not normalized:
                     continue
-                if normalized in haystack:
+                if normalized in local_haystack:
                     score += len(normalized)
-            if score > 0 and score > best_score:
-                best_node = node
-                best_score = score
+            for keyword in title_keywords:
+                normalized = keyword.strip().lower()
+                if not normalized:
+                    continue
+                if normalized in title_haystack:
+                    score += len(normalized)
+            if score > 0:
+                matched_nodes.append((-score, int(node.id), node))
 
-        chosen = best_node or self._fallback
-        if chosen is None:
-            return CategoryMatch(
-                category_id=0,
-                category_name="Прочее",
-                category_slug="prochee",
-                is_fallback=True,
-                is_favorite=False,
-            )
+        matched_nodes.sort(key=lambda item: (item[0], item[1]))
+        auto_matches = [self._to_category_match(node) for _, _, node in matched_nodes]
+        manual_matches: list[CategoryMatch] = []
+        if product_id is not None:
+            for category_id in self._manual_category_ids_by_product.get(product_id, []):
+                node = self._by_id.get(int(category_id))
+                if node is None:
+                    continue
+                if not bool(getattr(node, "is_enabled", True)):
+                    continue
+                manual_matches.append(self._to_category_match(node))
 
-        return CategoryMatch(
-            category_id=chosen.id,
-            category_name=chosen.name,
-            category_slug=chosen.slug,
-            is_fallback=bool(chosen.is_fallback),
-            is_favorite=bool(getattr(chosen, "is_favorite", False)),
-        )
+        ordered: list[CategoryMatch] = []
+        seen: set[int] = set()
+        for match in [*manual_matches, *auto_matches]:
+            if match.category_id <= 0 or match.category_id in seen:
+                continue
+            seen.add(match.category_id)
+            ordered.append(match)
+
+        if not ordered:
+            if self._fallback is None:
+                return [
+                    CategoryMatch(
+                        category_id=0,
+                        category_name="Прочее",
+                        category_slug="prochee",
+                        is_fallback=True,
+                        is_favorite=False,
+                    )
+                ]
+            return [self._to_category_match(self._fallback)]
+        return ordered
+
+    def match(self, item: Any, *, is_favorite: bool = False) -> CategoryMatch:
+        return self.match_many(item, is_favorite=is_favorite)[0]
 
     def direct_counts(self, items: list[Any], favorite_product_ids: set[int] | None = None) -> dict[int, int]:
         direct: dict[int, int] = {}
@@ -112,10 +158,11 @@ class CategoryAssigner:
             except (TypeError, ValueError):
                 product_id = None
             is_favorite = product_id is not None and product_id in favorite_set
-            matched = self.match(item, is_favorite=is_favorite)
-            if matched.category_id <= 0:
-                continue
-            direct[matched.category_id] = direct.get(matched.category_id, 0) + 1
+            matched_categories = self.match_many(item, is_favorite=is_favorite)
+            for matched in matched_categories:
+                if matched.category_id <= 0:
+                    continue
+                direct[matched.category_id] = direct.get(matched.category_id, 0) + 1
         return direct
 
 

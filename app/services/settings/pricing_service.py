@@ -33,14 +33,15 @@ _FORMULA_LINES = [
     "PFR = BUY * PFRP",
     "INS = insurance tier by SPE",
     "CDR = ((max(0, SPE - THR) * DUT) * (1 + CPR)) * (E2U * BFX) + CFX",
-    "SVC = service fee tier by BUY",
-    "SUB = BUY + PFR + INS + CDR + SSR[SUP,STP] + SVC",
-    "TAX = SUB * TXR",
-    "FPR = ceil(SUB + TAX)",
+    "SVC = configurable surcharge by BUY (fixed RUB or percent)",
+    "SUB = BUY + PFR + INS + CDR + SSR[SUP,RNG]",
+    "SUBM = SUB * (1 + MUP) + SVC",
+    "TAX = SUBM * TXR",
+    "FPR = round(SUBM + TAX, RND)",
 ]
 
 _FORMULA_LATEX = (
-    r"\left\lceil\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,STP]+SVC\right)\cdot MP+\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,STP]+SVC\right)\cdot MP\right)\cdot TXR\right\rceil"
+    r"\operatorname{round}_{RND}\!\left(\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,RNG]\right)\cdot(1+MUP)+SVC\right)+\left(\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,RNG]\right)\cdot(1+MUP)+SVC\right)\cdot TXR\right)\right)"
 )
 
 _FORMULA_LEGEND = [
@@ -48,7 +49,7 @@ _FORMULA_LEGEND = [
     {"key": "SPU", "description": "Цена товара в USD."},
     {"key": "SPE", "description": "Цена товара в EUR (для таможни и страхования)."},
     {"key": "SPR", "description": "Цена товара в RUB по курсу Bybit."},
-    {"key": "BBR", "description": "Курс выбранного Bybit-ордера/бакета для суммы этого товара (USDT/RUB)."},
+    {"key": "BBR", "description": "Курс первого адекватного Bybit-ордера (единый для всех товаров, USDT/RUB)."},
     {"key": "BEX", "description": "Надбавка к курсу Bybit."},
     {"key": "BFX", "description": "Итоговый курс USDT/RUB: BBR + BEX."},
     {"key": "E2U", "description": "Коэффициент EUR -> USD."},
@@ -65,13 +66,15 @@ _FORMULA_LEGEND = [
     {"key": "CDR", "description": "Таможня в RUB."},
     {"key": "SSR", "description": "Доставка поставщика."},
     {"key": "SUP", "description": "Поставщик."},
-    {"key": "STP", "description": "Шаг по 500г."},
+    {"key": "RNG", "description": "Весовой диапазон тарифа доставки."},
     {"key": "INS", "description": "Страховка в RUB."},
-    {"key": "SVC", "description": "Комиссия сервиса в RUB."},
-    {"key": "SUB", "description": "Сумма до налога в RUB."},
+    {"key": "SVC", "description": "Пользовательская надбавка сервиса в RUB (фикс или % от BUY)."},
+    {"key": "SUB", "description": "База до наценки и SVC: BUY + PFR + INS + CDR + SSR."},
+    {"key": "SUBM", "description": "Сумма до налога: SUB * (1 + MUP) + SVC."},
     {"key": "TXR", "description": "Ставка налога."},
     {"key": "TAX", "description": "Налог в RUB."},
-    {"key": "MP", "description": "Множитель наценки."},
+    {"key": "MUP", "description": "Наценка (доля к SUB, например 0.25 = +25%)."},
+    {"key": "RND", "description": "Режим округления финальной цены."},
     {"key": "FPR", "description": "Финальная цена в RUB."},
 ]
 
@@ -94,48 +97,48 @@ _DEFAULT_SERVICE_FEE_RULES: list[dict[str, Any]] = [
 _DEFAULT_SHIPPING_RULES: dict[str, dict[str, list[dict[str, Any]]]] = {
     "US": {
         "normal": [
-            {"kg": 0.5, "rub": 1400.0},
-            {"kg": 1.0, "rub": 1650.0},
-            {"kg": 1.5, "rub": 2250.0},
-            {"kg": 2.0, "rub": 2900.0},
-            {"kg": 2.5, "rub": 3500.0},
-            {"kg": 3.0, "rub": 4100.0},
+            {"min_kg": 0.0, "max_kg": 0.5, "rub": 1400.0},
+            {"min_kg": 0.5, "max_kg": 1.0, "rub": 1650.0},
+            {"min_kg": 1.0, "max_kg": 1.5, "rub": 2250.0},
+            {"min_kg": 1.5, "max_kg": 2.0, "rub": 2900.0},
+            {"min_kg": 2.0, "max_kg": 2.5, "rub": 3500.0},
+            {"min_kg": 2.5, "max_kg": None, "rub": 4100.0},
         ],
         "alt": [
-            {"kg": 0.5, "rub": 1700.0},
-            {"kg": 1.0, "rub": 3350.0},
-            {"kg": 1.5, "rub": 4100.0},
-            {"kg": 2.0, "rub": 4950.0},
-            {"kg": 2.5, "rub": 5650.0},
-            {"kg": 3.0, "rub": 6500.0},
+            {"min_kg": 0.0, "max_kg": 0.5, "rub": 1700.0},
+            {"min_kg": 0.5, "max_kg": 1.0, "rub": 3350.0},
+            {"min_kg": 1.0, "max_kg": 1.5, "rub": 4100.0},
+            {"min_kg": 1.5, "max_kg": 2.0, "rub": 4950.0},
+            {"min_kg": 2.0, "max_kg": 2.5, "rub": 5650.0},
+            {"min_kg": 2.5, "max_kg": None, "rub": 6500.0},
         ],
     },
     "EU": {
         "normal": [
-            {"kg": 0.5, "rub": 1100.0},
-            {"kg": 1.0, "rub": 1500.0},
-            {"kg": 1.5, "rub": 1900.0},
-            {"kg": 2.0, "rub": 2300.0},
-            {"kg": 2.5, "rub": 2700.0},
-            {"kg": 3.0, "rub": 3150.0},
+            {"min_kg": 0.0, "max_kg": 0.5, "rub": 1100.0},
+            {"min_kg": 0.5, "max_kg": 1.0, "rub": 1500.0},
+            {"min_kg": 1.0, "max_kg": 1.5, "rub": 1900.0},
+            {"min_kg": 1.5, "max_kg": 2.0, "rub": 2300.0},
+            {"min_kg": 2.0, "max_kg": 2.5, "rub": 2700.0},
+            {"min_kg": 2.5, "max_kg": None, "rub": 3150.0},
         ],
         "alt": [
-            {"kg": 0.5, "rub": 2300.0},
-            {"kg": 1.0, "rub": 2750.0},
-            {"kg": 1.5, "rub": 3750.0},
-            {"kg": 2.0, "rub": 4800.0},
-            {"kg": 2.5, "rub": 5800.0},
-            {"kg": 3.0, "rub": 6800.0},
+            {"min_kg": 0.0, "max_kg": 0.5, "rub": 2300.0},
+            {"min_kg": 0.5, "max_kg": 1.0, "rub": 2750.0},
+            {"min_kg": 1.0, "max_kg": 1.5, "rub": 3750.0},
+            {"min_kg": 1.5, "max_kg": 2.0, "rub": 4800.0},
+            {"min_kg": 2.0, "max_kg": 2.5, "rub": 5800.0},
+            {"min_kg": 2.5, "max_kg": None, "rub": 6800.0},
         ],
     },
     "UK": {
         "normal": [
-            {"kg": 0.5, "rub": 3400.0},
-            {"kg": 1.0, "rub": 3900.0},
-            {"kg": 1.5, "rub": 4400.0},
-            {"kg": 2.0, "rub": 4900.0},
-            {"kg": 2.5, "rub": 5450.0},
-            {"kg": 3.0, "rub": 5950.0},
+            {"min_kg": 0.0, "max_kg": 0.5, "rub": 3400.0},
+            {"min_kg": 0.5, "max_kg": 1.0, "rub": 3900.0},
+            {"min_kg": 1.0, "max_kg": 1.5, "rub": 4400.0},
+            {"min_kg": 1.5, "max_kg": 2.0, "rub": 4900.0},
+            {"min_kg": 2.0, "max_kg": 2.5, "rub": 5450.0},
+            {"min_kg": 2.5, "max_kg": None, "rub": 5950.0},
         ],
         "alt": [],
     },
@@ -280,6 +283,113 @@ class PricingSettingsService:
         return value
 
     @staticmethod
+    def _normalize_svc_rule_mode(raw: str | None, *, default: str = "fixed_rub") -> str:
+        value = (raw or default).strip().lower()
+        if value not in {"fixed_rub", "percent"}:
+            return default
+        return value
+
+    @staticmethod
+    def _normalize_final_rounding_mode(raw: str | None, *, default: str = "unit") -> str:
+        value = (raw or default).strip().lower()
+        if value not in {"none", "unit", "ten", "hundred", "thousand"}:
+            return default
+        return value
+
+    @staticmethod
+    def _apply_final_rounding(value: float, mode: str) -> float:
+        safe_value = float(value)
+        normalized_mode = PricingSettingsService._normalize_final_rounding_mode(mode)
+        if normalized_mode == "none":
+            return safe_value
+        if normalized_mode == "unit":
+            return float(math.ceil(safe_value))
+        step_map = {
+            "ten": 10.0,
+            "hundred": 100.0,
+            "thousand": 1000.0,
+        }
+        step = float(step_map.get(normalized_mode, 1.0))
+        return float(math.ceil(safe_value / step) * step)
+
+    @classmethod
+    def _normalize_svc_rules(cls, raw_rules: Any) -> list[dict[str, float | str]]:
+        if not isinstance(raw_rules, list):
+            return []
+        normalized: list[dict[str, float | str]] = []
+        for row in raw_rules:
+            if not isinstance(row, dict):
+                continue
+            min_rub = cls._safe_float(row.get("min_rub"))
+            max_rub = cls._safe_float(row.get("max_rub"))
+            value = cls._safe_float(row.get("value"))
+            if min_rub is None or value is None:
+                continue
+            min_rub = max(0.0, float(min_rub))
+            max_rub_value = None if max_rub is None else max(0.0, float(max_rub))
+            if max_rub_value is not None and max_rub_value <= min_rub:
+                continue
+            normalized.append(
+                {
+                    "min_rub": min_rub,
+                    "max_rub": max_rub_value,
+                    "mode": cls._normalize_svc_rule_mode(str(row.get("mode") or "fixed_rub")),
+                    "value": max(0.0, float(value)),
+                }
+            )
+        normalized.sort(
+            key=lambda item: (
+                float(item["min_rub"]),
+                float(item["max_rub"]) if item.get("max_rub") is not None else float("inf"),
+            )
+        )
+        return normalized
+
+    @staticmethod
+    def _validate_svc_rules_no_overlap(rules: list[dict[str, float | str]]) -> None:
+        previous_max: float | None = None
+        for item in rules:
+            min_rub = float(item["min_rub"])
+            max_raw = item.get("max_rub")
+            max_rub = None if max_raw is None else float(max_raw)
+            if max_rub is not None and max_rub <= min_rub:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="SVC: конец диапазона должен быть больше начала",
+                )
+            if previous_max is not None and min_rub < previous_max:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="SVC: диапазоны пересекаются, укажи непересекающиеся интервалы",
+                )
+            previous_max = max_rub
+
+    @staticmethod
+    def _sanitize_svc_rule_boundaries(rules: list[dict[str, float | str]]) -> list[dict[str, float | str]]:
+        sanitized: list[dict[str, float | str]] = []
+        for item in sorted(
+            rules,
+            key=lambda row: (
+                float(row["min_rub"]),
+                float(row["max_rub"]) if row.get("max_rub") is not None else float("inf"),
+            ),
+        ):
+            min_rub = max(0.0, float(item["min_rub"]))
+            max_raw = item.get("max_rub")
+            max_rub = None if max_raw is None else max(0.0, float(max_raw))
+            if max_rub is not None and max_rub <= min_rub:
+                continue
+            sanitized.append(
+                {
+                    "min_rub": min_rub,
+                    "max_rub": max_rub,
+                    "mode": PricingSettingsService._normalize_svc_rule_mode(str(item.get("mode") or "fixed_rub")),
+                    "value": max(0.0, float(item.get("value") or 0.0)),
+                }
+            )
+        return sanitized
+
+    @staticmethod
     def _to_rub(value: float, currency: str, *, usd_to_rub: float, eur_to_rub: float) -> float:
         normalized = PricingSettingsService._normalize_currency(currency)
         if normalized == "RUB":
@@ -371,25 +481,45 @@ class PricingSettingsService:
         return normalized
 
     @staticmethod
-    def _normalize_shipping_rows(rows: Any) -> list[dict[str, float]]:
+    def _normalize_shipping_rows(rows: Any) -> list[dict[str, Any]]:
         if not isinstance(rows, list):
             return []
-        normalized: list[dict[str, float]] = []
+        normalized: list[dict[str, Any]] = []
+        legacy_thresholds: list[tuple[float, float]] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
+            min_kg = PricingSettingsService._safe_float(row.get("min_kg"))
+            max_kg = PricingSettingsService._safe_float(row.get("max_kg"))
             kg = PricingSettingsService._safe_float(row.get("kg"))
             rub = PricingSettingsService._safe_float(row.get("rub"))
-            if kg is None or kg <= 0:
+            safe_rub = max(0.0, float(rub or 0.0))
+            if min_kg is not None or max_kg is not None:
+                safe_min = max(0.0, float(min_kg or 0.0))
+                safe_max = None if max_kg is None else max(0.0, float(max_kg))
+                if safe_max is not None and safe_max <= safe_min:
+                    continue
+                normalized.append({"min_kg": safe_min, "max_kg": safe_max, "rub": safe_rub})
                 continue
-            normalized.append({"kg": float(kg), "rub": max(0.0, float(rub or 0.0))})
-        normalized.sort(key=lambda item: item["kg"])
+            if kg is not None and kg > 0:
+                legacy_thresholds.append((float(kg), safe_rub))
+        if not normalized and legacy_thresholds:
+            legacy_thresholds.sort(key=lambda item: item[0])
+            previous_kg = 0.0
+            for threshold_kg, rub in legacy_thresholds:
+                if threshold_kg <= previous_kg:
+                    continue
+                normalized.append({"min_kg": previous_kg, "max_kg": threshold_kg, "rub": rub})
+                previous_kg = threshold_kg
+            if normalized:
+                normalized.append({"min_kg": previous_kg, "max_kg": None, "rub": float(normalized[-1]["rub"])})
+        normalized.sort(key=lambda item: (float(item.get("min_kg") or 0.0), float(item.get("max_kg") or float("inf"))))
         return normalized
 
     @staticmethod
-    def _normalize_shipping_rules(raw_rules: Any) -> dict[str, dict[str, list[dict[str, float]]]]:
+    def _normalize_shipping_rules(raw_rules: Any) -> dict[str, dict[str, list[dict[str, Any]]]]:
         rules = raw_rules if isinstance(raw_rules, dict) else {}
-        output: dict[str, dict[str, list[dict[str, float]]]] = {}
+        output: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for region in ("US", "EU", "UK"):
             region_payload = rules.get(region) if isinstance(rules.get(region), dict) else {}
             output[region] = {
@@ -416,6 +546,13 @@ class PricingSettingsService:
         if getattr(entity, "bybit_extra_rub", None) is None:
             entity.bybit_extra_rub = 1.0
             changed = True
+        normalized_rounding_mode = cls._normalize_final_rounding_mode(
+            getattr(entity, "final_rounding_mode", None),
+            default="unit",
+        )
+        if normalized_rounding_mode != getattr(entity, "final_rounding_mode", None):
+            entity.final_rounding_mode = normalized_rounding_mode
+            changed = True
         if not isinstance(getattr(entity, "bybit_bucket_rates", None), list):
             entity.bybit_bucket_rates = []
             changed = True
@@ -440,7 +577,6 @@ class PricingSettingsService:
         if getattr(entity, "tax_rate", None) is None:
             entity.tax_rate = 0.06
             changed = True
-
         normalized_insurance = cls._normalize_range_rules(
             getattr(entity, "insurance_rules", None),
             min_key="min_eur",
@@ -459,6 +595,14 @@ class PricingSettingsService:
         )
         if normalized_fee != (getattr(entity, "service_fee_rules", None) or []):
             entity.service_fee_rules = normalized_fee
+            changed = True
+
+        raw_svc_rules = getattr(entity, "svc_rules", None)
+        normalized_svc_rules = cls._normalize_svc_rules(raw_svc_rules)
+        normalized_svc_rules = cls._sanitize_svc_rule_boundaries(normalized_svc_rules)
+        cls._validate_svc_rules_no_overlap(normalized_svc_rules)
+        if normalized_svc_rules != (raw_svc_rules or []):
+            entity.svc_rules = normalized_svc_rules
             changed = True
 
         normalized_shipping = cls._normalize_shipping_rules(getattr(entity, "shipping_rules", None))
@@ -512,8 +656,18 @@ class PricingSettingsService:
         if getattr(entity, "bybit_last_error", None):
             entity.bybit_last_error = None
             changed = True
-        entity.bybit_last_updated_at = datetime.now(timezone.utc)
-        changed = True
+        snapshot_epoch = PricingSettingsService._safe_float(getattr(snapshot, "fetched_at", None))
+        if snapshot_epoch is not None and snapshot_epoch > 0:
+            try:
+                refreshed_at = datetime.fromtimestamp(float(snapshot_epoch), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                refreshed_at = datetime.now(timezone.utc)
+        else:
+            refreshed_at = datetime.now(timezone.utc)
+        current_updated_at = getattr(entity, "bybit_last_updated_at", None)
+        if current_updated_at is None or abs((refreshed_at - current_updated_at).total_seconds()) > 0.5:
+            entity.bybit_last_updated_at = refreshed_at
+            changed = True
         if not changed:
             return False, "live_cached", snapshot, None
         return True, "live_updated", snapshot, None
@@ -567,6 +721,11 @@ class PricingSettingsService:
                 ),
                 allow_gbp=True,
             )
+        if "final_rounding_mode" in patch:
+            patch["final_rounding_mode"] = self._normalize_final_rounding_mode(
+                patch.get("final_rounding_mode"),
+                default=self._normalize_final_rounding_mode(getattr(entity, "final_rounding_mode", None), default="unit"),
+            )
         if "insurance_rules" in patch:
             patch["insurance_rules"] = self._normalize_range_rules(
                 patch.get("insurance_rules"),
@@ -581,6 +740,9 @@ class PricingSettingsService:
                 max_key="max_rub",
                 default_rules=_DEFAULT_SERVICE_FEE_RULES,
             )
+        if "svc_rules" in patch:
+            patch["svc_rules"] = self._normalize_svc_rules(patch.get("svc_rules"))
+            self._validate_svc_rules_no_overlap(patch["svc_rules"])
         if "shipping_rules" in patch:
             patch["shipping_rules"] = self._normalize_shipping_rules(patch.get("shipping_rules"))
         for key, value in patch.items():
@@ -614,6 +776,8 @@ class PricingSettingsService:
             max_key="max_rub",
             default_rules=_DEFAULT_SERVICE_FEE_RULES,
         )
+        normalized_svc_rules = PricingSettingsService._normalize_svc_rules(getattr(entity, "svc_rules", None))
+        PricingSettingsService._validate_svc_rules_no_overlap(normalized_svc_rules)
         normalized_shipping = PricingSettingsService._normalize_shipping_rules(getattr(entity, "shipping_rules", None))
         bybit_bucket_rates = PricingSettingsService._normalize_bybit_bucket_rates(
             getattr(entity, "bybit_bucket_rates", None),
@@ -651,11 +815,16 @@ class PricingSettingsService:
             bybit_extra_rub=float(getattr(entity, "bybit_extra_rub", 1.0)),
             eur_to_usd_rate=float(getattr(entity, "eur_to_usd_rate", 1.18)),
             gbp_to_usd_rate=float(getattr(entity, "gbp_to_usd_rate", 1.4)),
+            final_rounding_mode=PricingSettingsService._normalize_final_rounding_mode(
+                getattr(entity, "final_rounding_mode", None),
+                default="unit",
+            ),
             payment_fee_rate=float(getattr(entity, "payment_fee_rate", 0.02)),
             customs_processing_rate=float(getattr(entity, "customs_processing_rate", 0.08)),
             customs_fixed_rub=float(getattr(entity, "customs_fixed_rub", 540.0)),
             shipping_alt_threshold_eur=float(getattr(entity, "shipping_alt_threshold_eur", 300.0)),
             tax_rate=float(getattr(entity, "tax_rate", 0.06)),
+            svc_rules=normalized_svc_rules,
             insurance_rules=normalized_insurance,
             service_fee_rules=normalized_service_fee,
             shipping_rules=normalized_shipping,
@@ -903,46 +1072,45 @@ class PricingSettingsService:
 
     @staticmethod
     def _resolve_tariff_by_weight(*, rows: list[dict[str, Any]], billable_kg: float) -> tuple[float, dict[str, Any]]:
-        normalized_rows = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            kg = PricingSettingsService._safe_float(row.get("kg"))
-            rub = PricingSettingsService._safe_float(row.get("rub"))
-            if kg is None or kg <= 0:
-                continue
-            normalized_rows.append((float(kg), max(0.0, float(rub or 0.0))))
-        normalized_rows.sort(key=lambda item: item[0])
+        normalized_rows = PricingSettingsService._normalize_shipping_rows(rows)
         if not normalized_rows:
-            return 0.0, {"shipping_rate_mode": "missing_tariff", "shipping_tariff_kg": None}
+            return 0.0, {
+                "shipping_rate_mode": "missing_tariff",
+                "shipping_tariff_min_kg": None,
+                "shipping_tariff_max_kg": None,
+                "shipping_tariff_label": None,
+            }
 
         target_kg = max(0.5, float(billable_kg))
-        for kg, rub in normalized_rows:
-            if target_kg <= kg:
+        for row in normalized_rows:
+            min_kg = max(0.0, float(row.get("min_kg") or 0.0))
+            max_kg_raw = row.get("max_kg")
+            max_kg = None if max_kg_raw is None else max(0.0, float(max_kg_raw))
+            rub = max(0.0, float(row.get("rub") or 0.0))
+            min_ok = target_kg >= (min_kg - 1e-9)
+            max_ok = True if max_kg is None else target_kg <= (max_kg + 1e-9)
+            if min_ok and max_ok:
+                label = f"{min_kg:g}+ кг" if max_kg is None else f"{min_kg:g}-{max_kg:g} кг"
                 return rub, {
-                    "shipping_rate_mode": "table_match",
-                    "shipping_tariff_kg": kg,
+                    "shipping_rate_mode": "range_match",
+                    "shipping_tariff_min_kg": min_kg,
+                    "shipping_tariff_max_kg": max_kg,
+                    "shipping_tariff_label": label,
                     "shipping_tariff_rub": rub,
                 }
 
-        if len(normalized_rows) == 1:
-            kg, rub = normalized_rows[0]
-            return rub, {
-                "shipping_rate_mode": "single_tariff_clamped",
-                "shipping_tariff_kg": kg,
-                "shipping_tariff_rub": rub,
-            }
-
-        prev_kg, prev_rub = normalized_rows[-2]
-        last_kg, last_rub = normalized_rows[-1]
-        delta_kg = max(0.1, last_kg - prev_kg)
-        slope_per_kg = (last_rub - prev_rub) / delta_kg
-        extrapolated = last_rub + max(0.0, target_kg - last_kg) * slope_per_kg
-        return max(0.0, float(extrapolated)), {
-            "shipping_rate_mode": "extrapolated",
-            "shipping_tariff_kg": target_kg,
-            "shipping_tariff_rub": max(0.0, float(extrapolated)),
-            "shipping_slope_per_kg_rub": round(float(slope_per_kg), 4),
+        last = normalized_rows[-1]
+        last_min = max(0.0, float(last.get("min_kg") or 0.0))
+        last_max_raw = last.get("max_kg")
+        last_max = None if last_max_raw is None else max(0.0, float(last_max_raw))
+        last_rub = max(0.0, float(last.get("rub") or 0.0))
+        last_label = f"{last_min:g}+ кг" if last_max is None else f"{last_min:g}-{last_max:g} кг"
+        return last_rub, {
+            "shipping_rate_mode": "range_clamped_last",
+            "shipping_tariff_min_kg": last_min,
+            "shipping_tariff_max_kg": last_max,
+            "shipping_tariff_label": last_label,
+            "shipping_tariff_rub": last_rub,
         }
 
     @staticmethod
@@ -1132,16 +1300,16 @@ class PricingSettingsService:
         settings: PricingSettingsResponse,
     ) -> tuple[float, dict[str, Any]]:
         base_rate = max(0.0, float(settings.bybit_usdt_to_rub))
-        selected_row, bucket_meta = PricingSettingsService._pick_bybit_bucket_quote(
-            target_usdt=target_usdt,
-            settings=settings,
-        )
-        if selected_row is None:
-            return base_rate, bucket_meta
-        selected_rate = PricingSettingsService._safe_float(selected_row.get("rate_rub_per_usdt"))
-        if selected_rate is None or selected_rate <= 0:
-            return base_rate, bucket_meta
-        return float(selected_rate), bucket_meta
+        return base_rate, {
+            "bybit_bucket_target_usdt": round(max(1.0, float(target_usdt)), 4),
+            "bybit_bucket_selected_usdt": None,
+            "bybit_bucket_strategy": "single_rate_all_products",
+            "bybit_bucket_source": "first_adequate_order",
+            "bybit_bucket_order_id": None,
+            "bybit_bucket_order_nickname": None,
+            "bybit_bucket_pay_rub": None,
+            "bybit_bucket_legs_count": 0,
+        }
 
     @staticmethod
     def _has_discount_in_variants(variants: list[dict[str, Any]] | None) -> bool:
@@ -1231,8 +1399,7 @@ class PricingSettingsService:
         sp_eur = sp_usd / eur_to_usd_rate
 
         effective_weight_grams = max(1.0, float(weight_grams) * settings.weight_tolerance)
-        billable_half_kg_steps = max(1, math.ceil((effective_weight_grams / 1000.0) / 0.5))
-        billable_kg = float(billable_half_kg_steps) * 0.5
+        billable_kg = max(0.001, effective_weight_grams / 1000.0)
         effective_buyout_surcharge_value = max(0.0, float(buyout_surcharge_value or 0.0))
         effective_buyout_surcharge_currency = PricingSettingsService._normalize_currency(
             buyout_surcharge_currency,
@@ -1284,20 +1451,25 @@ class PricingSettingsService:
         )
         delivery_rub = supplier_shipping_rub
 
-        service_fee_rule = PricingSettingsService._pick_range_rule(
+        svc_rule = PricingSettingsService._pick_range_rule(
             value=buyout_rub,
-            rules=settings.service_fee_rules,
+            rules=getattr(settings, "svc_rules", []) or [],
             min_key="min_rub",
             max_key="max_rub",
         )
-        service_fee_rub, service_fee_meta = PricingSettingsService._compute_rule_amount(buyout_rub, service_fee_rule)
-        subtotal_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub + service_fee_rub
+        service_fee_rub, service_fee_meta = PricingSettingsService._compute_rule_amount(buyout_rub, svc_rule)
+        subtotal_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub
         markup_multiplier = max(0.0, float(settings.markup_multiplier))
-        subtotal_after_markup_rub = subtotal_rub * markup_multiplier
+        subtotal_after_markup_rub = (subtotal_rub * markup_multiplier) + service_fee_rub
         tax_rub = subtotal_after_markup_rub * max(0.0, float(settings.tax_rate))
         pass_through_costs_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub
         margin_rub = subtotal_after_markup_rub - pass_through_costs_rub
-        final_price_rub = float(math.ceil(subtotal_after_markup_rub + tax_rub))
+        raw_final_price_rub = float(subtotal_after_markup_rub + tax_rub)
+        final_rounding_mode = PricingSettingsService._normalize_final_rounding_mode(
+            getattr(settings, "final_rounding_mode", None),
+            default="unit",
+        )
+        final_price_rub = PricingSettingsService._apply_final_rounding(raw_final_price_rub, final_rounding_mode)
 
         return ProductPricingComputation(
             final_price_rub=final_price_rub,
@@ -1336,10 +1508,12 @@ class PricingSettingsService:
                 "weight_grams": round(float(weight_grams), 4),
                 "weight_tolerance": round(settings.weight_tolerance, 6),
                 "effective_weight_grams": round(effective_weight_grams, 4),
-                "shipping_steps_500g": int(billable_half_kg_steps),
                 "billable_weight_kg": round(billable_kg, 4),
                 "supplier_transport_rub": round(supplier_shipping_rub, 4),
                 "delivery_rub": round(delivery_rub, 4),
+                "shipping_rule_min_kg": supplier_meta.get("shipping_tariff_min_kg"),
+                "shipping_rule_max_kg": supplier_meta.get("shipping_tariff_max_kg"),
+                "shipping_rule_label": supplier_meta.get("shipping_tariff_label"),
                 "service_fee_rub": round(service_fee_rub, 4),
                 "service_fee_mode": service_fee_meta.get("mode"),
                 "service_fee_value": service_fee_meta.get("value"),
@@ -1351,6 +1525,7 @@ class PricingSettingsService:
                 "margin_rub": round(margin_rub, 4),
                 "tp_rub": round(subtotal_rub, 4),
                 "markup_multiplier": round(markup_multiplier, 6),
+                "markup_rate": round(max(0.0, markup_multiplier - 1.0), 6),
                 "bybit_usdt_to_rub": round(float(settings.bybit_usdt_to_rub), 6),
                 "bybit_extra_rub": round(float(settings.bybit_extra_rub), 6),
                 "bybit_bucket_rate_rub": round(float(bybit_bucket_rate), 6),
@@ -1360,6 +1535,8 @@ class PricingSettingsService:
                 "eur_to_usd_rate": round(float(settings.eur_to_usd_rate), 6),
                 "gbp_to_usd_rate": round(float(settings.gbp_to_usd_rate), 6),
                 "eur_to_rub_effective": round(eur_to_rub_effective, 6),
+                "final_rounding_mode": final_rounding_mode,
+                "raw_final_price_rub": round(raw_final_price_rub, 4),
                 "final_price_rub": final_price_rub,
                 **bybit_bucket_meta,
                 **supplier_meta,

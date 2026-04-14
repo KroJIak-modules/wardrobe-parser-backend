@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import ParserProduct
@@ -36,3 +37,21 @@ class ParserProductRepository(BaseRepository[ParserProduct]):
             .filter(ParserProduct.status == "available")
             .all()
         )
+
+    def list_distinct_vendors(self) -> list[str]:
+        normalized_vendor = func.lower(func.trim(ParserProduct.vendor))
+        rows = (
+            self.query()
+            .with_entities(func.min(func.trim(ParserProduct.vendor)).label("vendor"))
+            .filter(ParserProduct.deleted_at.is_(None))
+            .filter(ParserProduct.vendor.isnot(None))
+            .group_by(normalized_vendor)
+            .order_by(normalized_vendor.asc())
+            .all()
+        )
+        result: list[str] = []
+        for (raw_vendor,) in rows:
+            vendor = str(raw_vendor or "").strip()
+            if vendor:
+                result.append(vendor)
+        return result
