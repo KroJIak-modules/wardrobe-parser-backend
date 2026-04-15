@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
+from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.models import ParserProduct
 from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
@@ -30,6 +35,14 @@ LOGGER = logging.getLogger(__name__)
 _PROXY_ROOT_METHODS = ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 _PROXY_PATH_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 _JSON_UNSAFE_HEADERS = {"content-length", "content-encoding", "transfer-encoding"}
+_ALLOWED_PRODUCT_STATUSES = {"available", "out_of_stock", "hidden"}
+_CATALOG_MAX_LIMIT = 120
+_CATALOG_SCAN_BATCH = 240
+_CATALOG_MAX_SCAN_PAGES = 8
+
+
+class InvalidProductStatusError(ValueError):
+    """Raised when product status in storage is outside the allowed set."""
 
 
 def _safe_float(value: Any) -> float | None:
@@ -53,6 +66,53 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _assert_allowed_product_status(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in _ALLOWED_PRODUCT_STATUSES:
+        raise InvalidProductStatusError(f"Invalid product status in storage: {normalized!r}")
+    return normalized
+
+
+def _normalize_int_list(raw: Any) -> list[int]:
+    if not isinstance(raw, list):
+        return []
+    values: list[int] = []
+    seen: set[int] = set()
+    for item in raw:
+        parsed = _safe_int(item)
+        if parsed is None:
+            continue
+        if parsed in seen:
+            continue
+        seen.add(parsed)
+        values.append(parsed)
+    return values
+
+
+def _encode_cursor(updated_at: datetime, product_id: int) -> str:
+    payload = f"{updated_at.isoformat()}|{int(product_id)}"
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(raw_cursor: str) -> tuple[datetime, int]:
+    padded = raw_cursor + ("=" * ((4 - len(raw_cursor) % 4) % 4))
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        ts_raw, product_id_raw = decoded.rsplit("|", 1)
+        ts = datetime.fromisoformat(ts_raw)
+        product_id = int(product_id_raw)
+        return ts, product_id
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректный cursor") from exc
+
+
+def _cursor_parts_for_product(product: ParserProduct) -> tuple[datetime, int]:
+    timestamp = product.updated_at or product.created_at
+    if timestamp is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="У товара отсутствует timestamp для cursor")
+    return timestamp, int(product.id)
 
 
 def _upstream_json_or_none(upstream: Response) -> Any | None:
@@ -99,6 +159,7 @@ def _apply_backend_pricing_to_item(
     source_profile_map: dict[int, Any],
     weight_rules: list[Any],
     category_assigner: CategoryAssigner | None = None,
+    favorite_manual_category_ids_by_product: dict[int, list[int]] | None = None,
 ) -> dict[str, Any]:
     source_id = _safe_int(item.get("source_id"))
     source_profile = source_profile_map.get(source_id) if source_id is not None else None
@@ -163,16 +224,22 @@ def _apply_backend_pricing_to_item(
     else:
         item["price"] = source_price
         item["currency"] = source_currency
+    item["status"] = _assert_allowed_product_status(item.get("status"))
     if category_assigner is not None:
         matches = category_assigner.match_many(item)
         primary = matches[0] if matches else None
-        item["is_favorite"] = False
         item["internal_category_ids"] = [match.category_id for match in matches if match.category_id > 0]
         item["internal_category_names"] = [match.category_name for match in matches if match.category_id > 0]
         item["internal_category_slugs"] = [match.category_slug for match in matches if match.category_id > 0]
         item["internal_category_id"] = primary.category_id if primary is not None else None
         item["internal_category_name"] = primary.category_name if primary is not None else None
         item["internal_category_slug"] = primary.category_slug if primary is not None else None
+    product_id = _safe_int(item.get("id"))
+    starred_ids = []
+    if favorite_manual_category_ids_by_product is not None and product_id is not None:
+        starred_ids = [int(value) for value in favorite_manual_category_ids_by_product.get(int(product_id), [])]
+    item["starred_category_ids"] = sorted(set(starred_ids))
+    item["is_favorite"] = len(item["starred_category_ids"]) > 0
     return item
 
 
@@ -184,6 +251,7 @@ def _safe_apply_backend_pricing_to_item(
     source_profile_map: dict[int, Any],
     weight_rules: list[Any],
     category_assigner: CategoryAssigner | None = None,
+    favorite_manual_category_ids_by_product: dict[int, list[int]] | None = None,
 ) -> dict[str, Any]:
     try:
         return _apply_backend_pricing_to_item(
@@ -193,10 +261,98 @@ def _safe_apply_backend_pricing_to_item(
             source_profile_map=source_profile_map,
             weight_rules=weight_rules,
             category_assigner=category_assigner,
+            favorite_manual_category_ids_by_product=favorite_manual_category_ids_by_product,
         )
+    except InvalidProductStatusError:
+        raise
     except Exception:
         LOGGER.exception("Failed to enrich product item", extra={"product_id": item.get("id")})
         return item
+
+
+def _flatten_tree(nodes: list[Any]) -> list[Any]:
+    result: list[Any] = []
+    for node in nodes:
+        result.append(node)
+        result.extend(_flatten_tree(list(getattr(node, "children", []) or [])))
+    return result
+
+
+def _collect_descendant_slugs(node: Any, target: set[str]) -> None:
+    slug = str(getattr(node, "slug", "") or "").strip()
+    if slug:
+        target.add(slug)
+    for child in list(getattr(node, "children", []) or []):
+        _collect_descendant_slugs(child, target)
+
+
+def _build_descendant_slug_index(tree: list[Any]) -> dict[str, set[str]]:
+    index: dict[str, set[str]] = {}
+    for node in _flatten_tree(tree):
+        slug = str(getattr(node, "slug", "") or "").strip()
+        if not slug:
+            continue
+        bucket: set[str] = set()
+        _collect_descendant_slugs(node, bucket)
+        index[slug] = bucket
+    return index
+
+
+def _product_row_to_item(product: ParserProduct) -> dict[str, Any]:
+    return {
+        "id": int(product.id),
+        "source_id": int(product.source_id),
+        "handle": str(product.handle),
+        "title": str(product.title),
+        "vendor": product.vendor,
+        "product_type": product.product_type,
+        "url": str(product.url),
+        "price": product.price,
+        "currency": str(product.currency),
+        "status": str(product.status),
+        "image_count": int(product.image_count or 0),
+        "image_urls": list(product.image_urls or []),
+        "image_ids": list(product.image_asset_ids or []),
+        "variants": list(product.variants or []),
+        "weight_grams": product.weight_grams,
+        "weight_source": product.weight_source,
+        "weight_match_keyword": product.weight_match_keyword,
+        "weight_value": product.weight_value,
+        "weight_unit": product.weight_unit,
+        "created_at": product.created_at.isoformat() if product.created_at is not None else None,
+        "updated_at": product.updated_at.isoformat() if product.updated_at is not None else None,
+    }
+
+
+def _apply_admin_product_filters(
+    query,
+    *,
+    search: str | None,
+    source_id: int | None,
+    vendor: str | None,
+    product_type: str | None,
+    status_filter: str | None,
+):
+    if source_id is not None:
+        query = query.filter(ParserProduct.source_id == int(source_id))
+    if vendor:
+        query = query.filter(ParserProduct.vendor == vendor)
+    if product_type:
+        query = query.filter(ParserProduct.product_type == product_type)
+    if status_filter:
+        query = query.filter(ParserProduct.status == status_filter)
+    if search:
+        pattern = f"%{search}%"
+        query = query.filter(
+            or_(
+                ParserProduct.title.ilike(pattern),
+                ParserProduct.vendor.ilike(pattern),
+                ParserProduct.product_type.ilike(pattern),
+                ParserProduct.handle.ilike(pattern),
+                ParserProduct.url.ilike(pattern),
+            )
+        )
+    return query
 
 
 @router.get("/products")
@@ -240,26 +396,309 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
         if product_id is not None
     }
     manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
+    favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
+    favorite_manual_map = {
+        int(product_id): [int(category_id) for category_id in category_ids if int(category_id) in favorite_category_ids]
+        for product_id, category_ids in manual_map.items()
+    }
     category_assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
 
-    payload["items"] = [
-        _safe_apply_backend_pricing_to_item(
-            item=item,
-            settings_service=settings_service,
-            settings=settings,
-            source_profile_map=source_profile_map,
-            weight_rules=weight_rules,
-            category_assigner=category_assigner,
-        )
-        if isinstance(item, dict)
-        else item
-        for item in items
-    ]
+    try:
+        payload["items"] = [
+            _safe_apply_backend_pricing_to_item(
+                item=item,
+                settings_service=settings_service,
+                settings=settings,
+                source_profile_map=source_profile_map,
+                weight_rules=weight_rules,
+                category_assigner=category_assigner,
+                favorite_manual_category_ids_by_product=favorite_manual_map,
+            )
+            if isinstance(item, dict)
+            else item
+            for item in items
+        ]
+    except InvalidProductStatusError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
+        ) from exc
     return JSONResponse(
         content=payload,
         status_code=upstream.status_code,
         headers=_json_response_headers(upstream),
     )
+
+
+@router.get("/catalog/products")
+def get_catalog_products(
+    db: Session = Depends(get_db),
+    category_slug: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    source_id: int | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=36, ge=1, le=_CATALOG_MAX_LIMIT),
+    cursor: str | None = Query(default=None),
+) -> dict[str, Any]:
+    selected_category_slug = (category_slug or "").strip().lower()
+    selected_status = None
+    if status_filter:
+        selected_status = str(status_filter).strip().lower()
+        if selected_status not in _ALLOWED_PRODUCT_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Допустимые статусы: available, out_of_stock, hidden",
+            )
+
+    settings_service = PricingSettingsService(db)
+    settings = settings_service.get_settings(refresh_bybit=False)
+    try:
+        weight_rules = WeightRuleService(db).get_matching_rules()
+    except Exception:
+        LOGGER.exception("Failed to load weight rules for /catalog/products; fallback to empty rules")
+        weight_rules = []
+
+    category_repo = ParserCategoryRepository(db)
+    keyword_repo = ParserCategoryKeywordRepository(db)
+    categories = category_repo.get_all_active()
+    category_tree = build_tree(categories, keyword_repo)
+    descendant_slug_index = _build_descendant_slug_index(category_tree)
+    allowed_slugs = descendant_slug_index.get(selected_category_slug) if selected_category_slug else None
+    if selected_category_slug and allowed_slugs is None:
+        return {
+            "items": [],
+            "next_cursor": None,
+            "has_more": False,
+            "limit": int(limit),
+        }
+
+    decoded_cursor: tuple[datetime, int] | None = _decode_cursor(cursor) if cursor else None
+    product_repo = ParserProductRepository(db)
+    manual_repo = ParserCategoryManualProductRepository(db)
+    source_repo = ParserSourceRepository(db)
+    favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
+
+    normalized_search = (search or "").strip()
+    accepted_items: list[dict[str, Any]] = []
+    next_cursor: str | None = None
+    scan_cursor = decoded_cursor
+
+    for _ in range(_CATALOG_MAX_SCAN_PAGES):
+        query = (
+            product_repo.query()
+            .filter(ParserProduct.deleted_at.is_(None))
+            .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
+        )
+        if source_id is not None:
+            query = query.filter(ParserProduct.source_id == int(source_id))
+        if selected_status is not None:
+            query = query.filter(ParserProduct.status == selected_status)
+        if normalized_search:
+            pattern = f"%{normalized_search}%"
+            query = query.filter(
+                or_(
+                    ParserProduct.title.ilike(pattern),
+                    ParserProduct.vendor.ilike(pattern),
+                    ParserProduct.product_type.ilike(pattern),
+                    ParserProduct.handle.ilike(pattern),
+                    ParserProduct.url.ilike(pattern),
+                )
+            )
+        if scan_cursor is not None:
+            query = query.filter(
+                or_(
+                    ParserProduct.updated_at < scan_cursor[0],
+                    (ParserProduct.updated_at == scan_cursor[0]) & (ParserProduct.id < scan_cursor[1]),
+                )
+            )
+
+        rows = (
+            query.order_by(ParserProduct.updated_at.desc(), ParserProduct.id.desc())
+            .limit(_CATALOG_SCAN_BATCH)
+            .all()
+        )
+        if not rows:
+            break
+
+        product_ids = {int(item.id) for item in rows}
+        manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
+        favorite_manual_map = {
+            int(product_id): [int(category_id) for category_id in category_ids if int(category_id) in favorite_category_ids]
+            for product_id, category_ids in manual_map.items()
+        }
+        assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
+        source_profile_map = {
+            int(source.id): source
+            for source in source_repo.get_active_by_ids({int(item.source_id) for item in rows})
+        }
+
+        for row in rows:
+            raw_item = _product_row_to_item(row)
+            if allowed_slugs is not None:
+                matched = assigner.match_many(raw_item)
+                matched_slugs = {item.category_slug for item in matched}
+                if not matched_slugs.intersection(allowed_slugs):
+                    continue
+            try:
+                enriched = _safe_apply_backend_pricing_to_item(
+                    item=raw_item,
+                    settings_service=settings_service,
+                    settings=settings,
+                    source_profile_map=source_profile_map,
+                    weight_rules=weight_rules,
+                    category_assigner=assigner,
+                    favorite_manual_category_ids_by_product=favorite_manual_map,
+                )
+            except InvalidProductStatusError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
+                ) from exc
+            accepted_items.append(enriched)
+            if len(accepted_items) >= int(limit):
+                cursor_ts, cursor_id = _cursor_parts_for_product(row)
+                next_cursor = _encode_cursor(cursor_ts, cursor_id)
+                break
+
+        if len(accepted_items) >= int(limit):
+            break
+
+        last_row = rows[-1]
+        last_cursor_ts, last_cursor_id = _cursor_parts_for_product(last_row)
+        scan_cursor = (last_cursor_ts, last_cursor_id)
+        if len(rows) < _CATALOG_SCAN_BATCH:
+            break
+        next_cursor = _encode_cursor(last_cursor_ts, last_cursor_id)
+
+    return {
+        "items": accepted_items[: int(limit)],
+        "next_cursor": next_cursor,
+        "has_more": bool(next_cursor),
+        "limit": int(limit),
+    }
+
+
+@router.get("/admin/products")
+def get_admin_products(
+    db: Session = Depends(get_db),
+    search: str | None = Query(default=None),
+    source_id: int | None = Query(default=None),
+    vendor: str | None = Query(default=None),
+    product_type: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=_CATALOG_MAX_LIMIT),
+    cursor: str | None = Query(default=None),
+) -> dict[str, Any]:
+    selected_status = None
+    if status_filter:
+        selected_status = str(status_filter).strip().lower()
+        if selected_status not in _ALLOWED_PRODUCT_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Допустимые статусы: available, out_of_stock, hidden",
+            )
+
+    normalized_search = (search or "").strip()
+    decoded_cursor: tuple[datetime, int] | None = _decode_cursor(cursor) if cursor else None
+
+    base_query = (
+        db.query(ParserProduct)
+        .filter(ParserProduct.deleted_at.is_(None))
+        .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
+    )
+    base_query = _apply_admin_product_filters(
+        base_query,
+        search=normalized_search or None,
+        source_id=source_id,
+        vendor=(vendor or "").strip() or None,
+        product_type=(product_type or "").strip() or None,
+        status_filter=selected_status,
+    )
+
+    total = (
+        base_query.with_entities(func.count(ParserProduct.id))
+        .order_by(None)
+        .scalar()
+        or 0
+    )
+
+    page_query = base_query
+    if decoded_cursor is not None:
+        page_query = page_query.filter(
+            or_(
+                ParserProduct.updated_at < decoded_cursor[0],
+                (ParserProduct.updated_at == decoded_cursor[0]) & (ParserProduct.id < decoded_cursor[1]),
+            )
+        )
+
+    rows = (
+        page_query
+        .order_by(ParserProduct.updated_at.desc(), ParserProduct.id.desc())
+        .limit(int(limit))
+        .all()
+    )
+
+    settings_service = PricingSettingsService(db)
+    settings = settings_service.get_settings(refresh_bybit=False)
+    try:
+        weight_rules = WeightRuleService(db).get_matching_rules()
+    except Exception:
+        LOGGER.exception("Failed to load weight rules for /admin/products; fallback to empty rules")
+        weight_rules = []
+
+    category_repo = ParserCategoryRepository(db)
+    keyword_repo = ParserCategoryKeywordRepository(db)
+    category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
+    manual_repo = ParserCategoryManualProductRepository(db)
+    product_ids = {int(item.id) for item in rows}
+    manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
+    favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
+    favorite_manual_map = {
+        int(product_id): [int(category_id) for category_id in category_ids if int(category_id) in favorite_category_ids]
+        for product_id, category_ids in manual_map.items()
+    }
+    assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
+
+    source_repo = ParserSourceRepository(db)
+    source_profile_map = {
+        int(source.id): source
+        for source in source_repo.get_active_by_ids({int(item.source_id) for item in rows})
+    }
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        raw_item = _product_row_to_item(row)
+        try:
+            enriched = _safe_apply_backend_pricing_to_item(
+                item=raw_item,
+                settings_service=settings_service,
+                settings=settings,
+                source_profile_map=source_profile_map,
+                weight_rules=weight_rules,
+                category_assigner=assigner,
+                favorite_manual_category_ids_by_product=favorite_manual_map,
+            )
+        except InvalidProductStatusError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
+            ) from exc
+        items.append(enriched)
+
+    next_cursor = None
+    has_more = False
+    if len(rows) == int(limit):
+        last_ts, last_id = _cursor_parts_for_product(rows[-1])
+        next_cursor = _encode_cursor(last_ts, last_id)
+        has_more = True
+
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "limit": int(limit),
+        "total": int(total),
+    }
 
 
 @router.get("/products/{product_id}")
@@ -288,20 +727,204 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
     manual_repo = ParserCategoryManualProductRepository(db)
     manual_map = manual_repo.get_grouped_by_product_ids({int(product_id)})
+    favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
+    favorite_manual_map = {
+        int(product_id): [int(category_id) for category_id in manual_map.get(int(product_id), []) if int(category_id) in favorite_category_ids]
+    }
     category_assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
-    priced = _safe_apply_backend_pricing_to_item(
-        item=payload,
-        settings_service=settings_service,
-        settings=settings,
-        source_profile_map=source_profile_map,
-        weight_rules=weight_rules,
-        category_assigner=category_assigner,
-    )
+    try:
+        priced = _safe_apply_backend_pricing_to_item(
+            item=payload,
+            settings_service=settings_service,
+            settings=settings,
+            source_profile_map=source_profile_map,
+            weight_rules=weight_rules,
+            category_assigner=category_assigner,
+            favorite_manual_category_ids_by_product=favorite_manual_map,
+        )
+    except InvalidProductStatusError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
+        ) from exc
     return JSONResponse(
         content=priced,
         status_code=upstream.status_code,
         headers=_json_response_headers(upstream),
     )
+
+
+@router.patch("/products/{product_id}")
+async def update_product(product_id: int, request: Request, db: Session = Depends(get_db)) -> Response:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректный payload")
+
+    next_status_raw = payload.get("status")
+    next_status = None
+    if next_status_raw is not None:
+        next_status = str(next_status_raw).strip().lower()
+        if next_status not in _ALLOWED_PRODUCT_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Допустимые статусы: available, out_of_stock, hidden",
+            )
+
+    if next_status is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет поддерживаемых полей для обновления")
+
+    product_repo = ParserProductRepository(db)
+    product = product_repo.get_active_by_id(product_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
+
+    product.status = next_status
+    db.commit()
+
+    patched_payload = {
+        "id": int(product.id),
+        "source_id": int(product.source_id),
+        "handle": str(product.handle),
+        "title": str(product.title),
+        "vendor": product.vendor,
+        "product_type": product.product_type,
+        "url": str(product.url),
+        "price": product.price,
+        "currency": str(product.currency),
+        "status": str(product.status),
+        "image_count": int(product.image_count or 0),
+        "image_urls": list(product.image_urls or []),
+        "image_ids": list(product.image_asset_ids or []),
+        "variants": list(product.variants or []),
+        "weight_grams": product.weight_grams,
+        "weight_source": product.weight_source,
+        "weight_match_keyword": product.weight_match_keyword,
+        "weight_value": product.weight_value,
+        "weight_unit": product.weight_unit,
+        "created_at": product.created_at.isoformat() if product.created_at is not None else None,
+        "updated_at": product.updated_at.isoformat() if product.updated_at is not None else None,
+    }
+
+    settings_service = PricingSettingsService(db)
+    settings = settings_service.get_settings(refresh_bybit=False)
+    try:
+        weight_rules = WeightRuleService(db).get_matching_rules()
+    except Exception:
+        LOGGER.exception("Failed to load weight rules for PATCH /products/{product_id}; fallback to empty rules")
+        weight_rules = []
+
+    source_repo = ParserSourceRepository(db)
+    source_profile = source_repo.get_active_by_id(int(product.source_id))
+    source_profile_map = {int(source_profile.id): source_profile} if source_profile is not None else {}
+
+    category_repo = ParserCategoryRepository(db)
+    keyword_repo = ParserCategoryKeywordRepository(db)
+    category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
+    manual_repo = ParserCategoryManualProductRepository(db)
+    manual_map = manual_repo.get_grouped_by_product_ids({int(product_id)})
+    favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
+    favorite_manual_map = {
+        int(product_id): [int(category_id) for category_id in manual_map.get(int(product_id), []) if int(category_id) in favorite_category_ids]
+    }
+    category_assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
+    try:
+        enriched = _safe_apply_backend_pricing_to_item(
+            item=patched_payload,
+            settings_service=settings_service,
+            settings=settings,
+            source_profile_map=source_profile_map,
+            weight_rules=weight_rules,
+            category_assigner=category_assigner,
+            favorite_manual_category_ids_by_product=favorite_manual_map,
+        )
+    except InvalidProductStatusError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
+        ) from exc
+    return JSONResponse(content=enriched)
+
+
+@router.get("/products/{product_id}/starred-categories")
+def get_product_starred_categories(product_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    product = ParserProductRepository(db).get_active_by_id(product_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
+
+    category_repo = ParserCategoryRepository(db)
+    starred_categories = category_repo.get_favorites()
+    starred_by_id = {int(category.id): category for category in starred_categories}
+
+    manual_map = ParserCategoryManualProductRepository(db).get_grouped_by_product_ids({int(product_id)})
+    assigned = sorted(
+        int(category_id)
+        for category_id in manual_map.get(int(product_id), [])
+        if int(category_id) in starred_by_id
+    )
+    return {
+        "product_id": int(product_id),
+        "assigned_category_ids": assigned,
+        "available_categories": [
+            {
+                "id": int(category.id),
+                "name": str(category.name),
+                "slug": str(category.slug),
+                "parent_id": int(category.parent_id) if category.parent_id is not None else None,
+            }
+            for category in starred_categories
+        ],
+    }
+
+
+@router.put("/products/{product_id}/starred-categories")
+async def set_product_starred_categories(product_id: int, request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
+    product = ParserProductRepository(db).get_active_by_id(product_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
+
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректный payload")
+
+    target_category_ids = _normalize_int_list(payload.get("category_ids"))
+
+    category_repo = ParserCategoryRepository(db)
+    starred_categories = category_repo.get_favorites()
+    starred_by_id = {int(category.id): category for category in starred_categories}
+    invalid_ids = [category_id for category_id in target_category_ids if category_id not in starred_by_id]
+    if invalid_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Категории не отмечены звездой в админке: {', '.join(str(value) for value in sorted(invalid_ids))}",
+        )
+
+    manual_repo = ParserCategoryManualProductRepository(db)
+    current_manual_map = manual_repo.get_grouped_by_product_ids({int(product_id)})
+    current_starred = {
+        int(category_id)
+        for category_id in current_manual_map.get(int(product_id), [])
+        if int(category_id) in starred_by_id
+    }
+    target_starred = set(target_category_ids)
+
+    for category_id in sorted(current_starred - target_starred):
+        entity = manual_repo.get_exact(category_id=category_id, product_id=product_id)
+        if entity is not None:
+            db.delete(entity)
+
+    for category_id in sorted(target_starred - current_starred):
+        existing = manual_repo.get_exact(category_id=category_id, product_id=product_id)
+        if existing is None:
+            manual_repo.create(category_id=category_id, product_id=product_id)
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "message": "Звездные категории товара обновлены",
+        "product_id": int(product_id),
+        "assigned_category_ids": sorted(target_starred),
+    }
 
 
 @router.api_route("/products", methods=_PROXY_ROOT_METHODS)

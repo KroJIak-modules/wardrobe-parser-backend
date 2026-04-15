@@ -230,10 +230,6 @@ class CategoryTreeService:
     def _prepare_categories(self, *, sync_designers: bool) -> tuple[list[ParserCategory], ParserCategory | None, set[int]]:
         changed = False
         fallback = ensure_fallback(self.category_repo)
-        favorite = self.category_repo.get_favorite()
-        if favorite is not None and favorite.deleted_at is None:
-            favorite.deleted_at = datetime.now(timezone.utc)
-            changed = True
 
         # Track cleanup changes for fallback explicitly.
         if self._purge_keywords({int(fallback.id)}):
@@ -360,6 +356,11 @@ class CategoryTreeService:
 
         if "is_enabled" in payload.model_fields_set and payload.is_enabled is not None:
             category.is_enabled = bool(payload.is_enabled)
+
+        if "is_favorite" in payload.model_fields_set and payload.is_favorite is not None:
+            if category.is_fallback or in_designers_branch:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Системную категорию нельзя отмечать звездой")
+            category.is_favorite = bool(payload.is_favorite)
 
         self.db.commit()
         categories = self.category_repo.get_all_active()

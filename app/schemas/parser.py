@@ -37,6 +37,7 @@ class CategoryUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     parent_id: int | None = None
     is_enabled: bool | None = None
+    is_favorite: bool | None = None
 
 
 class CategoryTreeNodeResponse(BaseModel):
@@ -185,6 +186,93 @@ class PricingSettingsResponse(BaseModel):
     formula_legend: list[dict[str, str]] = Field(default_factory=list)
 
 
+class SettingsTransferPricingSettings(BaseModel):
+    markup_multiplier: float
+    weight_tolerance: float
+    promo_factor: float
+    customs_threshold_eur: float
+    customs_threshold_currency: str
+    customs_duty_rate: float
+    bybit_extra_rub: float
+    eur_to_usd_rate: float
+    gbp_to_usd_rate: float
+    final_rounding_mode: str
+    payment_fee_rate: float
+    customs_processing_rate: float
+    customs_fixed_rub: float
+    shipping_alt_threshold_eur: float
+    tax_rate: float
+    svc_rules: list[dict] = Field(default_factory=list)
+    insurance_rules: list[dict] = Field(default_factory=list)
+    service_fee_rules: list[dict] = Field(default_factory=list)
+    shipping_rules: dict[str, dict[str, list[dict]]] = Field(default_factory=dict)
+
+
+class SettingsTransferSupplierRateEntry(BaseModel):
+    step_500g: int = Field(ge=1, le=10000)
+    rate_rub: float = Field(ge=0.0, le=100000000.0)
+
+
+class SettingsTransferSupplierEntry(BaseModel):
+    key: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=255)
+    category: str = Field(default="main", min_length=3, max_length=16)
+    rate_currency: str = Field(default="RUB", min_length=3, max_length=3)
+    rates: list[SettingsTransferSupplierRateEntry] = Field(default_factory=list)
+
+
+class SettingsTransferSourceEntry(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    url: str = Field(min_length=1, max_length=2048)
+    enabled: bool = True
+    supplier_key: str | None = Field(default=None, min_length=1, max_length=64)
+    promo_factor: float = Field(default=1.0, ge=0.0, le=10.0)
+    promo_only_no_discount: bool = False
+    buyout_surcharge_value: float = Field(default=0.0, ge=0.0, le=100000000.0)
+    buyout_surcharge_currency: str = Field(default="RUB", min_length=3, max_length=3)
+
+
+class SettingsTransferWeightRuleEntry(BaseModel):
+    weight_grams: int = Field(ge=1, le=1000000)
+    sort_order: int = Field(default=0, ge=0, le=1000000)
+    keywords: list[str] = Field(default_factory=list)
+
+
+class SettingsTransferCategoryEntry(BaseModel):
+    slug: str = Field(min_length=1, max_length=255)
+    name: str = Field(min_length=1, max_length=255)
+    parent_slug: str | None = Field(default=None, min_length=1, max_length=255)
+    is_fallback: bool = False
+    is_favorite: bool = False
+    is_enabled: bool = True
+
+
+class SettingsTransferCategoryKeywordEntry(BaseModel):
+    category_slug: str = Field(min_length=1, max_length=255)
+    keyword: str = Field(min_length=1, max_length=255)
+    scope: Literal["local", "title"] = "local"
+
+
+class SettingsTransferPayload(BaseModel):
+    schema_version: int = Field(default=1, ge=1, le=1000)
+    exported_at: str | None = None
+    project: str | None = None
+    pricing_settings: SettingsTransferPricingSettings
+    suppliers: list[SettingsTransferSupplierEntry] = Field(default_factory=list)
+    sources: list[SettingsTransferSourceEntry] = Field(default_factory=list)
+    weight_rules: list[SettingsTransferWeightRuleEntry] = Field(default_factory=list)
+    categories: list[SettingsTransferCategoryEntry] = Field(default_factory=list)
+    category_keywords: list[SettingsTransferCategoryKeywordEntry] = Field(default_factory=list)
+
+
+class SettingsTransferResponse(BaseModel):
+    ok: bool
+    message: str
+    schema_version: int
+    imported_at: str
+    imported_counts: dict[str, int] = Field(default_factory=dict)
+
+
 class ProductResponse(BaseModel):
     id: int
     source_id: int
@@ -206,6 +294,7 @@ class ProductResponse(BaseModel):
     weight_unit: str | None = None
     variants: list[dict] = Field(default_factory=list)
     is_favorite: bool = False
+    starred_category_ids: list[int] = Field(default_factory=list)
     internal_category_id: int | None = None
     internal_category_name: str | None = None
     internal_category_slug: str | None = None

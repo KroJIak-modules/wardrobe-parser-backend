@@ -12,6 +12,8 @@ from app.schemas.parser import (
     PricingSupplierCreateRequest,
     PricingSupplierResponse,
     PricingSupplierUpdateRequest,
+    SettingsTransferPayload,
+    SettingsTransferResponse,
     WeightMissingProductResponse,
     WeightRuleCreateRequest,
     WeightRuleKeywordRequest,
@@ -19,6 +21,7 @@ from app.schemas.parser import (
     WeightRuleUpdateRequest,
 )
 from app.services.settings.pricing_service import PricingSettingsService
+from app.services.settings.settings_transfer_service import SettingsTransferService
 from app.services.settings.weight_rule_service import WeightRuleService
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -91,3 +94,13 @@ def add_weight_rule_keyword(rule_id: int, payload: WeightRuleKeywordRequest, db:
 @router.delete("/weight-rules/{rule_id}/keywords/{keyword}")
 def remove_weight_rule_keyword(rule_id: int, keyword: str, db: Session = Depends(get_db)):
     return WeightRuleService(db).remove_keyword(rule_id, keyword)
+
+
+@router.get("/export", response_model=SettingsTransferPayload)
+def export_settings(db: Session = Depends(get_db)):
+    return SettingsTransferService(db).export_payload()
+
+
+@router.post("/import", response_model=SettingsTransferResponse)
+def import_settings(payload: SettingsTransferPayload, db: Session = Depends(get_db)):
+    return SettingsTransferService(db).import_payload(payload)

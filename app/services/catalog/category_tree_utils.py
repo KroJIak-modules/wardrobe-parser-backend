@@ -24,12 +24,12 @@ def build_tree(
     title_keyword_map = keyword_repo.get_grouped_keywords(scope="title")
 
     def walk(node: ParserCategory, in_designers_branch: bool) -> CategoryTreeNodeResponse:
-        own_keywords = [] if node.is_fallback or bool(getattr(node, "is_favorite", False)) else list(keyword_map.get(int(node.id), []))
-        own_title_keywords = [] if node.is_fallback or bool(getattr(node, "is_favorite", False)) else list(title_keyword_map.get(int(node.id), []))
+        own_keywords = [] if node.is_fallback else list(keyword_map.get(int(node.id), []))
+        own_title_keywords = [] if node.is_fallback else list(title_keyword_map.get(int(node.id), []))
         raw_children = by_parent.get(node.id, [])
         next_in_designers = in_designers_branch or (designers_root_id is not None and int(node.id) == int(designers_root_id))
         children = [walk(child, next_in_designers) for child in raw_children]
-        is_system = bool(node.is_fallback) or bool(getattr(node, "is_favorite", False)) or next_in_designers
+        is_system = bool(node.is_fallback) or next_in_designers
         has_children = len(raw_children) > 0
         keywords_editable = (not is_system) and (not has_children)
         if not keywords_editable:
@@ -108,9 +108,9 @@ def build_single_node_response(
         is_fallback=category.is_fallback,
         is_favorite=bool(getattr(category, "is_favorite", False)),
         is_enabled=bool(getattr(category, "is_enabled", True)),
-        is_system=bool(category.is_fallback) or bool(getattr(category, "is_favorite", False)),
+        is_system=bool(category.is_fallback),
         has_children=False,
-        keywords_editable=not (bool(category.is_fallback) or bool(getattr(category, "is_favorite", False))),
+        keywords_editable=not bool(category.is_fallback),
         keywords_locked_reason=None,
         is_designers_root=False,
         is_in_designers_branch=False,

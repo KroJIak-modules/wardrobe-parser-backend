@@ -1,4 +1,4 @@
-"""Reset parser category tree to the current storefront structure."""
+"""Reset parser category tree to the current catalog structure."""
 
 from __future__ import annotations
 

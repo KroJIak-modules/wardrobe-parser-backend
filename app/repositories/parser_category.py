@@ -37,6 +37,15 @@ class ParserCategoryRepository(BaseRepository[ParserCategory]):
             .first()
         )
 
+    def get_favorites(self) -> list[ParserCategory]:
+        return (
+            self.query()
+            .filter(ParserCategory.deleted_at.is_(None))
+            .filter(ParserCategory.is_favorite.is_(True))
+            .order_by(ParserCategory.id.asc())
+            .all()
+        )
+
     def get_by_slug(self, slug: str) -> ParserCategory | None:
         return (
             self.query()
