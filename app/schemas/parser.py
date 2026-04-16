@@ -64,6 +64,33 @@ class CategoryTreeNodeResponse(BaseModel):
         from_attributes = True
 
 
+class CatalogCategoryNodeResponse(BaseModel):
+    slug: str
+    name: str
+    parent_id: int | None = None
+    count: int = 0
+    is_enabled: bool = True
+    children: list["CatalogCategoryNodeResponse"] = Field(default_factory=list)
+
+
+class CatalogProductCardResponse(BaseModel):
+    id: int
+    source_id: int
+    title: str
+    vendor: str | None = None
+    url: str
+    price: float | None = None
+    currency: str
+    source_price: float | None = None
+    source_currency: str | None = None
+    status: str
+    image_count: int = 0
+    image_urls: list[str] = Field(default_factory=list)
+    image_ids: list[int] = Field(default_factory=list)
+    buyout_price_rub: float | None = None
+    is_favorite: bool = False
+
+
 class WeightRuleKeywordRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=255)
 
@@ -333,3 +360,4 @@ class DedupRejectRequest(BaseModel):
 
 
 CategoryTreeNodeResponse.model_rebuild()
+CatalogCategoryNodeResponse.model_rebuild()

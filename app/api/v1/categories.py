@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.schemas.parser import (
+    CatalogCategoryNodeResponse,
     CategoryCreateRequest,
     CategoryKeywordRequest,
     CategoryManualProductRequest,
@@ -18,6 +19,17 @@ from app.services.catalog.category_tree_service import CategoryTreeService
 router = APIRouter(tags=["categories"])
 
 
+def _to_catalog_node(node: CategoryTreeNodeResponse) -> CatalogCategoryNodeResponse:
+    return CatalogCategoryNodeResponse(
+        slug=node.slug,
+        name=node.name,
+        parent_id=node.parent_id,
+        count=int(node.product_count or 0),
+        is_enabled=bool(node.is_enabled),
+        children=[_to_catalog_node(child) for child in (node.children or []) if child.is_enabled],
+    )
+
+
 @router.get("/categories/tree", response_model=list[CategoryTreeNodeResponse])
 def get_category_tree(
     include_counts: bool = Query(default=True),
@@ -26,21 +38,30 @@ def get_category_tree(
     return CategoryTreeService(db).get_category_tree(include_counts=include_counts)
 
 
-@router.get("/catalog/categories/roots", response_model=list[CategoryTreeNodeResponse])
+@router.get("/catalog/categories/roots", response_model=list[CatalogCategoryNodeResponse])
 def get_catalog_roots(
     include_counts: bool = Query(default=True),
     db: Session = Depends(get_db),
 ):
     tree = CategoryTreeService(db).get_category_tree(include_counts=include_counts)
-    roots: list[CategoryTreeNodeResponse] = []
+    roots: list[CatalogCategoryNodeResponse] = []
     for node in tree:
         if node.parent_id is not None or not node.is_enabled:
             continue
-        roots.append(node.model_copy(update={"children": []}))
+        roots.append(
+            CatalogCategoryNodeResponse(
+                slug=node.slug,
+                name=node.name,
+                parent_id=node.parent_id,
+                count=int(node.product_count or 0),
+                is_enabled=bool(node.is_enabled),
+                children=[],
+            )
+        )
     return roots
 
 
-@router.get("/catalog/categories/root/{root_slug}", response_model=CategoryTreeNodeResponse)
+@router.get("/catalog/categories/root/{root_slug}", response_model=CatalogCategoryNodeResponse)
 def get_catalog_root_branch(
     root_slug: str,
     include_counts: bool = Query(default=True),
@@ -50,7 +71,7 @@ def get_catalog_root_branch(
     tree = CategoryTreeService(db).get_category_tree(include_counts=include_counts)
     for node in tree:
         if node.parent_id is None and node.is_enabled and node.slug == slug:
-            return node
+            return _to_catalog_node(node)
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Root category not found")
 
 

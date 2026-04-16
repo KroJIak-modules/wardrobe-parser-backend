@@ -15,7 +15,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models import ParserProduct
+from app.models import ImageAsset, ParserProduct
 from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
@@ -89,6 +89,108 @@ def _normalize_int_list(raw: Any) -> list[int]:
         seen.add(parsed)
         values.append(parsed)
     return values
+
+
+def _normalize_image_urls(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        url = str(item or "").strip()
+        if not url:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        result.append(url)
+    return result
+
+
+def _resolve_image_asset_ids_for_products(db: Session, products: list[ParserProduct]) -> dict[int, list[int]]:
+    """Resolve image ids for response without mutating parser_product rows."""
+    if not products:
+        return {}
+
+    targets: list[tuple[int, list[str], list[int]]] = []
+    all_urls: set[str] = set()
+    for product in products:
+        existing_ids = _normalize_int_list(product.image_asset_ids)
+        urls = _normalize_image_urls(product.image_urls)
+        if existing_ids:
+            targets.append((int(product.id), urls, existing_ids))
+            continue
+        if not urls:
+            continue
+        targets.append((int(product.id), urls, []))
+        all_urls.update(urls)
+
+    if not targets:
+        return {}
+
+    asset_by_url: dict[str, ImageAsset] = {}
+    if all_urls:
+        existing_assets = (
+            db.query(ImageAsset)
+            .filter(ImageAsset.deleted_at.is_(None))
+            .filter(ImageAsset.source_url.in_(list(all_urls)))
+            .all()
+        )
+        asset_by_url = {str(asset.source_url): asset for asset in existing_assets}
+    created_any = False
+
+    for url in all_urls:
+        if url in asset_by_url:
+            continue
+        asset = ImageAsset(source_url=url, storage_mode="proxy")
+        db.add(asset)
+        asset_by_url[url] = asset
+        created_any = True
+
+    if created_any:
+        db.flush()
+        db.commit()
+
+    resolved_by_product_id: dict[int, list[int]] = {}
+    for product_id, urls, existing_ids in targets:
+        if existing_ids:
+            resolved_by_product_id[product_id] = existing_ids
+            continue
+        resolved_ids = [int(asset_by_url[url].id) for url in urls if asset_by_url.get(url) is not None and asset_by_url[url].id is not None]
+        if resolved_ids:
+            resolved_by_product_id[product_id] = resolved_ids
+    return resolved_by_product_id
+
+
+def _extract_buyout_price_rub(item: dict[str, Any]) -> float | None:
+    components = item.get("pricing_components")
+    if not isinstance(components, dict):
+        return None
+    for key in ("buyout_rub", "buyout_price_rub", "buyout"):
+        parsed = _safe_float(components.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _project_catalog_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(item.get("id") or 0),
+        "source_id": int(item.get("source_id") or 0),
+        "title": str(item.get("title") or ""),
+        "vendor": item.get("vendor"),
+        "url": str(item.get("url") or ""),
+        "price": _safe_float(item.get("price")),
+        "currency": str(item.get("currency") or "RUB"),
+        "source_price": _safe_float(item.get("source_price")),
+        "source_currency": item.get("source_currency"),
+        "status": str(item.get("status") or "hidden"),
+        "image_count": int(item.get("image_count") or 0),
+        "image_urls": list(item.get("image_urls") or []),
+        "image_ids": _normalize_int_list(item.get("image_ids")),
+        "buyout_price_rub": _extract_buyout_price_rub(item),
+        "is_favorite": bool(item.get("is_favorite")),
+    }
 
 
 def _encode_cursor(updated_at: datetime, product_id: int) -> str:
@@ -519,6 +621,7 @@ def get_catalog_products(
         )
         if not rows:
             break
+        resolved_image_ids = _resolve_image_asset_ids_for_products(db, rows)
 
         product_ids = {int(item.id) for item in rows}
         manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
@@ -534,6 +637,8 @@ def get_catalog_products(
 
         for row in rows:
             raw_item = _product_row_to_item(row)
+            if int(row.id) in resolved_image_ids:
+                raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
             if allowed_slugs is not None:
                 matched = assigner.match_many(raw_item)
                 matched_slugs = {item.category_slug for item in matched}
@@ -554,7 +659,7 @@ def get_catalog_products(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
                 ) from exc
-            accepted_items.append(enriched)
+            accepted_items.append(_project_catalog_item(enriched))
             if len(accepted_items) >= int(limit):
                 cursor_ts, cursor_id = _cursor_parts_for_product(row)
                 next_cursor = _encode_cursor(cursor_ts, cursor_id)
@@ -637,6 +742,7 @@ def get_admin_products(
         .limit(int(limit))
         .all()
     )
+    resolved_image_ids = _resolve_image_asset_ids_for_products(db, rows)
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
@@ -668,6 +774,8 @@ def get_admin_products(
     items: list[dict[str, Any]] = []
     for row in rows:
         raw_item = _product_row_to_item(row)
+        if int(row.id) in resolved_image_ids:
+            raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
         try:
             enriched = _safe_apply_backend_pricing_to_item(
                 item=raw_item,
@@ -732,6 +840,12 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
         int(product_id): [int(category_id) for category_id in manual_map.get(int(product_id), []) if int(category_id) in favorite_category_ids]
     }
     category_assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
+    local_product = ParserProductRepository(db).get_active_by_id(product_id)
+    if local_product is not None:
+        resolved_single = _resolve_image_asset_ids_for_products(db, [local_product])
+        payload["image_ids"] = list(resolved_single.get(int(local_product.id), list(local_product.image_asset_ids or [])))
+        if isinstance(local_product.image_urls, list) and local_product.image_urls:
+            payload["image_urls"] = list(local_product.image_urls or [])
     try:
         priced = _safe_apply_backend_pricing_to_item(
             item=payload,
