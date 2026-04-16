@@ -309,21 +309,21 @@ def main() -> None:
             db=db,
             existing_slugs=existing_slugs,
             name="Одежда",
-            slug_base="men-clothes",
+            slug_base="muzhskoe-odezhda",
             parent_id=men.id,
         )
         men_shoes = _create_category(
             db=db,
             existing_slugs=existing_slugs,
             name="Обувь",
-            slug_base="men-shoes",
+            slug_base="muzhskoe-obuv",
             parent_id=men.id,
         )
         men_accessories = _create_category(
             db=db,
             existing_slugs=existing_slugs,
             name="Аксессуары",
-            slug_base="men-accessories",
+            slug_base="muzhskoe-aksessuary",
             parent_id=men.id,
         )
         for item in [
@@ -340,7 +340,7 @@ def main() -> None:
                 db=db,
                 existing_slugs=existing_slugs,
                 name=item,
-                slug_base=f"men-{item}",
+                slug_base=f"muzhskoe-{item}",
                 parent_id=men_clothes.id,
             )
         for item in ["Кроссовки и кеды", "Ботинки и сапоги"]:
@@ -348,7 +348,7 @@ def main() -> None:
                 db=db,
                 existing_slugs=existing_slugs,
                 name=item,
-                slug_base=f"men-{item}",
+                slug_base=f"muzhskoe-{item}",
                 parent_id=men_shoes.id,
             )
         for item in ["Украшения", "Сумки", "Ремни", "Головные уборы", "Очки", "Другое"]:
@@ -356,7 +356,7 @@ def main() -> None:
                 db=db,
                 existing_slugs=existing_slugs,
                 name=item,
-                slug_base=f"men-{item}",
+                slug_base=f"muzhskoe-{item}",
                 parent_id=men_accessories.id,
             )
 
@@ -364,21 +364,21 @@ def main() -> None:
             db=db,
             existing_slugs=existing_slugs,
             name="Одежда",
-            slug_base="women-clothes",
+            slug_base="zhenskoe-odezhda",
             parent_id=women.id,
         )
         women_shoes = _create_category(
             db=db,
             existing_slugs=existing_slugs,
             name="Обувь",
-            slug_base="women-shoes",
+            slug_base="zhenskoe-obuv",
             parent_id=women.id,
         )
         women_accessories = _create_category(
             db=db,
             existing_slugs=existing_slugs,
             name="Аксессуары",
-            slug_base="women-accessories",
+            slug_base="zhenskoe-aksessuary",
             parent_id=women.id,
         )
         for item in [
@@ -396,7 +396,7 @@ def main() -> None:
                 db=db,
                 existing_slugs=existing_slugs,
                 name=item,
-                slug_base=f"women-{item}",
+                slug_base=f"zhenskoe-{item}",
                 parent_id=women_clothes.id,
             )
         for item in ["Кроссовки и кеды", "Ботинки и сапоги", "Туфли"]:
@@ -404,7 +404,7 @@ def main() -> None:
                 db=db,
                 existing_slugs=existing_slugs,
                 name=item,
-                slug_base=f"women-{item}",
+                slug_base=f"zhenskoe-{item}",
                 parent_id=women_shoes.id,
             )
         for item in ["Украшения", "Сумки", "Ремни", "Головные уборы", "Очки", "Другое"]:
@@ -412,7 +412,7 @@ def main() -> None:
                 db=db,
                 existing_slugs=existing_slugs,
                 name=item,
-                slug_base=f"women-{item}",
+                slug_base=f"zhenskoe-{item}",
                 parent_id=women_accessories.id,
             )
 

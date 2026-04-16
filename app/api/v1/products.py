@@ -15,7 +15,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models import ImageAsset, ParserProduct
+from app.models import ImageAsset, ParserCategory, ParserProduct, ParserProductCategoryMatch
 from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
@@ -23,7 +23,7 @@ from app.repositories import (
     ParserProductRepository,
     ParserSourceRepository,
 )
-from app.services.catalog.category_assignment import CategoryAssigner
+from app.services.catalog.category_index_service import CategoryIndexService
 from app.services.catalog.category_tree_utils import build_tree
 from app.services.proxy.service_api_proxy import forward_service_request
 from app.services.settings.pricing_service import PricingSettingsService
@@ -260,7 +260,6 @@ def _apply_backend_pricing_to_item(
     settings,
     source_profile_map: dict[int, Any],
     weight_rules: list[Any],
-    category_assigner: CategoryAssigner | None = None,
     favorite_manual_category_ids_by_product: dict[int, list[int]] | None = None,
 ) -> dict[str, Any]:
     source_id = _safe_int(item.get("source_id"))
@@ -327,15 +326,6 @@ def _apply_backend_pricing_to_item(
         item["price"] = source_price
         item["currency"] = source_currency
     item["status"] = _assert_allowed_product_status(item.get("status"))
-    if category_assigner is not None:
-        matches = category_assigner.match_many(item)
-        primary = matches[0] if matches else None
-        item["internal_category_ids"] = [match.category_id for match in matches if match.category_id > 0]
-        item["internal_category_names"] = [match.category_name for match in matches if match.category_id > 0]
-        item["internal_category_slugs"] = [match.category_slug for match in matches if match.category_id > 0]
-        item["internal_category_id"] = primary.category_id if primary is not None else None
-        item["internal_category_name"] = primary.category_name if primary is not None else None
-        item["internal_category_slug"] = primary.category_slug if primary is not None else None
     product_id = _safe_int(item.get("id"))
     starred_ids = []
     if favorite_manual_category_ids_by_product is not None and product_id is not None:
@@ -352,7 +342,6 @@ def _safe_apply_backend_pricing_to_item(
     settings,
     source_profile_map: dict[int, Any],
     weight_rules: list[Any],
-    category_assigner: CategoryAssigner | None = None,
     favorite_manual_category_ids_by_product: dict[int, list[int]] | None = None,
 ) -> dict[str, Any]:
     try:
@@ -362,7 +351,6 @@ def _safe_apply_backend_pricing_to_item(
             settings=settings,
             source_profile_map=source_profile_map,
             weight_rules=weight_rules,
-            category_assigner=category_assigner,
             favorite_manual_category_ids_by_product=favorite_manual_category_ids_by_product,
         )
     except InvalidProductStatusError:
@@ -398,6 +386,32 @@ def _build_descendant_slug_index(tree: list[Any]) -> dict[str, set[str]]:
         _collect_descendant_slugs(node, bucket)
         index[slug] = bucket
     return index
+
+
+def _apply_internal_categories_from_ids(
+    item: dict[str, Any],
+    *,
+    product_id: int,
+    category_ids_by_product: dict[int, list[int]],
+    category_node_by_id: dict[int, Any],
+    fallback_node: Any | None,
+) -> None:
+    raw_ids = [int(value) for value in category_ids_by_product.get(int(product_id), [])]
+    matched_nodes = [category_node_by_id[category_id] for category_id in raw_ids if category_id in category_node_by_id]
+    if not matched_nodes and fallback_node is not None:
+        matched_nodes = [fallback_node]
+
+    item["internal_category_ids"] = [int(node.id) for node in matched_nodes]
+    item["internal_category_names"] = [str(node.name) for node in matched_nodes]
+    item["internal_category_slugs"] = [str(node.slug) for node in matched_nodes]
+    if matched_nodes:
+        item["internal_category_id"] = int(matched_nodes[0].id)
+        item["internal_category_name"] = str(matched_nodes[0].name)
+        item["internal_category_slug"] = str(matched_nodes[0].slug)
+    else:
+        item["internal_category_id"] = None
+        item["internal_category_name"] = None
+        item["internal_category_slug"] = None
 
 
 def _product_row_to_item(product: ParserProduct) -> dict[str, Any]:
@@ -491,6 +505,11 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
     category_repo = ParserCategoryRepository(db)
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
+    category_index_service = CategoryIndexService(db)
+    category_index_service.ensure_fresh(require_counts=False)
+    flat_tree = _flatten_tree(category_tree)
+    category_node_by_id = {int(node.id): node for node in flat_tree if bool(getattr(node, "is_enabled", True))}
+    fallback_node = next((node for node in flat_tree if bool(getattr(node, "is_fallback", False))), None)
     manual_repo = ParserCategoryManualProductRepository(db)
     product_ids = {
         product_id
@@ -498,28 +517,39 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
         if product_id is not None
     }
     manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
+    indexed_category_ids = category_index_service.get_grouped_category_ids(product_ids)
     favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
     favorite_manual_map = {
         int(product_id): [int(category_id) for category_id in category_ids if int(category_id) in favorite_category_ids]
         for product_id, category_ids in manual_map.items()
     }
-    category_assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
 
     try:
-        payload["items"] = [
-            _safe_apply_backend_pricing_to_item(
-                item=item,
-                settings_service=settings_service,
-                settings=settings,
-                source_profile_map=source_profile_map,
-                weight_rules=weight_rules,
-                category_assigner=category_assigner,
-                favorite_manual_category_ids_by_product=favorite_manual_map,
+        enriched_items: list[Any] = []
+        for item in items:
+            if not isinstance(item, dict):
+                enriched_items.append(item)
+                continue
+            product_id = _safe_int(item.get("id"))
+            if product_id is not None:
+                _apply_internal_categories_from_ids(
+                    item,
+                    product_id=int(product_id),
+                    category_ids_by_product=indexed_category_ids,
+                    category_node_by_id=category_node_by_id,
+                    fallback_node=fallback_node,
+                )
+            enriched_items.append(
+                _safe_apply_backend_pricing_to_item(
+                    item=item,
+                    settings_service=settings_service,
+                    settings=settings,
+                    source_profile_map=source_profile_map,
+                    weight_rules=weight_rules,
+                    favorite_manual_category_ids_by_product=favorite_manual_map,
+                )
             )
-            if isinstance(item, dict)
-            else item
-            for item in items
-        ]
+        payload["items"] = enriched_items
     except InvalidProductStatusError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -564,6 +594,12 @@ def get_catalog_products(
     keyword_repo = ParserCategoryKeywordRepository(db)
     categories = category_repo.get_all_active()
     category_tree = build_tree(categories, keyword_repo)
+    category_index_service = CategoryIndexService(db)
+    category_index_service.ensure_fresh(require_counts=False)
+    flat_tree = _flatten_tree(category_tree)
+    category_node_by_id = {int(node.id): node for node in flat_tree if bool(getattr(node, "is_enabled", True))}
+    fallback_node = next((node for node in flat_tree if bool(getattr(node, "is_fallback", False))), None)
+    fallback_slug = str(fallback_node.slug) if fallback_node is not None else None
     descendant_slug_index = _build_descendant_slug_index(category_tree)
     allowed_slugs = descendant_slug_index.get(selected_category_slug) if selected_category_slug else None
     if selected_category_slug and allowed_slugs is None:
@@ -572,6 +608,18 @@ def get_catalog_products(
             "next_cursor": None,
             "has_more": False,
             "limit": int(limit),
+        }
+    slug_to_enabled_category_id = {
+        str(getattr(node, "slug", "")): int(node.id)
+        for node in flat_tree
+        if bool(getattr(node, "is_enabled", True))
+    }
+    allowed_category_ids: set[int] = set()
+    if allowed_slugs is not None:
+        allowed_category_ids = {
+            int(category_id)
+            for slug, category_id in slug_to_enabled_category_id.items()
+            if slug in allowed_slugs
         }
 
     decoded_cursor: tuple[datetime, int] | None = _decode_cursor(cursor) if cursor else None
@@ -606,6 +654,34 @@ def get_catalog_products(
                     ParserProduct.url.ilike(pattern),
                 )
             )
+        if allowed_slugs is not None:
+            if fallback_slug and selected_category_slug == fallback_slug:
+                query = query.filter(
+                    ~db.query(ParserProductCategoryMatch.id)
+                    .join(ParserCategory, ParserCategory.id == ParserProductCategoryMatch.category_id)
+                    .filter(ParserProductCategoryMatch.product_id == ParserProduct.id)
+                    .filter(ParserCategory.deleted_at.is_(None))
+                    .filter(ParserCategory.is_enabled.is_(True))
+                    .filter(ParserCategory.is_fallback.is_(False))
+                    .exists()
+                )
+            elif allowed_category_ids:
+                query = query.filter(
+                    db.query(ParserProductCategoryMatch.id)
+                    .join(ParserCategory, ParserCategory.id == ParserProductCategoryMatch.category_id)
+                    .filter(ParserProductCategoryMatch.product_id == ParserProduct.id)
+                    .filter(ParserCategory.deleted_at.is_(None))
+                    .filter(ParserCategory.is_enabled.is_(True))
+                    .filter(ParserProductCategoryMatch.category_id.in_(list(allowed_category_ids)))
+                    .exists()
+                )
+            else:
+                return {
+                    "items": [],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "limit": int(limit),
+                }
         if scan_cursor is not None:
             query = query.filter(
                 or_(
@@ -625,11 +701,11 @@ def get_catalog_products(
 
         product_ids = {int(item.id) for item in rows}
         manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
+        indexed_category_ids = category_index_service.get_grouped_category_ids(product_ids)
         favorite_manual_map = {
             int(product_id): [int(category_id) for category_id in category_ids if int(category_id) in favorite_category_ids]
             for product_id, category_ids in manual_map.items()
         }
-        assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
         source_profile_map = {
             int(source.id): source
             for source in source_repo.get_active_by_ids({int(item.source_id) for item in rows})
@@ -639,9 +715,17 @@ def get_catalog_products(
             raw_item = _product_row_to_item(row)
             if int(row.id) in resolved_image_ids:
                 raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
+            _apply_internal_categories_from_ids(
+                raw_item,
+                product_id=int(row.id),
+                category_ids_by_product=indexed_category_ids,
+                category_node_by_id=category_node_by_id,
+                fallback_node=fallback_node,
+            )
             if allowed_slugs is not None:
-                matched = assigner.match_many(raw_item)
-                matched_slugs = {item.category_slug for item in matched}
+                matched_slugs = set(raw_item.get("internal_category_slugs") or [])
+                if not matched_slugs and fallback_slug:
+                    matched_slugs = {fallback_slug}
                 if not matched_slugs.intersection(allowed_slugs):
                     continue
             try:
@@ -651,7 +735,6 @@ def get_catalog_products(
                     settings=settings,
                     source_profile_map=source_profile_map,
                     weight_rules=weight_rules,
-                    category_assigner=assigner,
                     favorite_manual_category_ids_by_product=favorite_manual_map,
                 )
             except InvalidProductStatusError as exc:
@@ -755,15 +838,20 @@ def get_admin_products(
     category_repo = ParserCategoryRepository(db)
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
+    category_index_service = CategoryIndexService(db)
+    category_index_service.ensure_fresh(require_counts=False)
+    flat_tree = _flatten_tree(category_tree)
+    category_node_by_id = {int(node.id): node for node in flat_tree if bool(getattr(node, "is_enabled", True))}
+    fallback_node = next((node for node in flat_tree if bool(getattr(node, "is_fallback", False))), None)
     manual_repo = ParserCategoryManualProductRepository(db)
     product_ids = {int(item.id) for item in rows}
     manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
+    indexed_category_ids = category_index_service.get_grouped_category_ids(product_ids)
     favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
     favorite_manual_map = {
         int(product_id): [int(category_id) for category_id in category_ids if int(category_id) in favorite_category_ids]
         for product_id, category_ids in manual_map.items()
     }
-    assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
 
     source_repo = ParserSourceRepository(db)
     source_profile_map = {
@@ -776,6 +864,13 @@ def get_admin_products(
         raw_item = _product_row_to_item(row)
         if int(row.id) in resolved_image_ids:
             raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
+        _apply_internal_categories_from_ids(
+            raw_item,
+            product_id=int(row.id),
+            category_ids_by_product=indexed_category_ids,
+            category_node_by_id=category_node_by_id,
+            fallback_node=fallback_node,
+        )
         try:
             enriched = _safe_apply_backend_pricing_to_item(
                 item=raw_item,
@@ -783,7 +878,6 @@ def get_admin_products(
                 settings=settings,
                 source_profile_map=source_profile_map,
                 weight_rules=weight_rules,
-                category_assigner=assigner,
                 favorite_manual_category_ids_by_product=favorite_manual_map,
             )
         except InvalidProductStatusError as exc:
@@ -833,19 +927,31 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
     category_repo = ParserCategoryRepository(db)
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
+    category_index_service = CategoryIndexService(db)
+    category_index_service.ensure_fresh(require_counts=False)
+    flat_tree = _flatten_tree(category_tree)
+    category_node_by_id = {int(node.id): node for node in flat_tree if bool(getattr(node, "is_enabled", True))}
+    fallback_node = next((node for node in flat_tree if bool(getattr(node, "is_fallback", False))), None)
     manual_repo = ParserCategoryManualProductRepository(db)
     manual_map = manual_repo.get_grouped_by_product_ids({int(product_id)})
+    indexed_category_ids = category_index_service.get_grouped_category_ids({int(product_id)})
     favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
     favorite_manual_map = {
         int(product_id): [int(category_id) for category_id in manual_map.get(int(product_id), []) if int(category_id) in favorite_category_ids]
     }
-    category_assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
     local_product = ParserProductRepository(db).get_active_by_id(product_id)
     if local_product is not None:
         resolved_single = _resolve_image_asset_ids_for_products(db, [local_product])
         payload["image_ids"] = list(resolved_single.get(int(local_product.id), list(local_product.image_asset_ids or [])))
         if isinstance(local_product.image_urls, list) and local_product.image_urls:
             payload["image_urls"] = list(local_product.image_urls or [])
+    _apply_internal_categories_from_ids(
+        payload,
+        product_id=int(product_id),
+        category_ids_by_product=indexed_category_ids,
+        category_node_by_id=category_node_by_id,
+        fallback_node=fallback_node,
+    )
     try:
         priced = _safe_apply_backend_pricing_to_item(
             item=payload,
@@ -853,7 +959,6 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
             settings=settings,
             source_profile_map=source_profile_map,
             weight_rules=weight_rules,
-            category_assigner=category_assigner,
             favorite_manual_category_ids_by_product=favorite_manual_map,
         )
     except InvalidProductStatusError as exc:
@@ -905,6 +1010,8 @@ async def update_product(product_id: int, request: Request, db: Session = Depend
         "url": str(product.url),
         "price": product.price,
         "currency": str(product.currency),
+        "source_price": getattr(product, "source_price", None) if getattr(product, "source_price", None) is not None else product.price,
+        "source_currency": str(getattr(product, "source_currency", None) or product.currency),
         "status": str(product.status),
         "image_count": int(product.image_count or 0),
         "image_urls": list(product.image_urls or []),
@@ -919,44 +1026,27 @@ async def update_product(product_id: int, request: Request, db: Session = Depend
         "updated_at": product.updated_at.isoformat() if product.updated_at is not None else None,
     }
 
-    settings_service = PricingSettingsService(db)
-    settings = settings_service.get_settings(refresh_bybit=False)
-    try:
-        weight_rules = WeightRuleService(db).get_matching_rules()
-    except Exception:
-        LOGGER.exception("Failed to load weight rules for PATCH /products/{product_id}; fallback to empty rules")
-        weight_rules = []
-
-    source_repo = ParserSourceRepository(db)
-    source_profile = source_repo.get_active_by_id(int(product.source_id))
-    source_profile_map = {int(source_profile.id): source_profile} if source_profile is not None else {}
-
-    category_repo = ParserCategoryRepository(db)
-    keyword_repo = ParserCategoryKeywordRepository(db)
-    category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
-    manual_repo = ParserCategoryManualProductRepository(db)
-    manual_map = manual_repo.get_grouped_by_product_ids({int(product_id)})
-    favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
-    favorite_manual_map = {
-        int(product_id): [int(category_id) for category_id in manual_map.get(int(product_id), []) if int(category_id) in favorite_category_ids]
-    }
-    category_assigner = CategoryAssigner(category_tree, manual_category_ids_by_product=manual_map)
-    try:
-        enriched = _safe_apply_backend_pricing_to_item(
-            item=patched_payload,
-            settings_service=settings_service,
-            settings=settings,
-            source_profile_map=source_profile_map,
-            weight_rules=weight_rules,
-            category_assigner=category_assigner,
-            favorite_manual_category_ids_by_product=favorite_manual_map,
-        )
-    except InvalidProductStatusError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
-        ) from exc
-    return JSONResponse(content=enriched)
+    patched_payload.update(
+        {
+            "internal_category_id": None,
+            "internal_category_name": None,
+            "internal_category_slug": None,
+            "internal_category_ids": [],
+            "internal_category_names": [],
+            "internal_category_slugs": [],
+            "starred_category_ids": [],
+            "is_favorite": False,
+            "final_price": None,
+            "final_currency": "RUB",
+            "pricing_manual_required": True,
+            "pricing_reason": "Status update response is lightweight; pricing is computed in catalog/detail endpoints.",
+            "pricing_components": {
+                "status": str(product.status),
+                "reason": "status-only-patch",
+            },
+        }
+    )
+    return JSONResponse(content=patched_payload)
 
 
 @router.get("/products/{product_id}/starred-categories")
@@ -1009,7 +1099,7 @@ async def set_product_starred_categories(product_id: int, request: Request, db: 
     if invalid_ids:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Категории не отмечены звездой в админке: {', '.join(str(value) for value in sorted(invalid_ids))}",
+            detail=f"Категории не отмечены как избранные в админке: {', '.join(str(value) for value in sorted(invalid_ids))}",
         )
 
     manual_repo = ParserCategoryManualProductRepository(db)
@@ -1032,10 +1122,11 @@ async def set_product_starred_categories(product_id: int, request: Request, db: 
             manual_repo.create(category_id=category_id, product_id=product_id)
 
     db.commit()
+    CategoryIndexService(db).rebuild_full()
 
     return {
         "ok": True,
-        "message": "Звездные категории товара обновлены",
+        "message": "Избранные категории товара обновлены",
         "product_id": int(product_id),
         "assigned_category_ids": sorted(target_starred),
     }

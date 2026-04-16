@@ -22,7 +22,7 @@ from app.schemas.parser import (
     CategoryTreeNodeResponse,
     CategoryUpdateRequest,
 )
-from app.services.catalog.category_assignment import CategoryAssigner, aggregate_tree_counts
+from app.services.catalog.category_index_service import CategoryIndexService
 from app.services.catalog.category_tree_rules import (
     build_unique_slug,
     ensure_fallback,
@@ -45,6 +45,7 @@ class CategoryTreeService:
         self.keyword_repo = ParserCategoryKeywordRepository(db)
         self.manual_product_repo = ParserCategoryManualProductRepository(db)
         self.product_repo = ParserProductRepository(db)
+        self.category_index_service = CategoryIndexService(db)
 
     def _build_tree(self, categories: list[ParserCategory], designers_root: ParserCategory | None) -> list[CategoryTreeNodeResponse]:
         designers_root_id = designers_root.id if designers_root is not None else None
@@ -56,13 +57,8 @@ class CategoryTreeService:
 
     def _build_tree_with_counts(self, categories: list[ParserCategory], designers_root: ParserCategory | None) -> list[CategoryTreeNodeResponse]:
         designers_root_id = designers_root.id if designers_root is not None else None
-        base_tree = self._build_tree(categories, designers_root)
-        products = self.product_repo.list_active_for_category_counts()
-        product_ids = {int(item.id) for item in products}
-        manual_map = self.manual_product_repo.get_grouped_by_product_ids(product_ids)
-        assigner = CategoryAssigner(base_tree, manual_category_ids_by_product=manual_map)
-        direct_counts = assigner.direct_counts(products)
-        aggregated_counts = aggregate_tree_counts(base_tree, direct_counts)
+        self.category_index_service.ensure_fresh(require_counts=True)
+        aggregated_counts = self.category_index_service.get_snapshot_counts()
         return build_tree(
             categories,
             self.keyword_repo,
@@ -316,6 +312,7 @@ class CategoryTreeService:
         )
         self.category_repo.flush()
         self.db.commit()
+        self.category_index_service.rebuild_full()
         categories = self.category_repo.get_all_active()
         tree = self._build_tree_with_counts(categories, designers_root)
         created_node = find_node(tree, category.id)
@@ -359,10 +356,11 @@ class CategoryTreeService:
 
         if "is_favorite" in payload.model_fields_set and payload.is_favorite is not None:
             if category.is_fallback or in_designers_branch:
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Системную категорию нельзя отмечать звездой")
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Системную категорию нельзя отмечать как избранную")
             category.is_favorite = bool(payload.is_favorite)
 
         self.db.commit()
+        self.category_index_service.rebuild_full()
         categories = self.category_repo.get_all_active()
         tree = self._build_tree_with_counts(categories, designers_root)
         updated_node = find_node(tree, category.id)
@@ -382,6 +380,7 @@ class CategoryTreeService:
 
         category.deleted_at = datetime.now(timezone.utc)
         self.db.commit()
+        self.category_index_service.rebuild_full()
         return {"ok": True}
 
     def add_category_keyword(self, category_id: int, payload: CategoryKeywordRequest) -> dict:
@@ -403,6 +402,7 @@ class CategoryTreeService:
             return {"ok": True, "keyword": keyword, "scope": scope, "duplicated": True}
         self.keyword_repo.create(category_id=category_id, keyword=keyword, keyword_scope=scope)
         self.db.commit()
+        self.category_index_service.rebuild_full()
         return {"ok": True, "keyword": keyword, "scope": scope}
 
     def remove_category_keyword(self, category_id: int, keyword: str, scope: str | None = None) -> dict:
@@ -428,6 +428,7 @@ class CategoryTreeService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ключевое слово не найдено")
         self.db.delete(entity)
         self.db.commit()
+        self.category_index_service.rebuild_full()
         return {"ok": True}
 
     def _get_keyword_enabled_category(self, category_id: int) -> ParserCategory:
@@ -564,7 +565,7 @@ class CategoryTreeService:
         if existing is not None:
             return {"ok": True, "duplicated": True}
         self.manual_product_repo.create(category_id=category_id, product_id=product_id)
-        self.db.commit()
+        self.category_index_service.sync_manual_link(category_id=category_id, product_id=product_id)
         return {"ok": True}
 
     def remove_manual_product(self, category_id: int, product_id: int) -> dict:
@@ -573,5 +574,5 @@ class CategoryTreeService:
         if existing is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден в ручных назначениях")
         self.db.delete(existing)
-        self.db.commit()
+        self.category_index_service.remove_manual_link(category_id=category_id, product_id=product_id)
         return {"ok": True}

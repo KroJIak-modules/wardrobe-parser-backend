@@ -74,3 +74,47 @@ class ParserCategoryManualProduct(Base):
         Index("idx_parser_category_manual_category", "category_id"),
         Index("idx_parser_category_manual_product", "product_id"),
     )
+
+
+class ParserProductCategoryMatch(Base):
+    """Resolved product-category matches (manual and auto)."""
+
+    __tablename__ = "parser_product_category_match"
+
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, ForeignKey("parser_product.id", ondelete="CASCADE"), nullable=False)
+    category_id = Column(Integer, ForeignKey("parser_category.id", ondelete="CASCADE"), nullable=False)
+    match_source = Column(String(16), nullable=False, default="auto", server_default="auto")
+    score = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("product_id", "category_id", "match_source", name="uq_parser_product_category_match"),
+        Index("idx_parser_product_category_match_product", "product_id"),
+        Index("idx_parser_product_category_match_category", "category_id"),
+        Index("idx_parser_product_category_match_source", "match_source"),
+    )
+
+
+class ParserCategoryCountSnapshot(Base):
+    """Precomputed direct and subtree counters for category tree."""
+
+    __tablename__ = "parser_category_count_snapshot"
+
+    category_id = Column(Integer, ForeignKey("parser_category.id", ondelete="CASCADE"), primary_key=True)
+    direct_count = Column(Integer, nullable=False, default=0, server_default="0")
+    subtree_count = Column(Integer, nullable=False, default=0, server_default="0")
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class ParserCategoryIndexState(Base):
+    """Technical state for category index rebuilds."""
+
+    __tablename__ = "parser_category_index_state"
+
+    id = Column(Integer, primary_key=True)
+    matches_built_at = Column(DateTime(timezone=True), nullable=True)
+    counts_built_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
