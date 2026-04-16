@@ -1,11 +1,18 @@
 """API endpoints for parser/admin settings."""
 
 import logging
+import time
+from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.models import ImageAsset
 from app.schemas.parser import (
     PricingSettingsResponse,
     PricingSettingsUpdateRequest,
@@ -26,6 +33,8 @@ from app.services.settings.weight_rule_service import WeightRuleService
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 LOGGER = logging.getLogger(__name__)
+_UPLOAD_DIR = Path(__file__).resolve().parents[3] / "uploads" / "showcase"
+_ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 @router.get("/pricing", response_model=PricingSettingsResponse)
@@ -104,3 +113,39 @@ def export_settings(db: Session = Depends(get_db)):
 @router.post("/import", response_model=SettingsTransferResponse)
 def import_settings(payload: SettingsTransferPayload, db: Session = Depends(get_db)):
     return SettingsTransferService(db).import_payload(payload)
+
+
+@router.post("/showcase/upload-image")
+async def upload_showcase_image(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    if not file.filename:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Файл не передан")
+    extension = Path(file.filename).suffix.lower()
+    if extension not in _ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Недопустимый формат изображения")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Пустой файл")
+    try:
+        with Image.open(BytesIO(content)) as img:
+            img.verify()
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Файл не является корректным изображением")
+    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    safe_stem = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in Path(file.filename).stem.lower()).strip("-") or "showcase"
+    file_name = f"{safe_stem}-{int(time.time() * 1000)}-{uuid4().hex[:8]}{extension}"
+    target = _UPLOAD_DIR / file_name
+    target.write_bytes(content)
+    asset = ImageAsset(
+        source_url=f"stored://showcase/{file_name}",
+        storage_mode="stored_file",
+        stored_path=str(target),
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(asset)
+    db.commit()
+    db.refresh(asset)
+    return {
+        "ok": True,
+        "image_asset_id": int(asset.id),
+        "image_url": f"/api/v1/images/{int(asset.id)}",
+    }

@@ -1,4 +1,5 @@
 from pathlib import Path
+import secrets
 from typing import Optional
 
 from pydantic import Field, model_validator
@@ -58,6 +59,11 @@ class Settings(BaseSettings):
         le=86400,
         env="PRICING_BYBIT_WORKER_INTERVAL_SEC",
     )
+    admin_superuser_login: str = Field(default="admin", env="ADMIN_SUPERUSER_LOGIN")
+    admin_superuser_password: str = Field(default="", env="ADMIN_SUPERUSER_PASSWORD")
+    admin_access_token_ttl_sec: int = Field(default=86_400, ge=300, le=2_592_000, env="ADMIN_ACCESS_TOKEN_TTL_SEC")
+    admin_refresh_token_ttl_sec: int = Field(default=604_800, ge=3600, le=7_776_000, env="ADMIN_REFRESH_TOKEN_TTL_SEC")
+    admin_token_secret: str = Field(default="", env="ADMIN_TOKEN_SECRET")
 
     @model_validator(mode="after")
     def build_database_url(self) -> "Settings":
@@ -67,6 +73,10 @@ class Settings(BaseSettings):
                 f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
             )
             object.__setattr__(self, "database_url", url)
+        if not self.admin_superuser_password:
+            raise ValueError("ADMIN_SUPERUSER_PASSWORD must be set")
+        if not self.admin_token_secret:
+            object.__setattr__(self, "admin_token_secret", secrets.token_urlsafe(48))
         return self
 
     class Config:

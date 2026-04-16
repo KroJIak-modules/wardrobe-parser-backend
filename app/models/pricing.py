@@ -1,6 +1,6 @@
 """Pricing and supplier models for final customer price formula."""
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -88,15 +88,18 @@ class ParserSupplier(Base):
     key = Column(String(64), nullable=False, unique=True)
     name = Column(String(255), nullable=False)
     category = Column(String(16), nullable=False, default="main")
+    parent_supplier_id = Column(Integer, ForeignKey("parser_supplier.id", ondelete="CASCADE"), nullable=True)
+    alt_position = Column(Integer, nullable=False, default=0)
     rate_currency = Column(String(3), nullable=False, default="RUB")
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     sources = relationship("ParserSource", back_populates="supplier")
+    parent_supplier = relationship("ParserSupplier", remote_side=[id], backref="alt_suppliers")
     shipping_rates = relationship(
         "ParserSupplierShippingRate",
         back_populates="supplier",
-        order_by="ParserSupplierShippingRate.step_500g.asc()",
+        order_by="ParserSupplierShippingRate.min_kg.asc()",
         cascade="all, delete-orphan",
     )
 
@@ -107,13 +110,14 @@ class ParserSupplier(Base):
 
 
 class ParserSupplierShippingRate(Base):
-    """SSR table entry for one supplier and one 500g step."""
+    """SSR tariff row for one supplier by weight range."""
 
     __tablename__ = "parser_supplier_shipping_rate"
 
     id = Column(Integer, primary_key=True)
     supplier_id = Column(Integer, ForeignKey("parser_supplier.id", ondelete="CASCADE"), nullable=False)
-    step_500g = Column(Integer, nullable=False)
+    min_kg = Column(Float, nullable=False, default=0.0)
+    max_kg = Column(Float, nullable=True)
     rate_rub = Column(Float, nullable=False, default=0.0)
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -121,9 +125,9 @@ class ParserSupplierShippingRate(Base):
     supplier = relationship("ParserSupplier", back_populates="shipping_rates")
 
     __table_args__ = (
-        UniqueConstraint("supplier_id", "step_500g", name="uq_parser_supplier_shipping_rate_supplier_step"),
         Index("idx_parser_supplier_shipping_rate_supplier_id", "supplier_id"),
-        Index("idx_parser_supplier_shipping_rate_step_500g", "step_500g"),
+        Index("idx_parser_supplier_shipping_rate_min_kg", "min_kg"),
+        Index("idx_parser_supplier_shipping_rate_max_kg", "max_kg"),
     )
 
 
@@ -156,10 +160,13 @@ class ParserPricingSettings(Base):
     tax_rate = Column(Float, nullable=False, default=0.06)
     designers_min_products = Column(Integer, nullable=False, default=1)
     designers_exclude_store_vendors = Column(Boolean, nullable=False, default=False)
+    dedup_only_available_products = Column(Boolean, nullable=False, default=False)
     svc_rules = Column(JSON, nullable=False, default=list)
     insurance_rules = Column(JSON, nullable=False, default=_default_insurance_rules)
     service_fee_rules = Column(JSON, nullable=False, default=_default_service_fee_rules)
     shipping_rules = Column(JSON, nullable=False, default=_default_shipping_rules)
+    showcase_hero_image_asset_id = Column(Integer, nullable=True)
+    showcase_carousel_image_asset_ids = Column(JSON, nullable=False, default=list)
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

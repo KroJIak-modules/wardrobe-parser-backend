@@ -15,49 +15,28 @@ class ParserSupplierRepository(BaseRepository[ParserSupplier]):
     def get_by_key(self, key: str) -> ParserSupplier | None:
         return self.query().filter(ParserSupplier.key == key).first()
 
-    def get_default_supplier(self) -> ParserSupplier:
-        supplier = self.get_by_key("default")
-        if supplier:
-            return supplier
-        supplier = self.create(
-            id=1,
-            key="default",
-            name="Default Supplier",
-            category="main",
-        )
-        self.flush()
-        return supplier
-
     def list_all_with_rates(self) -> list[ParserSupplier]:
         return (
             self.query()
             .options(joinedload(ParserSupplier.shipping_rates))
-            .order_by(ParserSupplier.id.asc())
+            .order_by(
+                ParserSupplier.parent_supplier_id.asc().nullsfirst(),
+                ParserSupplier.alt_position.asc(),
+                ParserSupplier.id.asc(),
+            )
             .all()
         )
 
-    def ensure_linear_rates(self, *, supplier_id: int, per_500g_rub: float, max_step_500g: int) -> None:
-        rates = (
-            self.session.query(ParserSupplierShippingRate)
-            .filter(ParserSupplierShippingRate.supplier_id == supplier_id)
-            .all()
-        )
-        by_step = {item.step_500g: item for item in rates}
-        target_steps = max(1, int(max_step_500g))
-
-        for step in range(1, target_steps + 1):
-            value = float(step) * float(per_500g_rub)
-            existing = by_step.get(step)
-            if existing:
-                existing.rate_rub = value
-            else:
-                self.session.add(
-                    ParserSupplierShippingRate(
-                        supplier_id=supplier_id,
-                        step_500g=step,
-                        rate_rub=value,
-                    )
+    def replace_ranges(self, *, supplier_id: int, ranges: list[dict]) -> None:
+        self.session.query(ParserSupplierShippingRate).filter(
+            ParserSupplierShippingRate.supplier_id == supplier_id
+        ).delete(synchronize_session=False)
+        for row in ranges:
+            self.session.add(
+                ParserSupplierShippingRate(
+                    supplier_id=supplier_id,
+                    min_kg=float(row["min_kg"]),
+                    max_kg=(float(row["max_kg"]) if row.get("max_kg") is not None else None),
+                    rate_rub=float(row["rub"]),
                 )
-        for step, item in by_step.items():
-            if step > target_steps:
-                self.session.delete(item)
+            )

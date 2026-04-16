@@ -58,10 +58,13 @@ _PRICING_EXPORT_FIELDS = [
     "tax_rate",
     "designers_min_products",
     "designers_exclude_store_vendors",
+    "dedup_only_available_products",
     "svc_rules",
     "insurance_rules",
     "service_fee_rules",
     "shipping_rules",
+    "showcase_hero_image_asset_id",
+    "showcase_carousel_image_asset_ids",
 ]
 
 _PRICING_IMPORT_FIELDS = set(_PRICING_EXPORT_FIELDS)
@@ -123,13 +126,24 @@ class SettingsTransferService:
                 key=str(supplier.key),
                 name=str(supplier.name),
                 category=str(supplier.category),
+                parent_supplier_key=(
+                    str(supplier_by_id[int(supplier.parent_supplier_id)].key)
+                    if getattr(supplier, "parent_supplier_id", None) is not None
+                    and int(supplier.parent_supplier_id) in supplier_by_id
+                    else None
+                ),
+                alt_position=max(0, int(getattr(supplier, "alt_position", 0) or 0)),
                 rate_currency=str(supplier.rate_currency),
                 rates=[
                     {
-                        "step_500g": int(rate.step_500g),
-                        "rate_rub": float(rate.rate_rub),
+                        "min_kg": float(rate.min_kg),
+                        "max_kg": (float(rate.max_kg) if rate.max_kg is not None else None),
+                        "rub": float(rate.rate_rub),
                     }
-                    for rate in sorted(supplier.shipping_rates, key=lambda item: int(item.step_500g))
+                    for rate in sorted(
+                        supplier.shipping_rates,
+                        key=lambda item: (float(item.min_kg or 0.0), float(item.max_kg) if item.max_kg is not None else float("inf")),
+                    )
                 ],
             )
             for supplier in suppliers
@@ -247,9 +261,11 @@ class SettingsTransferService:
     def _import_suppliers(self, suppliers: list[SettingsTransferSupplierEntry]) -> dict[str, ParserSupplier]:
         existing = {str(item.key): item for item in self.supplier_repo.list_all_with_rates()}
         result: dict[str, ParserSupplier] = {}
+        incoming_by_key: dict[str, SettingsTransferSupplierEntry] = {}
 
         for index, incoming in enumerate(suppliers, start=1):
             key = _normalize_supplier_key(incoming.key, incoming.name, index=index)
+            incoming_by_key[key] = incoming
             current = existing.get(key)
             if current is None:
                 current = self.supplier_repo.create(
@@ -268,15 +284,38 @@ class SettingsTransferService:
                 synchronize_session=False
             )
             for rate in incoming.rates:
-                step = max(1, int(rate["step_500g"]))
+                min_kg = max(0.0, float(getattr(rate, "min_kg", 0.0)))
+                max_raw = getattr(rate, "max_kg", None)
+                max_kg = None if max_raw is None else max(min_kg + 0.000001, float(max_raw))
                 self.db.add(
                     ParserSupplierShippingRate(
                         supplier_id=int(current.id),
-                        step_500g=step,
-                        rate_rub=max(0.0, float(rate["rate_rub"])),
+                        min_kg=min_kg,
+                        max_kg=max_kg,
+                        rate_rub=max(0.0, float(getattr(rate, "rub", 0.0))),
                     )
                 )
             result[key] = current
+
+        # Apply parent/alt linkage after all suppliers exist.
+        for key, supplier in result.items():
+            incoming = incoming_by_key.get(key)
+            if incoming is None:
+                continue
+            parent_key = _normalize_supplier_key(
+                incoming.parent_supplier_key or "",
+                incoming.parent_supplier_key or "",
+                index=0,
+            ) if incoming.parent_supplier_key else None
+            parent_supplier = result.get(parent_key) if parent_key else None
+            supplier.parent_supplier_id = int(parent_supplier.id) if parent_supplier is not None else None
+            if supplier.parent_supplier_id is not None:
+                supplier.alt_position = max(1, int(getattr(incoming, "alt_position", 1) or 1))
+                supplier.category = "alt"
+            else:
+                supplier.alt_position = 0
+                if supplier.category not in {"main", "alt"}:
+                    supplier.category = "main"
         return result
 
     def _import_sources(
@@ -286,8 +325,7 @@ class SettingsTransferService:
         supplier_map: dict[str, ParserSupplier],
     ) -> int:
         if not supplier_map:
-            default_supplier = self.supplier_repo.get_default_supplier()
-            supplier_map = {"default": default_supplier}
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет тарифов для назначения источникам")
         fallback_supplier = next(iter(supplier_map.values()))
         updated = 0
 

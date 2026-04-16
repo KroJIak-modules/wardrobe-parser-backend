@@ -140,15 +140,19 @@ class PricingSettingsUpdateRequest(BaseModel):
     tax_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     designers_min_products: int | None = Field(default=None, ge=1, le=1_000_000)
     designers_exclude_store_vendors: bool | None = None
+    dedup_only_available_products: bool | None = None
     svc_rules: list[dict] | None = None
     insurance_rules: list[dict] | None = None
     service_fee_rules: list[dict] | None = None
     shipping_rules: dict[str, dict[str, list[dict]]] | None = None
+    showcase_hero_image_asset_id: int | None = None
+    showcase_carousel_image_asset_ids: list[int] | None = None
 
 
 class PricingSupplierRateResponse(BaseModel):
-    step_500g: int
-    rate_rub: float
+    min_kg: float
+    max_kg: float | None = None
+    rub: float
 
 
 class PricingSupplierResponse(BaseModel):
@@ -156,29 +160,28 @@ class PricingSupplierResponse(BaseModel):
     key: str
     name: str
     category: str
+    parent_supplier_id: int | None = None
+    alt_position: int = 0
     rate_currency: str
-    rate_per_500g_value: float
-    rate_per_500g_rub: float
-    max_step_500g: int
     rates: list[PricingSupplierRateResponse] = Field(default_factory=list)
 
 
 class PricingSupplierUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     category: str | None = Field(default=None, min_length=3, max_length=16)
+    alt_position: int | None = Field(default=None, ge=0, le=3)
     rate_currency: str | None = Field(default=None, min_length=3, max_length=3)
-    rate_per_500g_value: float | None = Field(default=None, ge=0.0, le=1000000.0)
-    rate_per_500g_rub: float | None = Field(default=None, ge=0.0, le=1000000.0)
-    max_step_500g: int | None = Field(default=None, ge=1, le=1000)
+    rates: list[dict] | None = None
 
 
 class PricingSupplierCreateRequest(BaseModel):
     key: str | None = Field(default=None, min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=255)
     category: str = Field(default="main", min_length=3, max_length=16)
+    parent_supplier_id: int | None = None
+    alt_position: int | None = Field(default=None, ge=0, le=3)
     rate_currency: str = Field(default="RUB", min_length=3, max_length=3)
-    rate_per_500g_value: float = Field(default=0.0, ge=0.0, le=1000000.0)
-    max_step_500g: int = Field(default=120, ge=1, le=1000)
+    rates: list[dict] | None = None
 
 
 class PricingSettingsResponse(BaseModel):
@@ -200,10 +203,13 @@ class PricingSettingsResponse(BaseModel):
     tax_rate: float
     designers_min_products: int
     designers_exclude_store_vendors: bool
+    dedup_only_available_products: bool
     svc_rules: list[dict] = Field(default_factory=list)
     insurance_rules: list[dict] = Field(default_factory=list)
     service_fee_rules: list[dict] = Field(default_factory=list)
     shipping_rules: dict[str, dict[str, list[dict]]] = Field(default_factory=dict)
+    showcase_hero_image_asset_id: int | None = None
+    showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
     bybit_rate_status: str = "unknown"
     bybit_rate_warning: str | None = None
     bybit_bucket_step_usdt: int = 0
@@ -237,21 +243,27 @@ class SettingsTransferPricingSettings(BaseModel):
     tax_rate: float
     designers_min_products: int = Field(ge=1, le=1_000_000)
     designers_exclude_store_vendors: bool = False
+    dedup_only_available_products: bool = False
     svc_rules: list[dict] = Field(default_factory=list)
     insurance_rules: list[dict] = Field(default_factory=list)
     service_fee_rules: list[dict] = Field(default_factory=list)
     shipping_rules: dict[str, dict[str, list[dict]]] = Field(default_factory=dict)
+    showcase_hero_image_asset_id: int | None = None
+    showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
 
 
 class SettingsTransferSupplierRateEntry(BaseModel):
-    step_500g: int = Field(ge=1, le=10000)
-    rate_rub: float = Field(ge=0.0, le=100000000.0)
+    min_kg: float = Field(ge=0.0, le=100000.0)
+    max_kg: float | None = Field(default=None, ge=0.0, le=100000.0)
+    rub: float = Field(ge=0.0, le=100000000.0)
 
 
 class SettingsTransferSupplierEntry(BaseModel):
     key: str = Field(min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=255)
     category: str = Field(default="main", min_length=3, max_length=16)
+    parent_supplier_key: str | None = Field(default=None, min_length=1, max_length=64)
+    alt_position: int = Field(default=0, ge=0, le=3)
     rate_currency: str = Field(default="RUB", min_length=3, max_length=3)
     rates: list[SettingsTransferSupplierRateEntry] = Field(default_factory=list)
 
@@ -377,6 +389,31 @@ class DedupMergeRequest(BaseModel):
 class DedupRejectRequest(BaseModel):
     product_a_id: int
     product_b_id: int
+
+
+class DedupCombineRequest(BaseModel):
+    product_a_id: int
+    product_b_id: int
+
+
+class DedupDecisionResponse(BaseModel):
+    pair_key: str
+    action: str
+    decided_at: datetime | None = None
+    can_undo: bool = False
+    undo_block_reason: str | None = None
+    left: ProductResponse
+    right: ProductResponse
+
+
+class DedupDecisionListResponse(BaseModel):
+    items: list[DedupDecisionResponse]
+    total: int
+    limit: int
+
+
+class DedupUndoRequest(BaseModel):
+    pair_key: str
 
 
 CategoryTreeNodeResponse.model_rebuild()

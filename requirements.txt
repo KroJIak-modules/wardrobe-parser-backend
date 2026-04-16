@@ -7,3 +7,5 @@ pydantic>=2.6
 pydantic-settings>=2.2
 requests>=2.32
 redis>=5.0
+Pillow>=10.0
+python-multipart>=0.0.9

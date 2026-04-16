@@ -29,6 +29,7 @@ from app.schemas.parser import PricingExampleProductResponse
 from app.services.catalog.category_index_service import CategoryIndexService
 from app.services.catalog.category_tree_utils import build_tree
 from app.services.proxy.service_api_proxy import forward_service_request
+from app.services.auth.admin_auth_service import require_admin_access
 from app.services.settings.pricing_service import PricingSettingsService
 from app.services.settings.weight_rule_service import WeightRuleService
 
@@ -38,7 +39,8 @@ LOGGER = logging.getLogger(__name__)
 _PROXY_ROOT_METHODS = ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 _PROXY_PATH_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 _JSON_UNSAFE_HEADERS = {"content-length", "content-encoding", "transfer-encoding"}
-_ALLOWED_PRODUCT_STATUSES = {"available", "out_of_stock", "hidden"}
+_ALLOWED_PRODUCT_STATUSES = {"available", "out_of_stock", "hidden", "unavailable"}
+_PUBLIC_PRODUCT_STATUSES = {"available", "out_of_stock", "hidden"}
 _CATALOG_MAX_LIMIT = 120
 _CATALOG_SCAN_BATCH = 240
 _CATALOG_MAX_SCAN_PAGES = 8
@@ -96,8 +98,8 @@ def _variant_is_available(variant: Any) -> bool:
 
 
 def _effective_status_from_variants(stored_status: str, variants: Any) -> str:
-    if stored_status == "hidden":
-        return "hidden"
+    if stored_status in {"hidden", "unavailable"}:
+        return stored_status
     if not isinstance(variants, list) or len(variants) == 0:
         return stored_status
     if any(_variant_is_available(item) for item in variants):
@@ -561,6 +563,7 @@ def _project_admin_table_item(item: dict[str, Any]) -> dict[str, Any]:
 @router.get("/admin/products/table")
 def get_admin_products_table(
     db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
     search: str | None = Query(default=None),
     source_id: int | None = Query(default=None),
     vendor: str | None = Query(default=None),
@@ -575,7 +578,7 @@ def get_admin_products_table(
         if selected_status not in _ALLOWED_PRODUCT_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Допустимые статусы: available, out_of_stock, hidden",
+                detail="Допустимые статусы: available, out_of_stock, hidden, unavailable",
             )
 
     normalized_search = (search or "").strip()
@@ -708,6 +711,7 @@ def get_admin_products_table(
 @router.get("/admin/products/table/facets")
 def get_admin_products_table_facets(
     db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
     search: str | None = Query(default=None),
     source_id: int | None = Query(default=None),
     vendor: str | None = Query(default=None),
@@ -720,7 +724,7 @@ def get_admin_products_table_facets(
         if selected_status not in _ALLOWED_PRODUCT_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Допустимые статусы: available, out_of_stock, hidden",
+                detail="Допустимые статусы: available, out_of_stock, hidden, unavailable",
             )
 
     normalized_search = (search or "").strip() or None
@@ -947,7 +951,7 @@ def get_catalog_products(
     selected_status = None
     if status_filter:
         selected_status = str(status_filter).strip().lower()
-        if selected_status not in _ALLOWED_PRODUCT_STATUSES:
+        if selected_status not in _PUBLIC_PRODUCT_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Допустимые статусы: available, out_of_stock, hidden",
@@ -1008,7 +1012,7 @@ def get_catalog_products(
         query = (
             product_repo.query()
             .filter(ParserProduct.deleted_at.is_(None))
-            .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
+            .filter(ParserProduct.status.in_(tuple(_PUBLIC_PRODUCT_STATUSES)))
         )
         if source_id is not None:
             query = query.filter(ParserProduct.source_id == int(source_id))
@@ -1140,6 +1144,7 @@ def get_catalog_products(
 @router.get("/admin/products")
 def get_admin_products(
     db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
     search: str | None = Query(default=None),
     source_id: int | None = Query(default=None),
     vendor: str | None = Query(default=None),
@@ -1154,7 +1159,7 @@ def get_admin_products(
         if selected_status not in _ALLOWED_PRODUCT_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Допустимые статусы: available, out_of_stock, hidden",
+                detail="Допустимые статусы: available, out_of_stock, hidden, unavailable",
             )
 
     normalized_search = (search or "").strip()
@@ -1275,7 +1280,10 @@ def get_admin_products(
 
 
 @router.get("/products/pricing-example", response_model=PricingExampleProductResponse)
-def get_pricing_example_product(db: Session = Depends(get_db)) -> dict[str, Any]:
+def get_pricing_example_product(
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+) -> dict[str, Any]:
     base_query = (
         db.query(ParserProduct)
         .filter(ParserProduct.deleted_at.is_(None))
@@ -1389,6 +1397,8 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
         int(product_id): [int(category_id) for category_id in manual_map.get(int(product_id), []) if int(category_id) in favorite_category_ids]
     }
     local_product = ParserProductRepository(db).get_active_by_id(product_id)
+    if local_product is not None and str(local_product.status or "").strip().lower() == "unavailable":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
     if local_product is not None:
         resolved_single = _resolve_image_asset_ids_for_products(db, [local_product])
         payload["image_ids"] = list(resolved_single.get(int(local_product.id), list(local_product.image_asset_ids or [])))
@@ -1423,7 +1433,12 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
 
 
 @router.patch("/products/{product_id}")
-async def update_product(product_id: int, request: Request, db: Session = Depends(get_db)) -> Response:
+async def update_product(
+    product_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+) -> Response:
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректный payload")
@@ -1432,7 +1447,7 @@ async def update_product(product_id: int, request: Request, db: Session = Depend
     next_status = None
     if next_status_raw is not None:
         next_status = str(next_status_raw).strip().lower()
-        if next_status not in _ALLOWED_PRODUCT_STATUSES:
+        if next_status not in _PUBLIC_PRODUCT_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Допустимые статусы: available, out_of_stock, hidden",
@@ -1500,7 +1515,9 @@ async def update_product(product_id: int, request: Request, db: Session = Depend
 
 
 @router.get("/products/{product_id}/starred-categories")
-def get_product_starred_categories(product_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+def get_product_starred_categories(
+    product_id: int, db: Session = Depends(get_db), _: object = Depends(require_admin_access)
+) -> dict[str, Any]:
     product = ParserProductRepository(db).get_active_by_id(product_id)
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
@@ -1531,7 +1548,12 @@ def get_product_starred_categories(product_id: int, db: Session = Depends(get_db
 
 
 @router.put("/products/{product_id}/starred-categories")
-async def set_product_starred_categories(product_id: int, request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
+async def set_product_starred_categories(
+    product_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+) -> dict[str, Any]:
     product = ParserProductRepository(db).get_active_by_id(product_id)
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
@@ -1583,13 +1605,13 @@ async def set_product_starred_categories(product_id: int, request: Request, db: 
 
 
 @router.api_route("/products", methods=_PROXY_ROOT_METHODS)
-async def proxy_products_root(request: Request) -> Response:
+async def proxy_products_root(request: Request, _: object = Depends(require_admin_access)) -> Response:
     body = await request.body()
     return forward_service_request(request=request, path="products", body=body)
 
 
 @router.api_route("/products/{path:path}", methods=_PROXY_PATH_METHODS)
-async def proxy_products_path(path: str, request: Request) -> Response:
+async def proxy_products_path(path: str, request: Request, _: object = Depends(require_admin_access)) -> Response:
     if request.method.upper() == "GET":
         try:
             int(path)
