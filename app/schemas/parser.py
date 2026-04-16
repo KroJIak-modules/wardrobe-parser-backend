@@ -348,6 +348,7 @@ class ProductResponse(BaseModel):
     internal_category_ids: list[int] = Field(default_factory=list)
     internal_category_names: list[str] = Field(default_factory=list)
     internal_category_slugs: list[str] = Field(default_factory=list)
+    description: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

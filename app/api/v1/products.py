@@ -194,6 +194,16 @@ def _resolve_image_asset_ids_for_products(db: Session, products: list[ParserProd
     return resolved_by_product_id
 
 
+def _extract_product_description(item: dict[str, Any]) -> str | None:
+    for key in ("description", "body_html", "body"):
+        value = item.get(key)
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return normalized
+    return None
+
+
 def _extract_buyout_price_rub(item: dict[str, Any]) -> float | None:
     components = item.get("pricing_components")
     if not isinstance(components, dict):
@@ -1369,6 +1379,7 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
     payload = _upstream_json_or_none(upstream)
     if not isinstance(payload, dict):
         return upstream
+    payload["description"] = _extract_product_description(payload)
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
