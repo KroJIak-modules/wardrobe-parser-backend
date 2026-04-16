@@ -6,6 +6,7 @@ import base64
 import binascii
 import json
 import logging
+import random
 import unicodedata
 from datetime import datetime
 from typing import Any
@@ -24,6 +25,7 @@ from app.repositories import (
     ParserProductRepository,
     ParserSourceRepository,
 )
+from app.schemas.parser import PricingExampleProductResponse
 from app.services.catalog.category_index_service import CategoryIndexService
 from app.services.catalog.category_tree_utils import build_tree
 from app.services.proxy.service_api_proxy import forward_service_request
@@ -219,6 +221,16 @@ def _project_catalog_item(item: dict[str, Any]) -> dict[str, Any]:
         "buyout_price_rub": _extract_buyout_price_rub(item),
         "is_favorite": bool(item.get("is_favorite")),
     }
+
+
+def _resolve_primary_image_url(item: dict[str, Any]) -> str | None:
+    image_ids = _normalize_int_list(item.get("image_ids"))
+    if image_ids:
+        return f"/api/v1/images/{int(image_ids[0])}"
+    image_urls = _normalize_image_urls(item.get("image_urls"))
+    if image_urls:
+        return image_urls[0]
+    return None
 
 
 def _encode_cursor(updated_at: datetime, product_id: int) -> str:
@@ -1262,6 +1274,84 @@ def get_admin_products(
     }
 
 
+@router.get("/products/pricing-example", response_model=PricingExampleProductResponse)
+def get_pricing_example_product(db: Session = Depends(get_db)) -> dict[str, Any]:
+    base_query = (
+        db.query(ParserProduct)
+        .filter(ParserProduct.deleted_at.is_(None))
+        .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
+        .filter(ParserProduct.status == "available")
+    )
+    total = (
+        base_query.with_entities(func.count(ParserProduct.id))
+        .order_by(None)
+        .scalar()
+        or 0
+    )
+    if total <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Нет доступных товаров для примера ценообразования",
+        )
+
+    random_index = random.randint(0, int(total) - 1)
+    row = (
+        base_query
+        .order_by(ParserProduct.updated_at.desc(), ParserProduct.id.desc())
+        .offset(int(random_index))
+        .limit(1)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Не удалось выбрать товар для примера ценообразования",
+        )
+
+    resolved_image_ids = _resolve_image_asset_ids_for_products(db, [row])
+    raw_item = _product_row_to_item(row)
+    if int(row.id) in resolved_image_ids:
+        raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
+
+    settings_service = PricingSettingsService(db)
+    settings = settings_service.get_settings(refresh_bybit=False)
+    try:
+        weight_rules = WeightRuleService(db).get_matching_rules()
+    except Exception:
+        LOGGER.exception("Failed to load weight rules for /products/pricing-example; fallback to empty rules")
+        weight_rules = []
+
+    source_repo = ParserSourceRepository(db)
+    source_profile_map = {
+        int(source.id): source
+        for source in source_repo.get_active_by_ids({int(row.source_id)})
+    }
+    enriched = _safe_apply_backend_pricing_to_item(
+        item=raw_item,
+        settings_service=settings_service,
+        settings=settings,
+        source_profile_map=source_profile_map,
+        weight_rules=weight_rules,
+        favorite_manual_category_ids_by_product=None,
+    )
+    components = enriched.get("pricing_components")
+    if not isinstance(components, dict):
+        components = {}
+    source_profile = source_profile_map.get(int(row.source_id))
+
+    return {
+        "product_id": int(row.id),
+        "title": str(enriched.get("title") or row.title),
+        "url": str(enriched.get("url") or row.url),
+        "source_name": str(getattr(source_profile, "name", "") or "") or None,
+        "image_url": _resolve_primary_image_url(enriched),
+        "source_price": _safe_float(enriched.get("source_price")),
+        "source_currency": str(enriched.get("source_currency") or "") or None,
+        "final_price": _safe_float(enriched.get("final_price")),
+        "components": components,
+    }
+
+
 @router.get("/products/{product_id}")
 async def get_product(product_id: int, request: Request, db: Session = Depends(get_db)) -> Response:
     upstream = forward_service_request(request=request, path=f"products/{product_id}", body=b"")
@@ -1358,6 +1448,7 @@ async def update_product(product_id: int, request: Request, db: Session = Depend
 
     product.status = next_status
     db.commit()
+    effective_status = _effective_status_from_variants(str(product.status), list(product.variants or []))
 
     patched_payload = {
         "id": int(product.id),
@@ -1371,7 +1462,7 @@ async def update_product(product_id: int, request: Request, db: Session = Depend
         "currency": str(product.currency),
         "source_price": getattr(product, "source_price", None) if getattr(product, "source_price", None) is not None else product.price,
         "source_currency": str(getattr(product, "source_currency", None) or product.currency),
-        "status": str(product.status),
+        "status": effective_status,
         "image_count": int(product.image_count or 0),
         "image_urls": list(product.image_urls or []),
         "image_ids": list(product.image_asset_ids or []),
@@ -1400,7 +1491,7 @@ async def update_product(product_id: int, request: Request, db: Session = Depend
             "pricing_manual_required": True,
             "pricing_reason": "Status update response is lightweight; pricing is computed in catalog/detail endpoints.",
             "pricing_components": {
-                "status": str(product.status),
+                "status": effective_status,
                 "reason": "status-only-patch",
             },
         }

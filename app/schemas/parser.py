@@ -343,6 +343,18 @@ class ProductResponse(BaseModel):
         from_attributes = True
 
 
+class PricingExampleProductResponse(BaseModel):
+    product_id: int
+    title: str
+    url: str
+    source_name: str | None = None
+    image_url: str | None = None
+    source_price: float | None = None
+    source_currency: str | None = None
+    final_price: float | None = None
+    components: dict[str, object] = Field(default_factory=dict)
+
+
 class DedupCandidateResponse(BaseModel):
     pair_key: str
     score: float
