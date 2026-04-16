@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 from fastapi import FastAPI
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette import status
 
 from app.api.v1 import api_router
@@ -15,6 +20,23 @@ from app.core.exceptions import IntegrityError, NotFoundError, ValidationError
 HTTP_NOT_FOUND = status.HTTP_404_NOT_FOUND
 HTTP_BAD_REQUEST = status.HTTP_400_BAD_REQUEST
 HTTP_CONFLICT = status.HTTP_409_CONFLICT
+_DOCS_DIR = Path(__file__).resolve().parents[1] / "docs"
+_SHOWCASE_OPENAPI_PATHS = {
+    "/health",
+    "/api/v1/catalog/categories/roots",
+    "/api/v1/catalog/categories/root/{root_slug}",
+    "/api/v1/catalog/products",
+    "/api/v1/products/{product_id}",
+    "/api/v1/images/{image_id}",
+}
+_SHOWCASE_OPENAPI_OPERATIONS = {
+    "/health": {"get"},
+    "/api/v1/catalog/categories/roots": {"get"},
+    "/api/v1/catalog/categories/root/{root_slug}": {"get"},
+    "/api/v1/catalog/products": {"get"},
+    "/api/v1/products/{product_id}": {"get"},
+    "/api/v1/images/{image_id}": {"get"},
+}
 
 
 def _register_exception_handlers(app: FastAPI) -> None:
@@ -42,15 +64,80 @@ def _configure_cors(app: FastAPI) -> None:
     )
 
 
+def _build_showcase_openapi(app: FastAPI) -> dict[str, Any]:
+    if getattr(app.state, "showcase_openapi_schema", None):
+        return app.state.showcase_openapi_schema
+    schema = get_openapi(
+        title="Wardrobe Showcase API",
+        version="1.0.0",
+        description="Публичный API витрины (без админ-методов).",
+        routes=app.routes,
+    )
+    filtered_paths: dict[str, Any] = {}
+    for path, path_item in (schema.get("paths") or {}).items():
+        if path not in _SHOWCASE_OPENAPI_PATHS:
+            continue
+        allowed_methods = _SHOWCASE_OPENAPI_OPERATIONS.get(path, {"get"})
+        filtered_operations = {
+            method: operation
+            for method, operation in path_item.items()
+            if method.lower() in allowed_methods
+        }
+        if filtered_operations:
+            filtered_paths[path] = filtered_operations
+    schema["paths"] = filtered_paths
+    used_tags = {
+        tag
+        for path_item in schema["paths"].values()
+        for operation in path_item.values()
+        for tag in operation.get("tags", [])
+    }
+    schema["tags"] = [tag for tag in (schema.get("tags") or []) if tag.get("name") in used_tags]
+    app.state.showcase_openapi_schema = schema
+    return schema
+
+
 def create_app() -> FastAPI:
     """Create and configure FastAPI application instance."""
-    app = FastAPI(title="Wardrobe Parser Backend API")
+    app = FastAPI(
+        title="Wardrobe Parser Backend API",
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+        redoc_url=None,
+    )
 
     @app.get("/health", summary="Health check")
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
     app.include_router(api_router)
+
+    @app.get("/api/openapi/showcase.json", include_in_schema=False)
+    def get_showcase_openapi() -> dict[str, Any]:
+        return _build_showcase_openapi(app)
+
+    @app.get("/api/docs/showcase", include_in_schema=False)
+    def get_showcase_docs():
+        return get_swagger_ui_html(
+            openapi_url="/api/openapi/showcase.json",
+            title="Wardrobe Showcase API - Swagger UI",
+        )
+
+    @app.get("/api/redoc/showcase", include_in_schema=False)
+    def get_showcase_redoc():
+        return get_redoc_html(
+            openapi_url="/api/openapi/showcase.json",
+            title="Wardrobe Showcase API - ReDoc",
+        )
+
+    @app.get("/api/docs/showcase.md", include_in_schema=False)
+    def download_showcase_markdown() -> FileResponse:
+        return FileResponse(
+            _DOCS_DIR / "showcase-api.md",
+            media_type="text/markdown",
+            filename="showcase-api.md",
+        )
+
     _register_exception_handlers(app)
     _configure_cors(app)
     return app

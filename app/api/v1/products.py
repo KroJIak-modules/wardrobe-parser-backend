@@ -25,7 +25,7 @@ from app.repositories import (
     ParserProductRepository,
     ParserSourceRepository,
 )
-from app.schemas.parser import PricingExampleProductResponse
+from app.schemas.parser import CatalogProductsResponse, PricingExampleProductResponse, ShowcaseProductResponse
 from app.services.catalog.category_index_service import CategoryIndexService
 from app.services.catalog.category_tree_utils import build_tree
 from app.services.proxy.service_api_proxy import forward_service_request
@@ -232,6 +232,29 @@ def _project_catalog_item(item: dict[str, Any]) -> dict[str, Any]:
         "image_ids": _normalize_int_list(item.get("image_ids")),
         "buyout_price_rub": _extract_buyout_price_rub(item),
         "is_favorite": bool(item.get("is_favorite")),
+    }
+
+
+def _project_showcase_product_detail(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(item.get("id") or 0),
+        "source_id": int(item.get("source_id") or 0),
+        "title": str(item.get("title") or ""),
+        "vendor": item.get("vendor"),
+        "url": str(item.get("url") or ""),
+        "price": _safe_float(item.get("price")),
+        "currency": str(item.get("currency") or "RUB"),
+        "source_price": _safe_float(item.get("source_price")),
+        "source_currency": item.get("source_currency"),
+        "final_price": _safe_float(item.get("final_price")),
+        "final_currency": item.get("final_currency"),
+        "status": str(item.get("status") or "hidden"),
+        "image_urls": list(item.get("image_urls") or []),
+        "image_ids": _normalize_int_list(item.get("image_ids")),
+        "variants": list(item.get("variants") or []),
+        "internal_category_name": item.get("internal_category_name"),
+        "internal_category_names": list(item.get("internal_category_names") or []),
+        "description": item.get("description"),
     }
 
 
@@ -947,15 +970,60 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
     )
 
 
-@router.get("/catalog/products")
+@router.get(
+    "/catalog/products",
+    response_model=CatalogProductsResponse,
+    summary="Список товаров витрины",
+    description=(
+        "Публичная выдача каталога для витрины. Поддерживает курсорную пагинацию, поиск, "
+        "фильтрацию по источнику, категории и статусу."
+    ),
+    responses={
+        200: {
+            "description": "Страница каталога витрины.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "items": [
+                            {
+                                "id": 120045,
+                                "source_id": 12,
+                                "title": "Куртка утеплённая",
+                                "vendor": "Stone Island",
+                                "url": "https://example.com/products/120045",
+                                "price": 18900.0,
+                                "currency": "RUB",
+                                "source_price": 165.0,
+                                "source_currency": "USD",
+                                "status": "available",
+                                "image_count": 4,
+                                "image_urls": [],
+                                "image_ids": [5011, 5012],
+                                "buyout_price_rub": 15450.0,
+                                "is_favorite": False,
+                            }
+                        ],
+                        "next_cursor": "MjAyNi0wNC0xNlQxOTowODoyNS4wMDAwMDB8MTIwMDQ1",
+                        "has_more": True,
+                        "limit": 36,
+                    }
+                }
+            },
+        }
+    },
+)
 def get_catalog_products(
     db: Session = Depends(get_db),
-    category_slug: str | None = Query(default=None),
-    search: str | None = Query(default=None),
-    source_id: int | None = Query(default=None),
-    status_filter: str | None = Query(default=None, alias="status"),
-    limit: int = Query(default=36, ge=1, le=_CATALOG_MAX_LIMIT),
-    cursor: str | None = Query(default=None),
+    category_slug: str | None = Query(default=None, description="Slug категории для фильтрации."),
+    search: str | None = Query(default=None, description="Поиск по title/vendor/type/handle/url."),
+    source_id: int | None = Query(default=None, description="ID источника товара."),
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        description="Фильтр по статусу: available | out_of_stock | hidden.",
+    ),
+    limit: int = Query(default=36, ge=1, le=_CATALOG_MAX_LIMIT, description="Размер страницы (до 120)."),
+    cursor: str | None = Query(default=None, description="Курсор следующей страницы из previous ответа."),
 ) -> dict[str, Any]:
     selected_category_slug = (category_slug or "").strip().lower()
     selected_status = None
@@ -1370,7 +1438,44 @@ def get_pricing_example_product(
     }
 
 
-@router.get("/products/{product_id}")
+@router.get(
+    "/products/{product_id}",
+    response_model=ShowcaseProductResponse,
+    summary="Карточка товара",
+    description="Детальная информация о товаре витрины по ID.",
+    responses={
+        200: {
+            "description": "Детальная карточка товара витрины.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "id": 120045,
+                        "source_id": 12,
+                        "title": "Куртка утеплённая",
+                        "vendor": "Stone Island",
+                        "url": "https://example.com/products/120045",
+                        "price": 18900.0,
+                        "currency": "RUB",
+                        "source_price": 165.0,
+                        "source_currency": "USD",
+                        "final_price": 18900.0,
+                        "final_currency": "RUB",
+                        "status": "available",
+                        "image_urls": [],
+                        "image_ids": [5011, 5012, 5013],
+                        "variants": [
+                            {"title": "M", "available": True, "inventory_quantity": 2, "price": "165.0"},
+                            {"title": "L", "available": False, "inventory_quantity": 0, "price": "165.0"},
+                        ],
+                        "internal_category_name": "Куртки",
+                        "internal_category_names": ["Мужское", "Куртки"],
+                        "description": "Технологичная утеплённая куртка.",
+                    }
+                }
+            },
+        }
+    },
+)
 async def get_product(product_id: int, request: Request, db: Session = Depends(get_db)) -> Response:
     upstream = forward_service_request(request=request, path=f"products/{product_id}", body=b"")
     if upstream.status_code >= 400:
@@ -1436,11 +1541,8 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
         ) from exc
-    return JSONResponse(
-        content=priced,
-        status_code=upstream.status_code,
-        headers=_json_response_headers(upstream),
-    )
+    projected = _project_showcase_product_detail(priced)
+    return JSONResponse(content=projected, status_code=upstream.status_code, headers=_json_response_headers(upstream))
 
 
 @router.patch("/products/{product_id}")

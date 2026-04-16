@@ -67,9 +67,7 @@ class CategoryTreeNodeResponse(BaseModel):
 class CatalogCategoryNodeResponse(BaseModel):
     slug: str
     name: str
-    parent_id: int | None = None
     count: int = 0
-    is_enabled: bool = True
     is_designers_root: bool = False
     is_in_designers_branch: bool = False
     children: list["CatalogCategoryNodeResponse"] = Field(default_factory=list)
@@ -91,6 +89,13 @@ class CatalogProductCardResponse(BaseModel):
     image_ids: list[int] = Field(default_factory=list)
     buyout_price_rub: float | None = None
     is_favorite: bool = False
+
+
+class CatalogProductsResponse(BaseModel):
+    items: list[CatalogProductCardResponse] = Field(default_factory=list)
+    next_cursor: str | None = None
+    has_more: bool = False
+    limit: int
 
 
 class WeightRuleKeywordRequest(BaseModel):
@@ -354,6 +359,27 @@ class ProductResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ShowcaseProductResponse(BaseModel):
+    id: int
+    source_id: int
+    title: str
+    vendor: str | None = None
+    url: str
+    price: float | None = None
+    currency: str
+    source_price: float | None = None
+    source_currency: str | None = None
+    final_price: float | None = None
+    final_currency: str | None = None
+    status: str = "available"
+    image_urls: list[str] = Field(default_factory=list)
+    image_ids: list[int] = Field(default_factory=list)
+    variants: list[dict] = Field(default_factory=list)
+    internal_category_name: str | None = None
+    internal_category_names: list[str] = Field(default_factory=list)
+    description: str | None = None
 
 
 class PricingExampleProductResponse(BaseModel):

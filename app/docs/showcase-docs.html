@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wardrobe Showcase API Docs</title>
+  <style>
+    body { margin: 0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .topbar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 16px;
+      border-bottom: 1px solid #e6e6e6;
+      background: #fafafa;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .topbar a {
+      color: #0a58ca;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .topbar a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <strong>Showcase API docs</strong>
+    <a href="/api/openapi/showcase.json" target="_blank" rel="noreferrer">OpenAPI JSON</a>
+    <a href="/api/docs/showcase.md" target="_blank" rel="noreferrer">Markdown</a>
+  </div>
+
+  <redoc spec-url="/api/openapi/showcase.json"></redoc>
+  <script src="https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js"></script>
+</body>
+</html>

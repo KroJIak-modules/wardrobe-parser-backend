@@ -24,9 +24,7 @@ def _to_catalog_node(node: CategoryTreeNodeResponse) -> CatalogCategoryNodeRespo
     return CatalogCategoryNodeResponse(
         slug=node.slug,
         name=node.name,
-        parent_id=node.parent_id,
         count=int(node.product_count or 0),
-        is_enabled=bool(node.is_enabled),
         is_designers_root=bool(node.is_designers_root),
         is_in_designers_branch=bool(node.is_in_designers_branch),
         children=[_to_catalog_node(child) for child in (node.children or []) if child.is_enabled],
@@ -41,9 +39,41 @@ def get_category_tree(
     return CategoryTreeService(db).get_category_tree(include_counts=include_counts)
 
 
-@router.get("/catalog/categories/roots", response_model=list[CatalogCategoryNodeResponse])
+@router.get(
+    "/catalog/categories/roots",
+    response_model=list[CatalogCategoryNodeResponse],
+    summary="Список корневых категорий витрины",
+    description="Возвращает только включённые корневые категории, доступные для публичной витрины.",
+    responses={
+        200: {
+            "description": "Корневые категории витрины.",
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "slug": "muzhskoe",
+                            "name": "Мужское",
+                            "count": 1240,
+                            "is_designers_root": False,
+                            "is_in_designers_branch": False,
+                            "children": [],
+                        },
+                        {
+                            "slug": "dizajnery",
+                            "name": "Дизайнеры",
+                            "count": 860,
+                            "is_designers_root": True,
+                            "is_in_designers_branch": False,
+                            "children": [],
+                        },
+                    ]
+                }
+            },
+        }
+    },
+)
 def get_catalog_roots(
-    include_counts: bool = Query(default=True),
+    include_counts: bool = Query(default=True, description="Добавить количество товаров в категории."),
     db: Session = Depends(get_db),
 ):
     tree = CategoryTreeService(db).get_category_tree(include_counts=include_counts)
@@ -55,9 +85,7 @@ def get_catalog_roots(
             CatalogCategoryNodeResponse(
                 slug=node.slug,
                 name=node.name,
-                parent_id=node.parent_id,
                 count=int(node.product_count or 0),
-                is_enabled=bool(node.is_enabled),
                 is_designers_root=bool(node.is_designers_root),
                 is_in_designers_branch=bool(node.is_in_designers_branch),
                 children=[],
@@ -66,10 +94,41 @@ def get_catalog_roots(
     return roots
 
 
-@router.get("/catalog/categories/root/{root_slug}", response_model=CatalogCategoryNodeResponse)
+@router.get(
+    "/catalog/categories/root/{root_slug}",
+    response_model=CatalogCategoryNodeResponse,
+    summary="Дерево категорий выбранного корня",
+    description="Возвращает выбранный корень и всех его включённых потомков для меню/навигации витрины.",
+    responses={
+        200: {
+            "description": "Ветка дерева категорий.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "slug": "muzhskoe",
+                        "name": "Мужское",
+                        "count": 1240,
+                        "is_designers_root": False,
+                        "is_in_designers_branch": False,
+                        "children": [
+                            {
+                                "slug": "muzhskoe-kurtki",
+                                "name": "Куртки",
+                                "count": 310,
+                                "is_designers_root": False,
+                                "is_in_designers_branch": False,
+                                "children": [],
+                            }
+                        ],
+                    }
+                }
+            },
+        }
+    },
+)
 def get_catalog_root_branch(
     root_slug: str,
-    include_counts: bool = Query(default=True),
+    include_counts: bool = Query(default=True, description="Добавить количество товаров для каждой категории."),
     db: Session = Depends(get_db),
 ):
     slug = root_slug.strip().lower()
