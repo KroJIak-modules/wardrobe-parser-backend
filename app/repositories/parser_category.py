@@ -54,6 +54,9 @@ class ParserCategoryRepository(BaseRepository[ParserCategory]):
             .first()
         )
 
+    def get_by_slug_any(self, slug: str) -> ParserCategory | None:
+        return self.query().filter(ParserCategory.slug == slug).first()
+
     def get_children(self, parent_id: int) -> list[ParserCategory]:
         return (
             self.query()

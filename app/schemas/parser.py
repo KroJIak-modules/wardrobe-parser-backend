@@ -138,6 +138,8 @@ class PricingSettingsUpdateRequest(BaseModel):
     customs_fixed_rub: float | None = Field(default=None, ge=0.0, le=1_000_000.0)
     shipping_alt_threshold_eur: float | None = Field(default=None, ge=0.0, le=100_000.0)
     tax_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    designers_min_products: int | None = Field(default=None, ge=1, le=1_000_000)
+    designers_exclude_store_vendors: bool | None = None
     svc_rules: list[dict] | None = None
     insurance_rules: list[dict] | None = None
     service_fee_rules: list[dict] | None = None
@@ -196,6 +198,8 @@ class PricingSettingsResponse(BaseModel):
     customs_fixed_rub: float
     shipping_alt_threshold_eur: float
     tax_rate: float
+    designers_min_products: int
+    designers_exclude_store_vendors: bool
     svc_rules: list[dict] = Field(default_factory=list)
     insurance_rules: list[dict] = Field(default_factory=list)
     service_fee_rules: list[dict] = Field(default_factory=list)
@@ -231,6 +235,8 @@ class SettingsTransferPricingSettings(BaseModel):
     customs_fixed_rub: float
     shipping_alt_threshold_eur: float
     tax_rate: float
+    designers_min_products: int = Field(ge=1, le=1_000_000)
+    designers_exclude_store_vendors: bool = False
     svc_rules: list[dict] = Field(default_factory=list)
     insurance_rules: list[dict] = Field(default_factory=list)
     service_fee_rules: list[dict] = Field(default_factory=list)

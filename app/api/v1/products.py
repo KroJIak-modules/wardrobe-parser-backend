@@ -75,6 +75,32 @@ def _assert_allowed_product_status(value: Any) -> str:
     return normalized
 
 
+def _variant_is_available(variant: Any) -> bool:
+    if not isinstance(variant, dict):
+        return False
+    raw_available = variant.get("available")
+    if isinstance(raw_available, bool):
+        if raw_available:
+            return True
+    elif raw_available is not None:
+        if str(raw_available).strip().lower() in {"1", "true", "yes", "y", "in_stock"}:
+            return True
+    inventory = _safe_float(variant.get("inventory_quantity"))
+    if inventory is not None and inventory > 0:
+        return True
+    return False
+
+
+def _effective_status_from_variants(stored_status: str, variants: Any) -> str:
+    if stored_status == "hidden":
+        return "hidden"
+    if not isinstance(variants, list) or len(variants) == 0:
+        return stored_status
+    if any(_variant_is_available(item) for item in variants):
+        return "available"
+    return "out_of_stock"
+
+
 def _normalize_int_list(raw: Any) -> list[int]:
     if not isinstance(raw, list):
         return []
@@ -325,7 +351,8 @@ def _apply_backend_pricing_to_item(
     else:
         item["price"] = source_price
         item["currency"] = source_currency
-    item["status"] = _assert_allowed_product_status(item.get("status"))
+    normalized_status = _assert_allowed_product_status(item.get("status"))
+    item["status"] = _effective_status_from_variants(normalized_status, item.get("variants"))
     product_id = _safe_int(item.get("id"))
     starred_ids = []
     if favorite_manual_category_ids_by_product is not None and product_id is not None:
@@ -641,8 +668,6 @@ def get_catalog_products(
         )
         if source_id is not None:
             query = query.filter(ParserProduct.source_id == int(source_id))
-        if selected_status is not None:
-            query = query.filter(ParserProduct.status == selected_status)
         if normalized_search:
             pattern = f"%{normalized_search}%"
             query = query.filter(
@@ -742,6 +767,8 @@ def get_catalog_products(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
                 ) from exc
+            if selected_status is not None and str(enriched.get("status") or "").strip().lower() != selected_status:
+                continue
             accepted_items.append(_project_catalog_item(enriched))
             if len(accepted_items) >= int(limit):
                 cursor_ts, cursor_id = _cursor_parts_for_product(row)

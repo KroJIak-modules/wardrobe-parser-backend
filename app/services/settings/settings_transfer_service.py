@@ -56,6 +56,8 @@ _PRICING_EXPORT_FIELDS = [
     "customs_fixed_rub",
     "shipping_alt_threshold_eur",
     "tax_rate",
+    "designers_min_products",
+    "designers_exclude_store_vendors",
     "svc_rules",
     "insurance_rules",
     "service_fee_rules",

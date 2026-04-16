@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import unicodedata
+from urllib.parse import urlparse
 
 from fastapi import HTTPException, status
 from sqlalchemy import or_
@@ -12,8 +14,10 @@ from app.models import ParserCategory, ParserCategoryKeyword, ParserProduct, Par
 from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
+    ParserPricingSettingsRepository,
     ParserCategoryRepository,
     ParserProductRepository,
+    ParserSourceRepository,
 )
 from app.schemas.parser import (
     CategoryCreateRequest,
@@ -27,6 +31,7 @@ from app.services.catalog.category_tree_rules import (
     build_unique_slug,
     ensure_fallback,
     normalize_keyword,
+    slugify,
     validate_parent_for_create,
     validate_parent_for_update,
 )
@@ -38,6 +43,7 @@ class CategoryTreeService:
     DESIGNERS_ROOT_SLUG = "dizaynery"
     DESIGNERS_SYNC_INTERVAL_SEC = 300
     _last_designers_sync_at: datetime | None = None
+    _last_designers_min_products: int | None = None
 
     def __init__(self, db: Session):
         self.db = db
@@ -45,6 +51,8 @@ class CategoryTreeService:
         self.keyword_repo = ParserCategoryKeywordRepository(db)
         self.manual_product_repo = ParserCategoryManualProductRepository(db)
         self.product_repo = ParserProductRepository(db)
+        self.source_repo = ParserSourceRepository(db)
+        self.pricing_repo = ParserPricingSettingsRepository(db)
         self.category_index_service = CategoryIndexService(db)
 
     def _build_tree(self, categories: list[ParserCategory], designers_root: ParserCategory | None) -> list[CategoryTreeNodeResponse]:
@@ -70,17 +78,68 @@ class CategoryTreeService:
     def _normalize_name(value: str) -> str:
         return value.strip().casefold()
 
+    @staticmethod
+    def _normalize_vendor_key(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+        # First layer only: merge casing/spacing/separator variants into one logical brand key.
+        return "".join(ch for ch in normalized if ch.isalnum())
+
+    @staticmethod
+    def _pick_canonical_vendor_name(candidates: list[str]) -> str:
+        cleaned = [str(item or "").strip() for item in candidates if str(item or "").strip()]
+        if not cleaned:
+            return ""
+        # Canonical display name is the shortest original variant.
+        cleaned.sort(key=lambda item: (len(item), item.casefold()))
+        return cleaned[0]
+
     @classmethod
-    def _should_sync_designers(cls) -> bool:
+    def _should_sync_designers(cls, *, designers_min_products: int) -> bool:
         now = datetime.now(timezone.utc)
         last = cls._last_designers_sync_at
         if last is None:
             return True
+        if cls._last_designers_min_products != int(designers_min_products):
+            return True
         return (now - last).total_seconds() >= cls.DESIGNERS_SYNC_INTERVAL_SEC
 
     @classmethod
-    def _mark_designers_synced(cls) -> None:
+    def _mark_designers_synced(cls, *, designers_min_products: int) -> None:
         cls._last_designers_sync_at = datetime.now(timezone.utc)
+        cls._last_designers_min_products = int(designers_min_products)
+
+    def _get_designers_min_products(self) -> int:
+        settings_row = self.pricing_repo.get_singleton()
+        if settings_row is None:
+            return 1
+        raw_value = getattr(settings_row, "designers_min_products", 1)
+        try:
+            return max(1, int(raw_value))
+        except (TypeError, ValueError):
+            return 1
+
+    def _get_designers_exclude_store_vendors(self) -> bool:
+        settings_row = self.pricing_repo.get_singleton()
+        if settings_row is None:
+            return False
+        return bool(getattr(settings_row, "designers_exclude_store_vendors", False))
+
+    def _source_identity_keys(self, source: ParserSource) -> set[str]:
+        keys: set[str] = set()
+        normalized_name = self._normalize_vendor_key(getattr(source, "name", ""))
+        if normalized_name:
+            keys.add(normalized_name)
+        raw_url = str(getattr(source, "url", "") or "").strip()
+        if not raw_url:
+            return keys
+        parsed = urlparse(raw_url if "://" in raw_url else f"https://{raw_url}")
+        host = (parsed.hostname or "").strip().lower()
+        if host.startswith("www."):
+            host = host[4:]
+        host_key = self._normalize_vendor_key(host.replace(".", " "))
+        if host_key:
+            keys.add(host_key)
+        return keys
 
     def _find_designers_root(self, categories: list[ParserCategory]) -> ParserCategory | None:
         by_name = [
@@ -149,16 +208,46 @@ class CategoryTreeService:
         )
         return bool(deleted)
 
-    def _sync_designers_branch(self, designers_root: ParserCategory, categories: list[ParserCategory]) -> bool:
+    def _sync_designers_branch(
+        self,
+        designers_root: ParserCategory,
+        categories: list[ParserCategory],
+        *,
+        min_products: int,
+        exclude_store_vendors: bool,
+    ) -> bool:
         changed = False
         root_id = int(designers_root.id)
-        vendors = self.product_repo.list_distinct_vendors()
-        vendor_by_key: dict[str, str] = {}
-        for vendor in vendors:
-            key = vendor.casefold().strip()
+        used_slugs = {str(item.slug) for item in self.db.query(ParserCategory.slug).all() if item and item[0]}
+        vendor_rows = self.product_repo.list_distinct_vendors_with_sources(min_products=min_products)
+        source_ids = sorted({source_id for _, ids in vendor_rows for source_id in ids})
+        source_keys_by_id: dict[int, set[str]] = {}
+        for source in self.source_repo.get_active_by_ids(source_ids):
+            source_keys_by_id[int(source.id)] = self._source_identity_keys(source)
+        vendor_groups: dict[str, list[str]] = {}
+        vendor_sources: dict[str, set[int]] = {}
+        for vendor, row_source_ids in vendor_rows:
+            key = self._normalize_vendor_key(vendor)
             if not key:
                 continue
-            vendor_by_key.setdefault(key, vendor)
+            vendor_groups.setdefault(key, []).append(vendor)
+            vendor_sources.setdefault(key, set()).update(int(item) for item in row_source_ids)
+        vendor_by_key: dict[str, str] = {
+            key: self._pick_canonical_vendor_name(items)
+            for key, items in vendor_groups.items()
+        }
+        if exclude_store_vendors:
+            filtered: dict[str, str] = {}
+            for key, canonical_name in vendor_by_key.items():
+                related_sources = sorted(vendor_sources.get(key, set()))
+                if not related_sources:
+                    filtered[key] = canonical_name
+                    continue
+                # Exclude only when brand key matches identity of every related source.
+                if all(key in source_keys_by_id.get(source_id, set()) for source_id in related_sources):
+                    continue
+                filtered[key] = canonical_name
+            vendor_by_key = filtered
 
         direct_children = [item for item in categories if item.deleted_at is None and item.parent_id == root_id]
         direct_children.sort(key=lambda item: int(item.id))
@@ -166,7 +255,7 @@ class CategoryTreeService:
         # Deduplicate manual duplicates in the designers list.
         seen_child_keys: set[str] = set()
         for child in direct_children:
-            key = str(child.name or "").strip().casefold()
+            key = self._normalize_vendor_key(str(child.name or ""))
             if not key:
                 if self._soft_delete_subtree(categories, int(child.id)):
                     changed = True
@@ -184,14 +273,20 @@ class CategoryTreeService:
 
         existing_by_key: dict[str, ParserCategory] = {}
         for child in direct_children:
-            key = str(child.name or "").strip().casefold()
+            key = self._normalize_vendor_key(str(child.name or ""))
             if key:
                 existing_by_key[key] = child
 
         for key, display_name in vendor_by_key.items():
             existing = existing_by_key.get(key)
             if existing is None:
-                slug = build_unique_slug(name=display_name, category_repo=self.category_repo)
+                base_slug = slugify(display_name)
+                slug = base_slug
+                suffix = 2
+                while slug in used_slugs:
+                    slug = f"{base_slug}-{suffix}"
+                    suffix += 1
+                used_slugs.add(slug)
                 self.category_repo.create(
                     name=display_name,
                     slug=slug,
@@ -208,7 +303,7 @@ class CategoryTreeService:
 
         valid_keys = set(vendor_by_key.keys())
         for child in direct_children:
-            key = str(child.name or "").strip().casefold()
+            key = self._normalize_vendor_key(str(child.name or ""))
             if key in valid_keys:
                 continue
             if self._soft_delete_subtree(categories, int(child.id)):
@@ -223,7 +318,12 @@ class CategoryTreeService:
 
         return changed
 
-    def _prepare_categories(self, *, sync_designers: bool) -> tuple[list[ParserCategory], ParserCategory | None, set[int]]:
+    def _prepare_categories(
+        self,
+        *,
+        sync_designers: bool,
+        designers_min_products: int = 1,
+    ) -> tuple[list[ParserCategory], ParserCategory | None, set[int]]:
         changed = False
         fallback = ensure_fallback(self.category_repo)
 
@@ -255,7 +355,12 @@ class CategoryTreeService:
                 changed = True
 
         if sync_designers and designers_root is not None:
-            if self._sync_designers_branch(designers_root, categories):
+            if self._sync_designers_branch(
+                designers_root,
+                categories,
+                min_products=designers_min_products,
+                exclude_store_vendors=self._get_designers_exclude_store_vendors(),
+            ):
                 changed = True
                 categories = self.category_repo.get_all_active()
 
@@ -283,10 +388,14 @@ class CategoryTreeService:
             )
 
     def get_category_tree(self, *, include_counts: bool = True) -> list[CategoryTreeNodeResponse]:
-        sync_designers = self._should_sync_designers()
-        categories, designers_root, _ = self._prepare_categories(sync_designers=sync_designers)
+        designers_min_products = self._get_designers_min_products()
+        sync_designers = self._should_sync_designers(designers_min_products=designers_min_products)
+        categories, designers_root, _ = self._prepare_categories(
+            sync_designers=sync_designers,
+            designers_min_products=designers_min_products,
+        )
         if sync_designers:
-            self._mark_designers_synced()
+            self._mark_designers_synced(designers_min_products=designers_min_products)
         if include_counts:
             return self._build_tree_with_counts(categories, designers_root)
         return self._build_tree(categories, designers_root)

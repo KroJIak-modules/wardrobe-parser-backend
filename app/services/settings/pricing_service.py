@@ -577,6 +577,15 @@ class PricingSettingsService:
         if getattr(entity, "tax_rate", None) is None:
             entity.tax_rate = 0.06
             changed = True
+        if getattr(entity, "designers_exclude_store_vendors", None) is None:
+            entity.designers_exclude_store_vendors = False
+            changed = True
+        raw_designers_min = getattr(entity, "designers_min_products", None)
+        normalized_designers_min = int(raw_designers_min) if raw_designers_min is not None else 1
+        normalized_designers_min = max(1, normalized_designers_min)
+        if normalized_designers_min != raw_designers_min:
+            entity.designers_min_products = normalized_designers_min
+            changed = True
         normalized_insurance = cls._normalize_range_rules(
             getattr(entity, "insurance_rules", None),
             min_key="min_eur",
@@ -745,6 +754,10 @@ class PricingSettingsService:
             self._validate_svc_rules_no_overlap(patch["svc_rules"])
         if "shipping_rules" in patch:
             patch["shipping_rules"] = self._normalize_shipping_rules(patch.get("shipping_rules"))
+        if "designers_min_products" in patch:
+            patch["designers_min_products"] = max(1, int(patch.get("designers_min_products") or 1))
+        if "designers_exclude_store_vendors" in patch:
+            patch["designers_exclude_store_vendors"] = bool(patch.get("designers_exclude_store_vendors"))
         for key, value in patch.items():
             setattr(entity, key, value)
         defaults_changed = self._coerce_settings_defaults(entity)
@@ -824,6 +837,8 @@ class PricingSettingsService:
             customs_fixed_rub=float(getattr(entity, "customs_fixed_rub", 540.0)),
             shipping_alt_threshold_eur=float(getattr(entity, "shipping_alt_threshold_eur", 300.0)),
             tax_rate=float(getattr(entity, "tax_rate", 0.06)),
+            designers_min_products=max(1, int(getattr(entity, "designers_min_products", 1) or 1)),
+            designers_exclude_store_vendors=bool(getattr(entity, "designers_exclude_store_vendors", False)),
             svc_rules=normalized_svc_rules,
             insurance_rules=normalized_insurance,
             service_fee_rules=normalized_service_fee,

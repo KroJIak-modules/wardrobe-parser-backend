@@ -65,7 +65,7 @@ def slugify(value: str) -> str:
 
 def build_unique_slug(*, name: str, category_repo: ParserCategoryRepository, exclude_category_id: int | None = None) -> str:
     slug = slugify(name)
-    maybe = category_repo.get_by_slug(slug)
+    maybe = category_repo.get_by_slug_any(slug)
     if maybe and maybe.id != exclude_category_id:
         slug = f"{slug}-{int(datetime.now(timezone.utc).timestamp())}"
     return slug
