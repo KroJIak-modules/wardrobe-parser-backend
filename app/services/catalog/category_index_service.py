@@ -28,7 +28,7 @@ class CategoryIndexService:
         if self._should_rebuild_matches():
             self.rebuild_full()
             return
-        if require_counts and self._snapshot_is_empty():
+        if require_counts and (self._snapshot_is_empty() or self._should_rebuild_counts()):
             self.rebuild_counts()
 
     def rebuild_full(self) -> None:
@@ -68,11 +68,10 @@ class CategoryIndexService:
             ),
             {"product_id": int(product_id), "category_id": int(category_id)},
         )
-        self._rebuild_counts_snapshot()
         state = self.state_repo.get_or_create_singleton()
         now = datetime.now(timezone.utc)
         state.matches_built_at = now
-        state.counts_built_at = now
+        state.counts_built_at = None
         self.db.commit()
 
     def remove_manual_link(self, *, category_id: int, product_id: int) -> None:
@@ -87,11 +86,54 @@ class CategoryIndexService:
             ),
             {"product_id": int(product_id), "category_id": int(category_id)},
         )
-        self._rebuild_counts_snapshot()
         state = self.state_repo.get_or_create_singleton()
         now = datetime.now(timezone.utc)
         state.matches_built_at = now
-        state.counts_built_at = now
+        state.counts_built_at = None
+        self.db.commit()
+
+    def sync_manual_links_for_product(self, *, product_id: int) -> None:
+        pid = int(product_id)
+        self.db.execute(
+            text(
+                """
+                DELETE FROM parser_product_category_match
+                WHERE product_id = :product_id
+                  AND match_source = 'manual'
+                """
+            ),
+            {"product_id": pid},
+        )
+        self.db.execute(
+            text(
+                """
+                INSERT INTO parser_product_category_match (product_id, category_id, match_source, score, created_at, updated_at)
+                SELECT
+                    m.product_id,
+                    m.category_id,
+                    'manual',
+                    1000000,
+                    now(),
+                    now()
+                FROM parser_category_manual_product m
+                JOIN parser_product p ON p.id = m.product_id AND p.deleted_at IS NULL
+                JOIN parser_category c ON c.id = m.category_id AND c.deleted_at IS NULL
+                WHERE m.product_id = :product_id
+                ON CONFLICT (product_id, category_id, match_source)
+                DO UPDATE SET score = EXCLUDED.score, updated_at = now()
+                """
+            ),
+            {"product_id": pid},
+        )
+        state = self.state_repo.get_or_create_singleton()
+        now = datetime.now(timezone.utc)
+        state.matches_built_at = now
+        state.counts_built_at = None
+        self.db.commit()
+
+    def mark_counts_stale(self) -> None:
+        state = self.state_repo.get_or_create_singleton()
+        state.counts_built_at = None
         self.db.commit()
 
     def _snapshot_is_empty(self) -> bool:
@@ -116,13 +158,20 @@ class CategoryIndexService:
         latest_product = self.db.query(func.max(ParserProduct.updated_at)).filter(ParserProduct.deleted_at.is_(None)).scalar()
         latest_keyword = self.db.query(func.max(ParserCategoryKeyword.created_at)).scalar()
         latest_manual = self.db.query(func.max(ParserCategoryManualProduct.created_at)).scalar()
-        latest_category = self.db.query(func.max(ParserCategory.updated_at)).filter(ParserCategory.deleted_at.is_(None)).scalar()
 
-        candidates = [latest_product, latest_keyword, latest_manual, latest_category]
+        candidates = [latest_product, latest_keyword, latest_manual]
         for item in candidates:
             if item is not None and item > matches_built_at:
                 return True
         return False
+
+    def _should_rebuild_counts(self) -> bool:
+        state = self.state_repo.get_or_create_singleton()
+        if state.counts_built_at is None:
+            return True
+        counts_built_at = state.counts_built_at
+        latest_category = self.db.query(func.max(ParserCategory.updated_at)).filter(ParserCategory.deleted_at.is_(None)).scalar()
+        return bool(latest_category is not None and latest_category > counts_built_at)
 
     def _sync_manual_matches(self) -> None:
         self.db.execute(text("DELETE FROM parser_product_category_match WHERE match_source = 'manual'"))

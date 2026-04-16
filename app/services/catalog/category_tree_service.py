@@ -7,7 +7,7 @@ import unicodedata
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
 from app.models import ParserCategory, ParserCategoryKeyword, ParserProduct, ParserSource
@@ -401,7 +401,7 @@ class CategoryTreeService:
         return self._build_tree(categories, designers_root)
 
     def create_category(self, payload: CategoryCreateRequest) -> CategoryTreeNodeResponse:
-        categories, designers_root, designers_branch_ids = self._prepare_categories(sync_designers=False)
+        _, _, designers_branch_ids = self._prepare_categories(sync_designers=False)
         validate_parent_for_create(category_repo=self.category_repo, parent_id=payload.parent_id)
         if payload.parent_id is not None:
             parent = self.category_repo.get_by_id(payload.parent_id)
@@ -421,14 +421,12 @@ class CategoryTreeService:
         )
         self.category_repo.flush()
         self.db.commit()
-        self.category_index_service.rebuild_full()
-        categories = self.category_repo.get_all_active()
-        tree = self._build_tree_with_counts(categories, designers_root)
-        created_node = find_node(tree, category.id)
-        return created_node or build_single_node_response(category, self.keyword_repo)
+        self.category_index_service.mark_counts_stale()
+        self.db.refresh(category)
+        return build_single_node_response(category, self.keyword_repo)
 
     def update_category(self, category_id: int, payload: CategoryUpdateRequest) -> CategoryTreeNodeResponse:
-        categories, designers_root, designers_branch_ids = self._prepare_categories(sync_designers=False)
+        _, _, designers_branch_ids = self._prepare_categories(sync_designers=False)
         category = self.category_repo.get_by_id(category_id)
         if not category or category.deleted_at is not None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Категория не найдена")
@@ -459,6 +457,7 @@ class CategoryTreeService:
             if category.is_fallback and payload.parent_id is not None:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Системную категорию нельзя делать дочерней")
             validate_parent_for_update(category=category, parent_id=payload.parent_id, category_repo=self.category_repo)
+            category.parent_id = payload.parent_id
 
         if "is_enabled" in payload.model_fields_set and payload.is_enabled is not None:
             category.is_enabled = bool(payload.is_enabled)
@@ -469,11 +468,8 @@ class CategoryTreeService:
             category.is_favorite = bool(payload.is_favorite)
 
         self.db.commit()
-        self.category_index_service.rebuild_full()
-        categories = self.category_repo.get_all_active()
-        tree = self._build_tree_with_counts(categories, designers_root)
-        updated_node = find_node(tree, category.id)
-        return updated_node or build_single_node_response(category, self.keyword_repo)
+        self.db.refresh(category)
+        return build_single_node_response(category, self.keyword_repo)
 
     def delete_category(self, category_id: int) -> dict:
         _, _, designers_branch_ids = self._prepare_categories(sync_designers=False)
@@ -488,8 +484,35 @@ class CategoryTreeService:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Нельзя удалить категорию с дочерними категориями")
 
         category.deleted_at = datetime.now(timezone.utc)
+        self.db.execute(
+            text(
+                """
+                DELETE FROM parser_product_category_match
+                WHERE category_id = :category_id
+                """
+            ),
+            {"category_id": int(category_id)},
+        )
+        self.db.execute(
+            text(
+                """
+                DELETE FROM parser_category_manual_product
+                WHERE category_id = :category_id
+                """
+            ),
+            {"category_id": int(category_id)},
+        )
+        self.db.execute(
+            text(
+                """
+                DELETE FROM parser_category_keyword
+                WHERE category_id = :category_id
+                """
+            ),
+            {"category_id": int(category_id)},
+        )
         self.db.commit()
-        self.category_index_service.rebuild_full()
+        self.category_index_service.mark_counts_stale()
         return {"ok": True}
 
     def add_category_keyword(self, category_id: int, payload: CategoryKeywordRequest) -> dict:

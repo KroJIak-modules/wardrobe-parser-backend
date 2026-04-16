@@ -38,7 +38,7 @@ def build_tree(
             elif is_system:
                 locked_reason = "У системной категории ключевые слова недоступны."
             else:
-                locked_reason = "Ключевые слова доступны только у конечных (листовых) категорий."
+                locked_reason = "Добавление ключевых слов и товаров доступно только для конечных категорий."
         else:
             locked_reason = None
         return CategoryTreeNodeResponse(

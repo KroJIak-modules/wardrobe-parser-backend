@@ -5,12 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import HTTPException, Request, status
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.image_asset import ImageAsset
-from app.services.media.image_proxy import build_etag, cache_headers
+from app.services.media.image_cache import get_image_cache
+from app.services.media.image_proxy import build_etag, cache_headers, fetch_image_bytes
 from app.services.media.image_security import check_rate_limit, ensure_allowed_url
 
 
@@ -48,6 +49,15 @@ class ImageGatewayService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image source URL is missing")
 
         normalized_source_url = ensure_allowed_url(asset.source_url)
-        # For remote assets use redirect instead of server-side byte proxying.
-        # This avoids backend egress bottlenecks and lets CDN delivery work directly in the client.
-        return RedirectResponse(url=normalized_source_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT, headers=headers)
+        image_cache = get_image_cache()
+        cached = image_cache.get(image_id=asset.id, etag=etag)
+        if cached is not None:
+            return Response(content=cached.body, media_type=cached.content_type, headers=headers)
+
+        content, media_type = fetch_image_bytes(
+            source_url=normalized_source_url,
+            timeout_sec=settings.image_proxy_timeout_sec,
+            max_bytes=settings.image_proxy_max_bytes,
+        )
+        image_cache.set(image_id=asset.id, etag=etag, body=content, content_type=media_type)
+        return Response(content=content, media_type=media_type, headers=headers)

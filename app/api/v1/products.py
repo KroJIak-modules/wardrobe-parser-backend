@@ -6,6 +6,7 @@ import base64
 import binascii
 import json
 import logging
+import unicodedata
 from datetime import datetime
 from typing import Any
 
@@ -39,6 +40,7 @@ _ALLOWED_PRODUCT_STATUSES = {"available", "out_of_stock", "hidden"}
 _CATALOG_MAX_LIMIT = 120
 _CATALOG_SCAN_BATCH = 240
 _CATALOG_MAX_SCAN_PAGES = 8
+_NO_BRAND_FILTER_TOKEN = "__NO_BRAND__"
 
 
 class InvalidProductStatusError(ValueError):
@@ -476,12 +478,32 @@ def _apply_admin_product_filters(
     product_type: str | None,
     status_filter: str | None,
 ):
+    normalized_vendor_expr = func.regexp_replace(
+        func.lower(func.trim(func.coalesce(ParserProduct.vendor, ""))),
+        "[^[:alnum:]]+",
+        "",
+        "g",
+    )
+    normalized_type_expr = func.lower(func.trim(func.coalesce(ParserProduct.product_type, "")))
     if source_id is not None:
         query = query.filter(ParserProduct.source_id == int(source_id))
     if vendor:
-        query = query.filter(ParserProduct.vendor == vendor)
+        if vendor == _NO_BRAND_FILTER_TOKEN:
+            query = query.filter(
+                or_(
+                    ParserProduct.vendor.is_(None),
+                    func.length(func.trim(ParserProduct.vendor)) == 0,
+                )
+            )
+        else:
+            normalized_vendor_key = "".join(
+                ch
+                for ch in unicodedata.normalize("NFKC", str(vendor or "")).casefold().strip()
+                if ch.isalnum()
+            )
+            query = query.filter(normalized_vendor_expr == normalized_vendor_key)
     if product_type:
-        query = query.filter(ParserProduct.product_type == product_type)
+        query = query.filter(normalized_type_expr == str(product_type).strip().lower())
     if status_filter:
         query = query.filter(ParserProduct.status == status_filter)
     if search:
@@ -496,6 +518,316 @@ def _apply_admin_product_filters(
             )
         )
     return query
+
+
+def _project_admin_table_item(item: dict[str, Any]) -> dict[str, Any]:
+    names = [str(value).strip() for value in list(item.get("internal_category_names") or []) if str(value or "").strip()]
+    if names:
+        internal_category_label = ", ".join(names)
+    else:
+        single_name = str(item.get("internal_category_name") or "").strip()
+        internal_category_label = single_name or "Прочее"
+
+    return {
+        "id": int(item.get("id") or 0),
+        "source_id": int(item.get("source_id") or 0),
+        "title": str(item.get("title") or ""),
+        "url": str(item.get("url") or ""),
+        "product_type": item.get("product_type"),
+        "status": str(item.get("status") or "hidden"),
+        "image_count": int(item.get("image_count") or 0),
+        "image_urls": list(item.get("image_urls") or []),
+        "image_ids": _normalize_int_list(item.get("image_ids")),
+        "source_price": _safe_float(item.get("source_price")),
+        "source_currency": item.get("source_currency"),
+        "final_price": _safe_float(item.get("final_price")),
+        "final_currency": item.get("final_currency"),
+        "internal_category_name": internal_category_label,
+    }
+
+
+@router.get("/admin/products/table")
+def get_admin_products_table(
+    db: Session = Depends(get_db),
+    search: str | None = Query(default=None),
+    source_id: int | None = Query(default=None),
+    vendor: str | None = Query(default=None),
+    product_type: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=_CATALOG_MAX_LIMIT),
+    cursor: str | None = Query(default=None),
+) -> dict[str, Any]:
+    selected_status = None
+    if status_filter:
+        selected_status = str(status_filter).strip().lower()
+        if selected_status not in _ALLOWED_PRODUCT_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Допустимые статусы: available, out_of_stock, hidden",
+            )
+
+    normalized_search = (search or "").strip()
+    normalized_vendor = (vendor or "").strip() or None
+    normalized_type = (product_type or "").strip() or None
+    decoded_cursor: tuple[datetime, int] | None = _decode_cursor(cursor) if cursor else None
+
+    base_query = (
+        db.query(ParserProduct)
+        .filter(ParserProduct.deleted_at.is_(None))
+        .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
+    )
+    base_query = _apply_admin_product_filters(
+        base_query,
+        search=normalized_search or None,
+        source_id=source_id,
+        vendor=normalized_vendor,
+        product_type=normalized_type,
+        status_filter=selected_status,
+    )
+
+    filtered_total = (
+        base_query.with_entities(func.count(ParserProduct.id))
+        .order_by(None)
+        .scalar()
+        or 0
+    )
+    overall_total = (
+        db.query(func.count(ParserProduct.id))
+        .filter(ParserProduct.deleted_at.is_(None))
+        .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
+        .scalar()
+        or 0
+    )
+
+    page_query = base_query
+    if decoded_cursor is not None:
+        page_query = page_query.filter(
+            or_(
+                ParserProduct.updated_at < decoded_cursor[0],
+                (ParserProduct.updated_at == decoded_cursor[0]) & (ParserProduct.id < decoded_cursor[1]),
+            )
+        )
+
+    rows = (
+        page_query
+        .order_by(ParserProduct.updated_at.desc(), ParserProduct.id.desc())
+        .limit(int(limit))
+        .all()
+    )
+    resolved_image_ids = _resolve_image_asset_ids_for_products(db, rows)
+
+    settings_service = PricingSettingsService(db)
+    settings = settings_service.get_settings(refresh_bybit=False)
+    try:
+        weight_rules = WeightRuleService(db).get_matching_rules()
+    except Exception:
+        LOGGER.exception("Failed to load weight rules for /admin/products/table; fallback to empty rules")
+        weight_rules = []
+
+    category_repo = ParserCategoryRepository(db)
+    keyword_repo = ParserCategoryKeywordRepository(db)
+    category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
+    category_index_service = CategoryIndexService(db)
+    category_index_service.ensure_fresh(require_counts=False)
+    flat_tree = _flatten_tree(category_tree)
+    category_node_by_id = {int(node.id): node for node in flat_tree if bool(getattr(node, "is_enabled", True))}
+    fallback_node = next((node for node in flat_tree if bool(getattr(node, "is_fallback", False))), None)
+    manual_repo = ParserCategoryManualProductRepository(db)
+    product_ids = {int(item.id) for item in rows}
+    manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
+    indexed_category_ids = category_index_service.get_grouped_category_ids(product_ids)
+    favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
+    favorite_manual_map = {
+        int(product_id): [int(category_id) for category_id in category_ids if int(category_id) in favorite_category_ids]
+        for product_id, category_ids in manual_map.items()
+    }
+
+    source_repo = ParserSourceRepository(db)
+    source_profile_map = {
+        int(source.id): source
+        for source in source_repo.get_active_by_ids({int(item.source_id) for item in rows})
+    }
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        raw_item = _product_row_to_item(row)
+        if int(row.id) in resolved_image_ids:
+            raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
+        _apply_internal_categories_from_ids(
+            raw_item,
+            product_id=int(row.id),
+            category_ids_by_product=indexed_category_ids,
+            category_node_by_id=category_node_by_id,
+            fallback_node=fallback_node,
+        )
+        try:
+            enriched = _safe_apply_backend_pricing_to_item(
+                item=raw_item,
+                settings_service=settings_service,
+                settings=settings,
+                source_profile_map=source_profile_map,
+                weight_rules=weight_rules,
+                favorite_manual_category_ids_by_product=favorite_manual_map,
+            )
+        except InvalidProductStatusError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
+            ) from exc
+        items.append(_project_admin_table_item(enriched))
+
+    next_cursor = None
+    has_more = False
+    if len(rows) == int(limit):
+        last_ts, last_id = _cursor_parts_for_product(rows[-1])
+        next_cursor = _encode_cursor(last_ts, last_id)
+        has_more = True
+
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "limit": int(limit),
+        "total": int(filtered_total),
+        "overall_total": int(overall_total),
+    }
+
+
+@router.get("/admin/products/table/facets")
+def get_admin_products_table_facets(
+    db: Session = Depends(get_db),
+    search: str | None = Query(default=None),
+    source_id: int | None = Query(default=None),
+    vendor: str | None = Query(default=None),
+    product_type: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+) -> dict[str, Any]:
+    selected_status = None
+    if status_filter:
+        selected_status = str(status_filter).strip().lower()
+        if selected_status not in _ALLOWED_PRODUCT_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Допустимые статусы: available, out_of_stock, hidden",
+            )
+
+    normalized_search = (search or "").strip() or None
+    normalized_vendor = (vendor or "").strip() or None
+    normalized_type = (product_type or "").strip() or None
+
+    base_all = (
+        db.query(ParserProduct)
+        .filter(ParserProduct.deleted_at.is_(None))
+        .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
+    )
+    filtered_query = _apply_admin_product_filters(
+        base_all,
+        search=normalized_search,
+        source_id=source_id,
+        vendor=normalized_vendor,
+        product_type=normalized_type,
+        status_filter=selected_status,
+    )
+    filtered_total = (
+        filtered_query.with_entities(func.count(ParserProduct.id))
+        .order_by(None)
+        .scalar()
+        or 0
+    )
+    overall_total = (
+        db.query(func.count(ParserProduct.id))
+        .filter(ParserProduct.deleted_at.is_(None))
+        .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
+        .scalar()
+        or 0
+    )
+
+    vendor_query = _apply_admin_product_filters(
+        base_all,
+        search=normalized_search,
+        source_id=source_id,
+        vendor=None,
+        product_type=normalized_type,
+        status_filter=selected_status,
+    )
+    normalized_vendor_expr = func.regexp_replace(
+        func.lower(func.trim(func.coalesce(ParserProduct.vendor, ""))),
+        "[^[:alnum:]]+",
+        "",
+        "g",
+    )
+    vendor_rows = (
+        vendor_query
+        .with_entities(
+            normalized_vendor_expr.label("vendor_key"),
+            func.min(func.trim(ParserProduct.vendor)).label("vendor_label"),
+            func.count(ParserProduct.id).label("vendor_count"),
+        )
+        .group_by(normalized_vendor_expr)
+        .order_by(normalized_vendor_expr.asc())
+        .all()
+    )
+
+    vendors: list[dict[str, Any]] = []
+    no_brand_count = 0
+    for vendor_key, vendor_label, vendor_count in vendor_rows:
+        vendor_key_normalized = str(vendor_key or "").strip()
+        count_int = int(vendor_count or 0)
+        if not vendor_key_normalized:
+            no_brand_count += count_int
+            continue
+        display_name = str(vendor_label or "").strip() or vendor_key_normalized
+        vendors.append({
+            "value": vendor_key_normalized,
+            "label": display_name,
+            "count": count_int,
+        })
+    if no_brand_count > 0:
+        vendors.insert(0, {
+            "value": _NO_BRAND_FILTER_TOKEN,
+            "label": "Без бренда",
+            "count": int(no_brand_count),
+        })
+
+    type_query = _apply_admin_product_filters(
+        base_all,
+        search=normalized_search,
+        source_id=source_id,
+        vendor=normalized_vendor,
+        product_type=None,
+        status_filter=selected_status,
+    )
+    normalized_type_expr = func.lower(func.trim(func.coalesce(ParserProduct.product_type, "")))
+    type_rows = (
+        type_query
+        .with_entities(
+            normalized_type_expr.label("type_key"),
+            func.min(func.trim(ParserProduct.product_type)).label("type_label"),
+            func.count(ParserProduct.id).label("type_count"),
+        )
+        .filter(func.length(normalized_type_expr) > 0)
+        .group_by(normalized_type_expr)
+        .order_by(normalized_type_expr.asc())
+        .all()
+    )
+    local_categories: list[dict[str, Any]] = []
+    for raw_type_key, raw_type_label, raw_type_count in type_rows:
+        type_key = str(raw_type_key or "").strip()
+        if not type_key:
+            continue
+        type_label = str(raw_type_label or "").strip() or type_key
+        local_categories.append({
+            "value": type_key,
+            "label": type_label,
+            "count": int(raw_type_count or 0),
+        })
+
+    return {
+        "vendors": vendors,
+        "local_categories": local_categories,
+        "total": int(filtered_total),
+        "overall_total": int(overall_total),
+    }
 
 
 @router.get("/products")
@@ -1149,7 +1481,7 @@ async def set_product_starred_categories(product_id: int, request: Request, db: 
             manual_repo.create(category_id=category_id, product_id=product_id)
 
     db.commit()
-    CategoryIndexService(db).rebuild_full()
+    CategoryIndexService(db).sync_manual_links_for_product(product_id=product_id)
 
     return {
         "ok": True,

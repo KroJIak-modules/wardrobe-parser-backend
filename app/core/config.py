@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     image_proxy_timeout_sec: float = Field(default=10.0, env="IMAGE_PROXY_TIMEOUT_SEC")
     image_proxy_max_bytes: int = Field(default=8_000_000, env="IMAGE_PROXY_MAX_BYTES")
     image_cache_max_age_sec: int = Field(default=86_400, env="IMAGE_CACHE_MAX_AGE_SEC")
+    redis_url: str = Field(default="redis://redis:6379/0", env="REDIS_URL")
+    image_cache_redis_ttl_sec: int = Field(default=259_200, ge=60, le=2_592_000, env="IMAGE_CACHE_REDIS_TTL_SEC")
     image_rate_limit_per_minute: int = Field(default=120, env="IMAGE_RATE_LIMIT_PER_MINUTE")
     weight_default_fallback_grams: int = Field(default=1000, env="DEFAULT_FALLBACK_WEIGHT_GRAMS")
     dedup_scan_limit: int = Field(default=2000, ge=10, le=100000, env="DEDUP_SCAN_LIMIT")
