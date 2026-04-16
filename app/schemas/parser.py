@@ -70,6 +70,8 @@ class CatalogCategoryNodeResponse(BaseModel):
     parent_id: int | None = None
     count: int = 0
     is_enabled: bool = True
+    is_designers_root: bool = False
+    is_in_designers_branch: bool = False
     children: list["CatalogCategoryNodeResponse"] = Field(default_factory=list)
 
 

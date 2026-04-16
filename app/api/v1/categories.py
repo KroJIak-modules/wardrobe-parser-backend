@@ -26,6 +26,8 @@ def _to_catalog_node(node: CategoryTreeNodeResponse) -> CatalogCategoryNodeRespo
         parent_id=node.parent_id,
         count=int(node.product_count or 0),
         is_enabled=bool(node.is_enabled),
+        is_designers_root=bool(node.is_designers_root),
+        is_in_designers_branch=bool(node.is_in_designers_branch),
         children=[_to_catalog_node(child) for child in (node.children or []) if child.is_enabled],
     )
 
@@ -55,6 +57,8 @@ def get_catalog_roots(
                 parent_id=node.parent_id,
                 count=int(node.product_count or 0),
                 is_enabled=bool(node.is_enabled),
+                is_designers_root=bool(node.is_designers_root),
+                is_in_designers_branch=bool(node.is_in_designers_branch),
                 children=[],
             )
         )
