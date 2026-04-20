@@ -74,7 +74,9 @@ class Settings(BaseSettings):
             )
             object.__setattr__(self, "database_url", url)
         if not self.admin_superuser_password:
-            raise ValueError("ADMIN_SUPERUSER_PASSWORD must be set")
+            # Allow utility workers to run without admin credentials.
+            # API container still gets explicit ADMIN_* values from docker-compose.
+            object.__setattr__(self, "admin_superuser_password", secrets.token_urlsafe(24))
         if not self.admin_token_secret:
             object.__setattr__(self, "admin_token_secret", secrets.token_urlsafe(48))
         return self
