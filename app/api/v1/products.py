@@ -97,9 +97,19 @@ def _variant_is_available(variant: Any) -> bool:
     return False
 
 
-def _effective_status_from_variants(stored_status: str, variants: Any) -> str:
+def _effective_status_from_variants(
+    stored_status: str,
+    variants: Any,
+    *,
+    source_profile: Any | None = None,
+    is_auto_added: bool = True,
+    auto_hide_force_visible: bool = False,
+) -> str:
     if stored_status in {"hidden", "unavailable"}:
         return stored_status
+    source_auto_hide = bool(getattr(source_profile, "hide_auto_added_products", False))
+    if source_auto_hide and bool(is_auto_added) and not bool(auto_hide_force_visible):
+        return "hidden"
     if not isinstance(variants, list) or len(variants) == 0:
         return stored_status
     if any(_variant_is_available(item) for item in variants):
@@ -401,7 +411,13 @@ def _apply_backend_pricing_to_item(
         item["price"] = source_price
         item["currency"] = source_currency
     normalized_status = _assert_allowed_product_status(item.get("status"))
-    item["status"] = _effective_status_from_variants(normalized_status, item.get("variants"))
+    item["status"] = _effective_status_from_variants(
+        normalized_status,
+        item.get("variants"),
+        source_profile=source_profile,
+        is_auto_added=bool(item.get("is_auto_added", True)),
+        auto_hide_force_visible=bool(item.get("auto_hide_force_visible", False)),
+    )
     product_id = _safe_int(item.get("id"))
     starred_ids = []
     if favorite_manual_category_ids_by_product is not None and product_id is not None:
@@ -502,6 +518,8 @@ def _product_row_to_item(product: ParserProduct) -> dict[str, Any]:
         "price": product.price,
         "currency": str(product.currency),
         "status": str(product.status),
+        "is_auto_added": bool(getattr(product, "is_auto_added", True)),
+        "auto_hide_force_visible": bool(getattr(product, "auto_hide_force_visible", False)),
         "image_count": int(product.image_count or 0),
         "image_urls": list(product.image_urls or []),
         "image_ids": list(product.image_asset_ids or []),
@@ -1570,13 +1588,39 @@ async def update_product(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет поддерживаемых полей для обновления")
 
     product_repo = ParserProductRepository(db)
+    source_repo = ParserSourceRepository(db)
     product = product_repo.get_active_by_id(product_id)
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
+    source_profile = source_repo.get_active_by_id(int(product.source_id))
+    source_auto_hide = bool(getattr(source_profile, "hide_auto_added_products", False))
+    is_auto_added = bool(getattr(product, "is_auto_added", True))
+    is_force_visible = bool(getattr(product, "auto_hide_force_visible", False))
+    current_stored_status = str(product.status or "").strip().lower()
 
-    product.status = next_status
+    if next_status == "hidden":
+        if source_auto_hide and is_auto_added and is_force_visible and current_stored_status != "hidden":
+            # Return to source-level auto-hidden state (global rule), not a manual hidden lock.
+            product.auto_hide_force_visible = False
+        else:
+            product.status = "hidden"
+            product.auto_hide_force_visible = False
+    else:
+        product.status = next_status
+        if source_auto_hide and is_auto_added:
+            # User explicitly unhid auto-hidden product: keep visible until user hides it back.
+            product.auto_hide_force_visible = True
+        else:
+            product.auto_hide_force_visible = False
+
     db.commit()
-    effective_status = _effective_status_from_variants(str(product.status), list(product.variants or []))
+    effective_status = _effective_status_from_variants(
+        str(product.status),
+        list(product.variants or []),
+        source_profile=source_profile,
+        is_auto_added=bool(getattr(product, "is_auto_added", True)),
+        auto_hide_force_visible=bool(getattr(product, "auto_hide_force_visible", False)),
+    )
 
     patched_payload = {
         "id": int(product.id),
