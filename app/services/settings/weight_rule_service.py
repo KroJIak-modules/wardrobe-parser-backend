@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import re
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings as app_settings
@@ -53,6 +54,14 @@ def _unique_normalized_keywords(keywords: list[str]) -> list[str]:
         seen.add(normalized)
         unique.append(normalized)
     return unique
+
+
+def _default_rules_unique() -> list[tuple[int, list[str]]]:
+    by_weight: dict[int, list[str]] = {}
+    for weight_grams, keywords in DEFAULT_WEIGHT_RULES:
+        bucket = by_weight.setdefault(weight_grams, [])
+        bucket.extend(keywords)
+    return [(weight_grams, _unique_normalized_keywords(keywords)) for weight_grams, keywords in sorted(by_weight.items(), key=lambda row: row[0])]
 
 
 DEFAULT_WEIGHT_RULES: list[tuple[int, list[str]]] = [
@@ -475,13 +484,17 @@ class WeightRuleService:
         active = self.rule_repo.get_all_active()
         changed = False
         if not active:
-            for index, (weight_grams, keywords) in enumerate(DEFAULT_WEIGHT_RULES, start=1):
+            for index, (weight_grams, keywords) in enumerate(_default_rules_unique(), start=1):
                 created = self.rule_repo.create(weight_grams=weight_grams, sort_order=index)
                 self.rule_repo.flush()
-                for normalized in _unique_normalized_keywords(keywords):
+                for normalized in keywords:
                     self.keyword_repo.create(rule_id=created.id, keyword=normalized)
-            changed = True
-            active = self.rule_repo.get_all_active()
+            try:
+                self.db.commit()
+            except IntegrityError:
+                # Another transaction could seed defaults in parallel.
+                self.db.rollback()
+            return self.rule_repo.get_all_active()
 
         for rule in active:
             changed = self._normalize_rule_keywords(rule.id) or changed
@@ -489,7 +502,7 @@ class WeightRuleService:
         active = self.rule_repo.get_all_active()
         by_weight = {rule.weight_grams: rule for rule in active}
         next_sort_order = max((rule.sort_order for rule in active), default=0)
-        for weight_grams, keywords in DEFAULT_WEIGHT_RULES:
+        for weight_grams, keywords in _default_rules_unique():
             rule = by_weight.get(weight_grams)
             if rule is None:
                 next_sort_order += 1
@@ -499,14 +512,17 @@ class WeightRuleService:
                 changed = True
 
             existing = {item.keyword for item in self.keyword_repo.get_by_rule(rule.id)}
-            for normalized in _unique_normalized_keywords(keywords):
+            for normalized in keywords:
                 if normalized not in existing:
                     self.keyword_repo.create(rule_id=rule.id, keyword=normalized)
                     existing.add(normalized)
                     changed = True
 
         if changed:
-            self.db.commit()
+            try:
+                self.db.commit()
+            except IntegrityError:
+                self.db.rollback()
         return self.rule_repo.get_all_active()
 
     def list_rules(self) -> list[WeightRuleResponse]:
@@ -563,7 +579,11 @@ class WeightRuleService:
         return {"ok": True}
 
     def get_matching_rules(self) -> list[WeightRuleResponse]:
-        return self.list_rules()
+        try:
+            return self.list_rules()
+        except IntegrityError:
+            self.db.rollback()
+            return self.list_rules()
 
     def list_missing_weight_products(self, limit: int = 500) -> list[WeightMissingProductResponse]:
         safe_limit = max(1, min(limit, 5000))
