@@ -158,6 +158,17 @@ class PricingSettingsUpdateRequest(BaseModel):
     showcase_carousel_image_asset_ids: list[int] | None = None
 
 
+class ShowcaseMediaSettingsUpdateRequest(BaseModel):
+    showcase_hero_image_asset_id: int | None = None
+    showcase_carousel_image_asset_ids: list[int] | None = None
+
+
+class ShowcaseMediaSettingsResponse(BaseModel):
+    showcase_hero_image_asset_id: int | None = None
+    showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
+    carousel_limit: int = 20
+
+
 class PricingSupplierRateResponse(BaseModel):
     min_kg: float
     max_kg: float | None = None

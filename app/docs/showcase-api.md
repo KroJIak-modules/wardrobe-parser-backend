@@ -79,3 +79,69 @@ curl "http://localhost:8000/api/v1/products/12345"
 ```bash
 curl "http://localhost:8000/api/v1/images/10?w=600&h=800&q=80"
 ```
+
+## Админ: медиа витрины (для frontend админки)
+
+Эти ручки используются в разделе `Настройки -> Медиа витрины`.
+
+- Требуют админ-авторизацию (`Authorization: Bearer <token>`).
+- Базовый префикс: `/api/v1/settings`.
+
+### 6) Получить текущее состояние медиа витрины
+
+`GET /api/v1/settings/showcase-media`
+
+Ответ:
+- `showcase_hero_image_asset_id` — id заставки или `null`;
+- `showcase_carousel_image_asset_ids` — массив id слайдов карусели;
+- `carousel_limit` — максимальное число слайдов (сейчас `20`).
+
+Пример:
+```bash
+curl -H "Authorization: Bearer <token>" \
+  "http://localhost:8000/api/v1/settings/showcase-media"
+```
+
+### 7) Обновить медиа витрины
+
+`PATCH /api/v1/settings/showcase-media`
+
+Тело запроса:
+- `showcase_hero_image_asset_id` — `number | null`;
+- `showcase_carousel_image_asset_ids` — `number[]`.
+
+Поведение:
+- карусель сохраняется в том же порядке, в котором передан массив;
+- id автоматически нормализуются (дубликаты/невалидные значения удаляются);
+- карусель обрезается до `carousel_limit`.
+
+Пример: установить заставку и карусель
+```bash
+curl -X PATCH "http://localhost:8000/api/v1/settings/showcase-media" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "showcase_hero_image_asset_id": 12345,
+    "showcase_carousel_image_asset_ids": [20001, 20002, 20003]
+  }'
+```
+
+Пример: очистить заставку
+```bash
+curl -X PATCH "http://localhost:8000/api/v1/settings/showcase-media" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "showcase_hero_image_asset_id": null
+  }'
+```
+
+Пример: изменить только порядок карусели
+```bash
+curl -X PATCH "http://localhost:8000/api/v1/settings/showcase-media" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "showcase_carousel_image_asset_ids": [20003, 20001, 20002]
+  }'
+```
