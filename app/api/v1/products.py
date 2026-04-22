@@ -133,6 +133,98 @@ def _normalize_int_list(raw: Any) -> list[int]:
     return values
 
 
+def _normalize_image_order_tokens(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        token = str(item or "").strip()
+        if not token:
+            continue
+        if not (token.startswith("s:") or token.startswith("m:")):
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        result.append(token)
+    return result
+
+
+def _compose_effective_image_ids(
+    *,
+    source_image_ids: list[int],
+    images_sync_locked: bool,
+    hidden_source_image_ids: list[int],
+    manual_image_ids: list[int],
+    manual_image_order: list[str],
+) -> list[int]:
+    if not images_sync_locked:
+        return list(source_image_ids)
+
+    hidden_set = set(hidden_source_image_ids)
+    visible_source = [image_id for image_id in source_image_ids if image_id not in hidden_set]
+    source_map = {f"s:{image_id}": image_id for image_id in visible_source}
+    manual_map = {f"m:{image_id}": image_id for image_id in manual_image_ids}
+    merged_map: dict[str, int] = {}
+    merged_map.update(source_map)
+    merged_map.update(manual_map)
+    ordered: list[int] = []
+    used: set[int] = set()
+    for token in manual_image_order:
+        image_id = merged_map.get(token)
+        if image_id is None or image_id in used:
+            continue
+        used.add(image_id)
+        ordered.append(image_id)
+    for image_id in [*visible_source, *manual_image_ids]:
+        if image_id in used:
+            continue
+        used.add(image_id)
+        ordered.append(image_id)
+    return ordered
+
+
+def _apply_product_overrides_to_item(item: dict[str, Any], product: ParserProduct | None) -> None:
+    if product is None:
+        return
+    title_sync_locked = bool(getattr(product, "title_sync_locked", False))
+    description_sync_locked = bool(getattr(product, "description_sync_locked", False))
+    images_sync_locked = bool(getattr(product, "images_sync_locked", False))
+    title_override = getattr(product, "title_override", None)
+    description_override = getattr(product, "description_override", None)
+    hidden_source_image_ids = _normalize_int_list(getattr(product, "hidden_source_image_asset_ids", None))
+    manual_image_ids = _normalize_int_list(getattr(product, "manual_image_asset_ids", None))
+    manual_image_order = _normalize_image_order_tokens(getattr(product, "manual_image_order", None))
+
+    source_image_ids = _normalize_int_list(item.get("image_ids"))
+    effective_image_ids = _compose_effective_image_ids(
+        source_image_ids=source_image_ids,
+        images_sync_locked=images_sync_locked,
+        hidden_source_image_ids=hidden_source_image_ids,
+        manual_image_ids=manual_image_ids,
+        manual_image_order=manual_image_order,
+    )
+
+    if title_sync_locked and title_override is not None:
+        item["title"] = str(title_override)
+    if description_sync_locked and description_override is not None:
+        item["description"] = str(description_override)
+    item["image_ids"] = effective_image_ids
+    item["image_count"] = len(effective_image_ids)
+    item["product_edit"] = {
+        "title_sync_locked": title_sync_locked,
+        "description_sync_locked": description_sync_locked,
+        "images_sync_locked": images_sync_locked,
+        "title_override": title_override,
+        "description_override": description_override,
+        "hidden_source_image_ids": hidden_source_image_ids,
+        "manual_image_ids": manual_image_ids,
+        "manual_image_order": manual_image_order,
+        "source_image_ids": source_image_ids,
+    }
+
+
 def _normalize_image_urls(raw: Any) -> list[str]:
     if not isinstance(raw, list):
         return []
@@ -246,6 +338,9 @@ def _project_catalog_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _project_showcase_product_detail(item: dict[str, Any]) -> dict[str, Any]:
+    components = item.get("pricing_components")
+    if not isinstance(components, dict):
+        components = {}
     return {
         "id": int(item.get("id") or 0),
         "source_id": int(item.get("source_id") or 0),
@@ -265,6 +360,7 @@ def _project_showcase_product_detail(item: dict[str, Any]) -> dict[str, Any]:
         "internal_category_name": item.get("internal_category_name"),
         "internal_category_names": list(item.get("internal_category_names") or []),
         "description": item.get("description"),
+        "pricing_components": components,
     }
 
 

@@ -380,6 +380,7 @@ class ShowcaseProductResponse(BaseModel):
     internal_category_name: str | None = None
     internal_category_names: list[str] = Field(default_factory=list)
     description: str | None = None
+    pricing_components: dict[str, object] = Field(default_factory=dict)
 
 
 class PricingExampleProductResponse(BaseModel):

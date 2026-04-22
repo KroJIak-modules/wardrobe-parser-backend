@@ -1,6 +1,6 @@
 """Core parser entities mirrored in backend for native business endpoints."""
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, JSON, String
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -48,6 +48,14 @@ class ParserProduct(Base):
     image_count = Column(Integer, nullable=False, default=0)
     image_urls = Column(JSON, nullable=False, default=list)
     image_asset_ids = Column(JSON, nullable=False, default=list)
+    title_override = Column(Text, nullable=True)
+    description_override = Column(Text, nullable=True)
+    title_sync_locked = Column(Boolean, nullable=False, default=False)
+    description_sync_locked = Column(Boolean, nullable=False, default=False)
+    images_sync_locked = Column(Boolean, nullable=False, default=False)
+    hidden_source_image_asset_ids = Column(JSON, nullable=False, default=list)
+    manual_image_asset_ids = Column(JSON, nullable=False, default=list)
+    manual_image_order = Column(JSON, nullable=False, default=list)
     variants = Column(JSON, nullable=False, default=list)
     is_auto_added = Column(Boolean, nullable=False, default=True)
     auto_hide_force_visible = Column(Boolean, nullable=False, default=False)
