@@ -53,6 +53,7 @@ class ParserProduct(Base):
     description_override = Column(Text, nullable=True)
     title_sync_locked = Column(Boolean, nullable=False, default=False)
     description_sync_locked = Column(Boolean, nullable=False, default=False)
+    description_visible_override = Column(Boolean, nullable=True)
     images_sync_locked = Column(Boolean, nullable=False, default=False)
     hidden_source_image_asset_ids = Column(JSON, nullable=False, default=list)
     manual_image_asset_ids = Column(JSON, nullable=False, default=list)

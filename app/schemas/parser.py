@@ -150,6 +150,7 @@ class PricingSettingsUpdateRequest(BaseModel):
     designers_min_products: int | None = Field(default=None, ge=1, le=1_000_000)
     designers_exclude_store_vendors: bool | None = None
     dedup_only_available_products: bool | None = None
+    show_product_description: bool | None = None
     svc_rules: list[dict] | None = None
     insurance_rules: list[dict] | None = None
     service_fee_rules: list[dict] | None = None
@@ -224,6 +225,7 @@ class PricingSettingsResponse(BaseModel):
     designers_min_products: int
     designers_exclude_store_vendors: bool
     dedup_only_available_products: bool
+    show_product_description: bool
     svc_rules: list[dict] = Field(default_factory=list)
     insurance_rules: list[dict] = Field(default_factory=list)
     service_fee_rules: list[dict] = Field(default_factory=list)
@@ -264,6 +266,7 @@ class SettingsTransferPricingSettings(BaseModel):
     designers_min_products: int = Field(ge=1, le=1_000_000)
     designers_exclude_store_vendors: bool = False
     dedup_only_available_products: bool = False
+    show_product_description: bool = True
     svc_rules: list[dict] = Field(default_factory=list)
     insurance_rules: list[dict] = Field(default_factory=list)
     service_fee_rules: list[dict] = Field(default_factory=list)

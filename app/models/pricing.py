@@ -161,6 +161,7 @@ class ParserPricingSettings(Base):
     designers_min_products = Column(Integer, nullable=False, default=1)
     designers_exclude_store_vendors = Column(Boolean, nullable=False, default=False)
     dedup_only_available_products = Column(Boolean, nullable=False, default=False)
+    show_product_description = Column(Boolean, nullable=False, default=True)
     svc_rules = Column(JSON, nullable=False, default=list)
     insurance_rules = Column(JSON, nullable=False, default=_default_insurance_rules)
     service_fee_rules = Column(JSON, nullable=False, default=_default_service_fee_rules)

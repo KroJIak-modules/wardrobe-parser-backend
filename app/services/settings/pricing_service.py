@@ -615,6 +615,9 @@ class PricingSettingsService:
         if getattr(entity, "dedup_only_available_products", None) is None:
             entity.dedup_only_available_products = False
             changed = True
+        if getattr(entity, "show_product_description", None) is None:
+            entity.show_product_description = True
+            changed = True
         raw_designers_min = getattr(entity, "designers_min_products", None)
         normalized_designers_min = int(raw_designers_min) if raw_designers_min is not None else 1
         normalized_designers_min = max(1, normalized_designers_min)
@@ -807,6 +810,8 @@ class PricingSettingsService:
             patch["designers_exclude_store_vendors"] = bool(patch.get("designers_exclude_store_vendors"))
         if "dedup_only_available_products" in patch:
             patch["dedup_only_available_products"] = bool(patch.get("dedup_only_available_products"))
+        if "show_product_description" in patch:
+            patch["show_product_description"] = bool(patch.get("show_product_description"))
         if "showcase_hero_image_asset_id" in patch:
             raw_hero = patch.get("showcase_hero_image_asset_id")
             patch["showcase_hero_image_asset_id"] = int(raw_hero) if isinstance(raw_hero, int) and raw_hero > 0 else None
@@ -897,6 +902,7 @@ class PricingSettingsService:
             designers_min_products=max(1, int(getattr(entity, "designers_min_products", 1) or 1)),
             designers_exclude_store_vendors=bool(getattr(entity, "designers_exclude_store_vendors", False)),
             dedup_only_available_products=bool(getattr(entity, "dedup_only_available_products", False)),
+            show_product_description=bool(getattr(entity, "show_product_description", True)),
             svc_rules=normalized_svc_rules,
             insurance_rules=normalized_insurance,
             service_fee_rules=normalized_service_fee,

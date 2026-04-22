@@ -229,11 +229,17 @@ def _compose_effective_image_ids(
     return ordered
 
 
-def _apply_product_overrides_to_item(item: dict[str, Any], product: ParserProduct | None) -> None:
+def _apply_product_overrides_to_item(
+    item: dict[str, Any],
+    product: ParserProduct | None,
+    *,
+    default_show_description: bool = True,
+) -> None:
     if product is None:
         return
     title_sync_locked = bool(getattr(product, "title_sync_locked", False))
     description_sync_locked = bool(getattr(product, "description_sync_locked", False))
+    description_visible_override = getattr(product, "description_visible_override", None)
     images_sync_locked = bool(getattr(product, "images_sync_locked", False))
     title_override = getattr(product, "title_override", None)
     description_override = getattr(product, "description_override", None)
@@ -254,11 +260,20 @@ def _apply_product_overrides_to_item(item: dict[str, Any], product: ParserProduc
         item["title"] = str(title_override)
     if description_sync_locked and description_override is not None:
         item["description"] = str(description_override)
+    effective_show_description = (
+        bool(description_visible_override)
+        if description_visible_override is not None
+        else bool(default_show_description)
+    )
+    if not effective_show_description:
+        item["description"] = None
     item["image_ids"] = effective_image_ids
     item["image_count"] = len(effective_image_ids)
     item["product_edit"] = {
         "title_sync_locked": title_sync_locked,
         "description_sync_locked": description_sync_locked,
+        "description_visible_override": description_visible_override,
+        "description_visible_effective": effective_show_description,
         "images_sync_locked": images_sync_locked,
         "title_override": title_override,
         "description_override": description_override,
@@ -750,7 +765,7 @@ def _apply_internal_categories_from_ids(
         item["internal_category_slug"] = None
 
 
-def _product_row_to_item(product: ParserProduct) -> dict[str, Any]:
+def _product_row_to_item(product: ParserProduct, *, default_show_description: bool = True) -> dict[str, Any]:
     item: dict[str, Any] = {
         "id": int(product.id),
         "source_id": int(product.source_id),
@@ -780,7 +795,7 @@ def _product_row_to_item(product: ParserProduct) -> dict[str, Any]:
         "created_at": product.created_at.isoformat() if product.created_at is not None else None,
         "updated_at": product.updated_at.isoformat() if product.updated_at is not None else None,
     }
-    _apply_product_overrides_to_item(item, product)
+    _apply_product_overrides_to_item(item, product, default_show_description=default_show_description)
     return item
 
 
@@ -934,6 +949,7 @@ def get_admin_products_table(
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
+    default_show_description = bool(getattr(settings, "show_product_description", True))
     try:
         weight_rules = WeightRuleService(db).get_matching_rules()
     except Exception:
@@ -968,7 +984,7 @@ def get_admin_products_table(
 
     items: list[dict[str, Any]] = []
     for row in rows:
-        raw_item = _product_row_to_item(row)
+        raw_item = _product_row_to_item(row, default_show_description=default_show_description)
         _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
         if int(row.id) in resolved_image_ids:
             raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
@@ -1183,6 +1199,7 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
+    default_show_description = bool(getattr(settings, "show_product_description", True))
     try:
         weight_rules = WeightRuleService(db).get_matching_rules()
     except Exception:
@@ -1212,6 +1229,15 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
         for product_id in (_safe_int(item.get("id")) for item in items if isinstance(item, dict))
         if product_id is not None
     }
+    local_product_map: dict[int, ParserProduct] = {}
+    if product_ids:
+        for local_product in (
+            db.query(ParserProduct)
+            .filter(ParserProduct.deleted_at.is_(None))
+            .filter(ParserProduct.id.in_(list(product_ids)))
+            .all()
+        ):
+            local_product_map[int(local_product.id)] = local_product
     manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
     indexed_category_ids = category_index_service.get_grouped_category_ids(product_ids)
     favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
@@ -1228,8 +1254,17 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
             if not isinstance(item, dict):
                 enriched_items.append(item)
                 continue
-            _apply_brand_mapping_to_item(item, brand_mapping_service, mapping_by_key)
             product_id = _safe_int(item.get("id"))
+            local_product = local_product_map.get(int(product_id)) if product_id is not None else None
+            if local_product is not None:
+                _apply_product_overrides_to_item(
+                    item,
+                    local_product,
+                    default_show_description=default_show_description,
+                )
+            elif not default_show_description:
+                item["description"] = None
+            _apply_brand_mapping_to_item(item, brand_mapping_service, mapping_by_key)
             if product_id is not None:
                 _apply_internal_categories_from_ids(
                     item,
@@ -1329,6 +1364,7 @@ def get_catalog_products(
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
+    default_show_description = bool(getattr(settings, "show_product_description", True))
     try:
         weight_rules = WeightRuleService(db).get_matching_rules()
     except Exception:
@@ -1458,7 +1494,7 @@ def get_catalog_products(
         }
 
         for row in rows:
-            raw_item = _product_row_to_item(row)
+            raw_item = _product_row_to_item(row, default_show_description=default_show_description)
             _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
             if int(row.id) in resolved_image_ids:
                 raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
@@ -1581,6 +1617,7 @@ def get_admin_products(
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
+    default_show_description = bool(getattr(settings, "show_product_description", True))
     try:
         weight_rules = WeightRuleService(db).get_matching_rules()
     except Exception:
@@ -1615,7 +1652,7 @@ def get_admin_products(
 
     items: list[dict[str, Any]] = []
     for row in rows:
-        raw_item = _product_row_to_item(row)
+        raw_item = _product_row_to_item(row, default_show_description=default_show_description)
         _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
         if int(row.id) in resolved_image_ids:
             raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
@@ -1697,12 +1734,12 @@ def get_pricing_example_product(
         )
 
     resolved_image_ids = _resolve_image_asset_ids_for_products(db, [row])
-    raw_item = _product_row_to_item(row)
-    if int(row.id) in resolved_image_ids:
-        raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
-
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
+    default_show_description = bool(getattr(settings, "show_product_description", True))
+    raw_item = _product_row_to_item(row, default_show_description=default_show_description)
+    if int(row.id) in resolved_image_ids:
+        raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
     try:
         weight_rules = WeightRuleService(db).get_matching_rules()
     except Exception:
@@ -1796,6 +1833,7 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
+    default_show_description = bool(getattr(settings, "show_product_description", True))
     try:
         weight_rules = WeightRuleService(db).get_matching_rules()
     except Exception:
@@ -1828,8 +1866,14 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
         payload["image_ids"] = list(resolved_single.get(int(local_product.id), list(local_product.image_asset_ids or [])))
         if isinstance(local_product.image_urls, list) and local_product.image_urls:
             payload["image_urls"] = list(local_product.image_urls or [])
-        _apply_product_overrides_to_item(payload, local_product)
+        _apply_product_overrides_to_item(
+            payload,
+            local_product,
+            default_show_description=default_show_description,
+        )
         _apply_brand_mapping_to_item(payload, brand_mapping_service, mapping_by_key)
+    elif not default_show_description:
+        payload["description"] = None
     _apply_internal_categories_from_ids(
         payload,
         product_id=int(product_id),
@@ -1872,7 +1916,7 @@ async def update_product(
         reset_fields = {
             str(item or "").strip().lower()
             for item in reset_fields_raw
-            if str(item or "").strip().lower() in {"title", "description", "images"}
+            if str(item or "").strip().lower() in {"title", "description", "images", "description_visibility"}
         }
 
     next_status_raw = payload.get("status")
@@ -1889,10 +1933,19 @@ async def update_product(
     has_title_override = "title" in payload
     description_override_payload = payload.get("description") if "description" in payload else None
     has_description_override = "description" in payload
+    description_visible_override_payload = payload.get("description_visible") if "description_visible" in payload else None
+    has_description_visibility_override = "description_visible" in payload
     image_patch = payload.get("images") if isinstance(payload.get("images"), dict) else None
     has_image_patch = image_patch is not None
 
-    if next_status is None and not reset_fields and not has_title_override and not has_description_override and not has_image_patch:
+    if (
+        next_status is None
+        and not reset_fields
+        and not has_title_override
+        and not has_description_override
+        and not has_description_visibility_override
+        and not has_image_patch
+    ):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет поддерживаемых полей для обновления")
 
     product_repo = ParserProductRepository(db)
@@ -1907,6 +1960,8 @@ async def update_product(
     if "description" in reset_fields:
         product.description_override = None
         product.description_sync_locked = False
+    if "description_visibility" in reset_fields:
+        product.description_visible_override = None
     if "images" in reset_fields:
         product.images_sync_locked = False
         product.hidden_source_image_asset_ids = []
@@ -1927,6 +1982,12 @@ async def update_product(
             next_description = str(description_override_payload).strip()
         product.description_override = next_description
         product.description_sync_locked = True
+
+    if has_description_visibility_override:
+        if description_visible_override_payload is None:
+            product.description_visible_override = None
+        else:
+            product.description_visible_override = bool(description_visible_override_payload)
 
     if has_image_patch:
         hidden_source_ids = _normalize_int_list(image_patch.get("hidden_source_image_ids"))
@@ -1997,7 +2058,13 @@ async def update_product(
         "created_at": product.created_at.isoformat() if product.created_at is not None else None,
         "updated_at": product.updated_at.isoformat() if product.updated_at is not None else None,
     }
-    _apply_product_overrides_to_item(patched_payload, product)
+    settings_service = PricingSettingsService(db)
+    settings = settings_service.get_settings(refresh_bybit=False)
+    _apply_product_overrides_to_item(
+        patched_payload,
+        product,
+        default_show_description=bool(getattr(settings, "show_product_description", True)),
+    )
     brand_mapping_service = BrandMappingService(db)
     _apply_brand_mapping_to_item(patched_payload, brand_mapping_service, brand_mapping_service.get_mapping_by_key())
 

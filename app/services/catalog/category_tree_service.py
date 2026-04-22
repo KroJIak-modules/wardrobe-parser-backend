@@ -67,7 +67,10 @@ class CategoryTreeService:
 
     def _build_tree_with_counts(self, categories: list[ParserCategory], designers_root: ParserCategory | None) -> list[CategoryTreeNodeResponse]:
         designers_root_id = designers_root.id if designers_root is not None else None
-        self.category_index_service.ensure_fresh(require_counts=True)
+        # Read path must stay fast: do not trigger heavy full match rebuild
+        # from a UI tree request. We use the latest consistent snapshot and
+        # only allow lightweight counts refresh when possible.
+        self.category_index_service.ensure_fresh(require_counts=True, allow_match_rebuild=False)
         aggregated_counts = self.category_index_service.get_snapshot_counts()
         return build_tree(
             categories,

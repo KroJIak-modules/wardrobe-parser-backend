@@ -59,6 +59,7 @@ _PRICING_EXPORT_FIELDS = [
     "designers_min_products",
     "designers_exclude_store_vendors",
     "dedup_only_available_products",
+    "show_product_description",
     "svc_rules",
     "insurance_rules",
     "service_fee_rules",

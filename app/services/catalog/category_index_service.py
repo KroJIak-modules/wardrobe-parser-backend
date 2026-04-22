@@ -31,7 +31,7 @@ class CategoryIndexService:
             # and serve using the last consistent snapshot.
             if allow_match_rebuild:
                 self.rebuild_full()
-            return
+                return
         if require_counts and (self._snapshot_is_empty() or self._should_rebuild_counts()):
             self.rebuild_counts()
 
