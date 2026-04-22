@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 class CategoryKeywordRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=255)
-    scope: Literal["local", "title"] = "local"
+    scope: Literal["local", "title", "status"] = "local"
 
 
 class CategoryManualProductRequest(BaseModel):
@@ -57,6 +57,7 @@ class CategoryTreeNodeResponse(BaseModel):
     product_count: int = 0
     keywords: list[str] = Field(default_factory=list)
     title_keywords: list[str] = Field(default_factory=list)
+    status_keywords: list[str] = Field(default_factory=list)
     effective_keywords: list[str] = Field(default_factory=list)
     children: list["CategoryTreeNodeResponse"] = Field(default_factory=list)
 
@@ -78,6 +79,9 @@ class CatalogProductCardResponse(BaseModel):
     source_id: int
     title: str
     vendor: str | None = None
+    vendor_original: str | None = None
+    vendor_mapped: str | None = None
+    vendor_display: str | None = None
     url: str
     price: float | None = None
     currency: str
@@ -331,6 +335,9 @@ class ProductResponse(BaseModel):
     handle: str
     title: str
     vendor: str | None = None
+    vendor_original: str | None = None
+    vendor_mapped: str | None = None
+    vendor_display: str | None = None
     product_type: str | None = None
     url: str
     price: float | None = None
@@ -366,6 +373,9 @@ class ShowcaseProductResponse(BaseModel):
     source_id: int
     title: str
     vendor: str | None = None
+    vendor_original: str | None = None
+    vendor_mapped: str | None = None
+    vendor_display: str | None = None
     url: str
     price: float | None = None
     currency: str
@@ -381,6 +391,7 @@ class ShowcaseProductResponse(BaseModel):
     internal_category_names: list[str] = Field(default_factory=list)
     description: str | None = None
     pricing_components: dict[str, object] = Field(default_factory=dict)
+    product_edit: dict[str, object] = Field(default_factory=dict)
 
 
 class PricingExampleProductResponse(BaseModel):
@@ -393,6 +404,21 @@ class PricingExampleProductResponse(BaseModel):
     source_currency: str | None = None
     final_price: float | None = None
     components: dict[str, object] = Field(default_factory=dict)
+
+
+class BrandMappingItemResponse(BaseModel):
+    source_brand: str
+    target_brand: str
+    include_in_designers: bool = True
+
+
+class BrandMappingListResponse(BaseModel):
+    items: list[BrandMappingItemResponse] = Field(default_factory=list)
+    known_targets: list[str] = Field(default_factory=list)
+
+
+class BrandMappingUpdateRequest(BaseModel):
+    items: list[BrandMappingItemResponse] = Field(default_factory=list)
 
 
 class DedupCandidateResponse(BaseModel):

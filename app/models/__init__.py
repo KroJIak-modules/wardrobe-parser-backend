@@ -7,7 +7,7 @@ from app.models.category import (
     ParserCategoryManualProduct,
     ParserProductCategoryMatch,
 )
-from app.models.parser_entities import ParserDedupDecision, ParserFavoriteProduct, ParserProduct, ParserSource
+from app.models.parser_entities import ParserBrandMapping, ParserDedupDecision, ParserFavoriteProduct, ParserProduct, ParserSource
 from app.models.pricing import ParserPricingSettings, ParserSupplier, ParserSupplierShippingRate
 from app.models.product import Product
 from app.models.product_image import ProductImage
@@ -22,6 +22,7 @@ __all__ = [
     "ParserCategoryKeyword",
     "ParserCategoryManualProduct",
     "ParserProductCategoryMatch",
+    "ParserBrandMapping",
     "ParserDedupDecision",
     "ParserFavoriteProduct",
     "ParserPricingSettings",

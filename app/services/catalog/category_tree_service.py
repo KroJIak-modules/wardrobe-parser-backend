@@ -7,10 +7,10 @@ import unicodedata
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
-from app.models import ParserCategory, ParserCategoryKeyword, ParserProduct, ParserSource
+from app.models import ParserBrandMapping, ParserCategory, ParserCategoryKeyword, ParserProduct, ParserSource
 from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
@@ -36,6 +36,7 @@ from app.services.catalog.category_tree_rules import (
     validate_parent_for_update,
 )
 from app.services.catalog.category_tree_utils import build_single_node_response, build_tree, find_node
+from app.services.brand_mapping_service import BrandMappingService
 
 
 class CategoryTreeService:
@@ -44,6 +45,7 @@ class CategoryTreeService:
     DESIGNERS_SYNC_INTERVAL_SEC = 300
     _last_designers_sync_at: datetime | None = None
     _last_designers_min_products: int | None = None
+    _last_designers_mapping_signature: str | None = None
 
     def __init__(self, db: Session):
         self.db = db
@@ -93,20 +95,28 @@ class CategoryTreeService:
         cleaned.sort(key=lambda item: (len(item), item.casefold()))
         return cleaned[0]
 
+    def _get_brand_mapping_signature(self) -> str:
+        max_updated = self.db.query(func.max(ParserBrandMapping.updated_at)).scalar()
+        total = self.db.query(func.count(ParserBrandMapping.id)).scalar() or 0
+        return f"{int(total)}|{str(max_updated or '')}"
+
     @classmethod
-    def _should_sync_designers(cls, *, designers_min_products: int) -> bool:
+    def _should_sync_designers(cls, *, designers_min_products: int, mapping_signature: str) -> bool:
         now = datetime.now(timezone.utc)
         last = cls._last_designers_sync_at
         if last is None:
             return True
         if cls._last_designers_min_products != int(designers_min_products):
             return True
+        if cls._last_designers_mapping_signature != mapping_signature:
+            return True
         return (now - last).total_seconds() >= cls.DESIGNERS_SYNC_INTERVAL_SEC
 
     @classmethod
-    def _mark_designers_synced(cls, *, designers_min_products: int) -> None:
+    def _mark_designers_synced(cls, *, designers_min_products: int, mapping_signature: str) -> None:
         cls._last_designers_sync_at = datetime.now(timezone.utc)
         cls._last_designers_min_products = int(designers_min_products)
+        cls._last_designers_mapping_signature = mapping_signature
 
     def _get_designers_min_products(self) -> int:
         settings_row = self.pricing_repo.get_singleton()
@@ -219,23 +229,39 @@ class CategoryTreeService:
         changed = False
         root_id = int(designers_root.id)
         used_slugs = {str(item.slug) for item in self.db.query(ParserCategory.slug).all() if item and item[0]}
-        vendor_rows = self.product_repo.list_distinct_vendors_with_sources(min_products=min_products)
-        source_ids = sorted({source_id for _, ids in vendor_rows for source_id in ids})
+        vendor_rows = self.product_repo.list_vendor_source_counts(min_products=1)
+        source_ids = sorted({int(source_id) for _, source_id, _ in vendor_rows})
+        brand_mapping_service = BrandMappingService(self.db)
+        mapping_by_key = brand_mapping_service.get_mapping_by_key()
+        excluded_from_designers_keys = brand_mapping_service.get_excluded_from_designers_keys()
         source_keys_by_id: dict[int, set[str]] = {}
         for source in self.source_repo.get_active_by_ids(source_ids):
             source_keys_by_id[int(source.id)] = self._source_identity_keys(source)
         vendor_groups: dict[str, list[str]] = {}
         vendor_sources: dict[str, set[int]] = {}
-        for vendor, row_source_ids in vendor_rows:
-            key = self._normalize_vendor_key(vendor)
+        vendor_totals: dict[str, int] = {}
+        for vendor, source_id, source_count in vendor_rows:
+            _, mapped_vendor, _ = brand_mapping_service.resolve_vendor(vendor, mapping_by_key)
+            key = self._normalize_vendor_key(mapped_vendor or vendor)
             if not key:
                 continue
-            vendor_groups.setdefault(key, []).append(vendor)
-            vendor_sources.setdefault(key, set()).update(int(item) for item in row_source_ids)
+            if key in excluded_from_designers_keys:
+                continue
+            vendor_groups.setdefault(key, []).append(mapped_vendor or vendor)
+            vendor_sources.setdefault(key, set()).add(int(source_id))
+            vendor_totals[key] = int(vendor_totals.get(key, 0)) + int(source_count or 0)
         vendor_by_key: dict[str, str] = {
             key: self._pick_canonical_vendor_name(items)
             for key, items in vendor_groups.items()
         }
+
+        if min_products > 1:
+            vendor_by_key = {
+                key: value
+                for key, value in vendor_by_key.items()
+                if int(vendor_totals.get(key, 0)) >= int(min_products)
+            }
+
         if exclude_store_vendors:
             filtered: dict[str, str] = {}
             for key, canonical_name in vendor_by_key.items():
@@ -389,13 +415,20 @@ class CategoryTreeService:
 
     def get_category_tree(self, *, include_counts: bool = True) -> list[CategoryTreeNodeResponse]:
         designers_min_products = self._get_designers_min_products()
-        sync_designers = self._should_sync_designers(designers_min_products=designers_min_products)
+        mapping_signature = self._get_brand_mapping_signature()
+        sync_designers = self._should_sync_designers(
+            designers_min_products=designers_min_products,
+            mapping_signature=mapping_signature,
+        )
         categories, designers_root, _ = self._prepare_categories(
             sync_designers=sync_designers,
             designers_min_products=designers_min_products,
         )
         if sync_designers:
-            self._mark_designers_synced(designers_min_products=designers_min_products)
+            self._mark_designers_synced(
+                designers_min_products=designers_min_products,
+                mapping_signature=mapping_signature,
+            )
         if include_counts:
             return self._build_tree_with_counts(categories, designers_root)
         return self._build_tree(categories, designers_root)
@@ -527,14 +560,19 @@ class CategoryTreeService:
             in_designers_branch=int(category.id) in designers_branch_ids,
         )
 
-        scope = "title" if payload.scope == "title" else "local"
+        if payload.scope == "title":
+            scope = "title"
+        elif payload.scope == "status":
+            scope = "status"
+        else:
+            scope = "local"
         keyword = normalize_keyword(payload.keyword)
         existing = self.keyword_repo.get_exact(category_id, keyword, scope=scope)
         if existing:
             return {"ok": True, "keyword": keyword, "scope": scope, "duplicated": True}
         self.keyword_repo.create(category_id=category_id, keyword=keyword, keyword_scope=scope)
         self.db.commit()
-        self.category_index_service.rebuild_full()
+        self.category_index_service.refresh_auto_matches_for_category(category_id=category_id)
         return {"ok": True, "keyword": keyword, "scope": scope}
 
     def remove_category_keyword(self, category_id: int, keyword: str, scope: str | None = None) -> dict:
@@ -550,17 +588,19 @@ class CategoryTreeService:
         )
 
         normalized = keyword.strip().lower()
-        if scope in {"local", "title"}:
+        if scope in {"local", "title", "status"}:
             entity = self.keyword_repo.get_exact(category_id, normalized, scope=scope)
         else:
             entity = self.keyword_repo.get_exact(category_id, normalized, scope="local")
             if entity is None:
                 entity = self.keyword_repo.get_exact(category_id, normalized, scope="title")
+            if entity is None:
+                entity = self.keyword_repo.get_exact(category_id, normalized, scope="status")
         if not entity:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ключевое слово не найдено")
         self.db.delete(entity)
         self.db.commit()
-        self.category_index_service.rebuild_full()
+        self.category_index_service.refresh_auto_matches_for_category(category_id=category_id)
         return {"ok": True}
 
     def _get_keyword_enabled_category(self, category_id: int) -> ParserCategory:

@@ -22,10 +22,12 @@ def build_tree(
 
     keyword_map = keyword_repo.get_grouped_keywords(scope="local")
     title_keyword_map = keyword_repo.get_grouped_keywords(scope="title")
+    status_keyword_map = keyword_repo.get_grouped_keywords(scope="status")
 
     def walk(node: ParserCategory, in_designers_branch: bool) -> CategoryTreeNodeResponse:
         own_keywords = [] if node.is_fallback else list(keyword_map.get(int(node.id), []))
         own_title_keywords = [] if node.is_fallback else list(title_keyword_map.get(int(node.id), []))
+        own_status_keywords = [] if node.is_fallback else list(status_keyword_map.get(int(node.id), []))
         raw_children = by_parent.get(node.id, [])
         next_in_designers = in_designers_branch or (designers_root_id is not None and int(node.id) == int(designers_root_id))
         children = [walk(child, next_in_designers) for child in raw_children]
@@ -58,6 +60,7 @@ def build_tree(
             product_count=(product_counts or {}).get(node.id, 0),
             keywords=own_keywords,
             title_keywords=own_title_keywords,
+            status_keywords=own_status_keywords,
             effective_keywords=own_keywords,
             children=children,
         )
@@ -100,6 +103,7 @@ def build_single_node_response(
 ) -> CategoryTreeNodeResponse:
     own_keywords = [item.keyword for item in keyword_repo.get_by_category(category.id, scope="local")]
     own_title_keywords = [item.keyword for item in keyword_repo.get_by_category(category.id, scope="title")]
+    own_status_keywords = [item.keyword for item in keyword_repo.get_by_category(category.id, scope="status")]
     return CategoryTreeNodeResponse(
         id=category.id,
         name=category.name,
@@ -117,6 +121,7 @@ def build_single_node_response(
         product_count=0,
         keywords=own_keywords,
         title_keywords=own_title_keywords,
+        status_keywords=own_status_keywords,
         effective_keywords=own_keywords,
         children=[],
     )

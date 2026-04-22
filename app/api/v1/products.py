@@ -13,11 +13,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models import ImageAsset, ParserCategory, ParserProduct, ParserProductCategoryMatch
+from app.models import ImageAsset, ParserBrandMapping, ParserCategory, ParserProduct, ParserProductCategoryMatch
 from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
@@ -25,11 +25,18 @@ from app.repositories import (
     ParserProductRepository,
     ParserSourceRepository,
 )
-from app.schemas.parser import CatalogProductsResponse, PricingExampleProductResponse, ShowcaseProductResponse
+from app.schemas.parser import (
+    BrandMappingListResponse,
+    BrandMappingUpdateRequest,
+    CatalogProductsResponse,
+    PricingExampleProductResponse,
+    ShowcaseProductResponse,
+)
 from app.services.catalog.category_index_service import CategoryIndexService
 from app.services.catalog.category_tree_utils import build_tree
 from app.services.proxy.service_api_proxy import forward_service_request
 from app.services.auth.admin_auth_service import require_admin_access
+from app.services.brand_mapping_service import BrandMappingService
 from app.services.settings.pricing_service import PricingSettingsService
 from app.services.settings.weight_rule_service import WeightRuleService
 
@@ -149,6 +156,43 @@ def _normalize_image_order_tokens(raw: Any) -> list[str]:
         seen.add(token)
         result.append(token)
     return result
+
+
+def _normalized_vendor_key_expr():
+    return func.regexp_replace(
+        func.lower(func.trim(func.coalesce(ParserProduct.vendor, ""))),
+        "[^[:alnum:]]+",
+        "",
+        "g",
+    )
+
+
+def _mapped_vendor_label_expr():
+    vendor_key_expr = _normalized_vendor_key_expr()
+    mapped_vendor_subquery = (
+        select(ParserBrandMapping.target_brand)
+        .where(ParserBrandMapping.source_brand_key == vendor_key_expr)
+        .limit(1)
+        .scalar_subquery()
+    )
+    return func.coalesce(func.trim(mapped_vendor_subquery), func.trim(ParserProduct.vendor))
+
+
+def _normalized_mapped_vendor_key_expr():
+    return func.regexp_replace(
+        func.lower(func.trim(func.coalesce(_mapped_vendor_label_expr(), ""))),
+        "[^[:alnum:]]+",
+        "",
+        "g",
+    )
+
+
+def _apply_brand_mapping_to_item(item: dict[str, Any], mapping_service: BrandMappingService, mapping_by_key: dict[str, str]) -> None:
+    vendor_original, vendor_mapped, vendor_display = mapping_service.resolve_vendor(item.get("vendor"), mapping_by_key)
+    item["vendor_original"] = vendor_original
+    item["vendor_mapped"] = vendor_mapped
+    item["vendor_display"] = vendor_display
+    item["vendor"] = vendor_display
 
 
 def _compose_effective_image_ids(
@@ -323,6 +367,9 @@ def _project_catalog_item(item: dict[str, Any]) -> dict[str, Any]:
         "source_id": int(item.get("source_id") or 0),
         "title": str(item.get("title") or ""),
         "vendor": item.get("vendor"),
+        "vendor_original": item.get("vendor_original"),
+        "vendor_mapped": item.get("vendor_mapped"),
+        "vendor_display": item.get("vendor_display"),
         "url": str(item.get("url") or ""),
         "price": _safe_float(item.get("price")),
         "currency": str(item.get("currency") or "RUB"),
@@ -341,11 +388,17 @@ def _project_showcase_product_detail(item: dict[str, Any]) -> dict[str, Any]:
     components = item.get("pricing_components")
     if not isinstance(components, dict):
         components = {}
+    product_edit = item.get("product_edit")
+    if not isinstance(product_edit, dict):
+        product_edit = {}
     return {
         "id": int(item.get("id") or 0),
         "source_id": int(item.get("source_id") or 0),
         "title": str(item.get("title") or ""),
         "vendor": item.get("vendor"),
+        "vendor_original": item.get("vendor_original"),
+        "vendor_mapped": item.get("vendor_mapped"),
+        "vendor_display": item.get("vendor_display"),
         "url": str(item.get("url") or ""),
         "price": _safe_float(item.get("price")),
         "currency": str(item.get("currency") or "RUB"),
@@ -361,7 +414,38 @@ def _project_showcase_product_detail(item: dict[str, Any]) -> dict[str, Any]:
         "internal_category_names": list(item.get("internal_category_names") or []),
         "description": item.get("description"),
         "pricing_components": components,
+        "product_edit": product_edit,
     }
+
+
+def _status_sort_rank(raw_status: Any) -> int:
+    normalized = str(raw_status or "").strip().lower()
+    return 0 if normalized == "available" else 1
+
+
+def _vendor_sort_value(item: dict[str, Any]) -> str:
+    return (
+        str(
+            item.get("vendor_display")
+            or item.get("vendor_mapped")
+            or item.get("vendor")
+            or item.get("vendor_original")
+            or ""
+        )
+        .strip()
+        .casefold()
+    )
+
+
+def _sort_products_for_display(items: list[dict[str, Any]]) -> None:
+    items.sort(
+        key=lambda item: (
+            _status_sort_rank(item.get("status")),
+            _vendor_sort_value(item),
+            str(item.get("title") or "").strip().casefold(),
+            int(item.get("id") or 0),
+        )
+    )
 
 
 def _resolve_primary_image_url(item: dict[str, Any]) -> str | None:
@@ -576,6 +660,64 @@ def _build_descendant_slug_index(tree: list[Any]) -> dict[str, set[str]]:
     return index
 
 
+def _build_category_full_path_parts(
+    node: Any,
+    *,
+    category_node_by_id: dict[int, Any],
+) -> list[str]:
+    parts: list[str] = []
+    current = node
+    guard = 0
+    while current is not None and guard < 64:
+        name = str(getattr(current, "name", "") or "").strip()
+        if name:
+            parts.append(name)
+        parent_id_raw = getattr(current, "parent_id", None)
+        parent_id = _safe_int(parent_id_raw)
+        current = category_node_by_id.get(int(parent_id)) if parent_id is not None else None
+        guard += 1
+    parts.reverse()
+    return parts
+
+
+def _group_category_paths_for_display(path_parts_list: list[list[str]]) -> list[str]:
+    grouped: dict[str, set[str]] = {}
+    order: list[str] = []
+
+    for parts in path_parts_list:
+        clean_parts = [str(part).strip() for part in parts if str(part or "").strip()]
+        if not clean_parts:
+            continue
+        if len(clean_parts) == 1:
+            prefix_key = ""
+            leaf = clean_parts[0]
+        else:
+            prefix_key = " -> ".join(clean_parts[:-1])
+            leaf = clean_parts[-1]
+        if prefix_key not in grouped:
+            grouped[prefix_key] = set()
+            order.append(prefix_key)
+        grouped[prefix_key].add(leaf)
+
+    labels: list[str] = []
+    for prefix in order:
+        leaves = sorted(grouped[prefix], key=lambda value: value.casefold())
+        if not leaves:
+            continue
+        if prefix:
+            labels.append(f"{prefix} -> {', '.join(leaves)}")
+        else:
+            labels.append(", ".join(leaves))
+    return labels
+
+
+def _format_grouped_category_paths(path_parts_list: list[list[str]]) -> tuple[list[str], str | None]:
+    labels = _group_category_paths_for_display(path_parts_list)
+    if not labels:
+        return [], None
+    return labels, "; ".join(labels) + ";"
+
+
 def _apply_internal_categories_from_ids(
     item: dict[str, Any],
     *,
@@ -589,12 +731,18 @@ def _apply_internal_categories_from_ids(
     if not matched_nodes and fallback_node is not None:
         matched_nodes = [fallback_node]
 
+    path_parts_list = [
+        _build_category_full_path_parts(node, category_node_by_id=category_node_by_id)
+        for node in matched_nodes
+    ]
+    grouped_labels, grouped_label = _format_grouped_category_paths(path_parts_list)
+
     item["internal_category_ids"] = [int(node.id) for node in matched_nodes]
-    item["internal_category_names"] = [str(node.name) for node in matched_nodes]
+    item["internal_category_names"] = grouped_labels
     item["internal_category_slugs"] = [str(node.slug) for node in matched_nodes]
     if matched_nodes:
         item["internal_category_id"] = int(matched_nodes[0].id)
-        item["internal_category_name"] = str(matched_nodes[0].name)
+        item["internal_category_name"] = grouped_label or str(matched_nodes[0].name)
         item["internal_category_slug"] = str(matched_nodes[0].slug)
     else:
         item["internal_category_id"] = None
@@ -603,12 +751,16 @@ def _apply_internal_categories_from_ids(
 
 
 def _product_row_to_item(product: ParserProduct) -> dict[str, Any]:
-    return {
+    item: dict[str, Any] = {
         "id": int(product.id),
         "source_id": int(product.source_id),
         "handle": str(product.handle),
         "title": str(product.title),
+        "description": product.description,
         "vendor": product.vendor,
+        "vendor_original": product.vendor,
+        "vendor_mapped": product.vendor,
+        "vendor_display": product.vendor,
         "product_type": product.product_type,
         "url": str(product.url),
         "price": product.price,
@@ -628,6 +780,8 @@ def _product_row_to_item(product: ParserProduct) -> dict[str, Any]:
         "created_at": product.created_at.isoformat() if product.created_at is not None else None,
         "updated_at": product.updated_at.isoformat() if product.updated_at is not None else None,
     }
+    _apply_product_overrides_to_item(item, product)
+    return item
 
 
 def _apply_admin_product_filters(
@@ -639,12 +793,8 @@ def _apply_admin_product_filters(
     product_type: str | None,
     status_filter: str | None,
 ):
-    normalized_vendor_expr = func.regexp_replace(
-        func.lower(func.trim(func.coalesce(ParserProduct.vendor, ""))),
-        "[^[:alnum:]]+",
-        "",
-        "g",
-    )
+    normalized_vendor_expr = _normalized_mapped_vendor_key_expr()
+    mapped_vendor_expr = _mapped_vendor_label_expr()
     normalized_type_expr = func.lower(func.trim(func.coalesce(ParserProduct.product_type, "")))
     if source_id is not None:
         query = query.filter(ParserProduct.source_id == int(source_id))
@@ -672,7 +822,7 @@ def _apply_admin_product_filters(
         query = query.filter(
             or_(
                 ParserProduct.title.ilike(pattern),
-                ParserProduct.vendor.ilike(pattern),
+                mapped_vendor_expr.ilike(pattern),
                 ParserProduct.product_type.ilike(pattern),
                 ParserProduct.handle.ilike(pattern),
                 ParserProduct.url.ilike(pattern),
@@ -684,7 +834,7 @@ def _apply_admin_product_filters(
 def _project_admin_table_item(item: dict[str, Any]) -> dict[str, Any]:
     names = [str(value).strip() for value in list(item.get("internal_category_names") or []) if str(value or "").strip()]
     if names:
-        internal_category_label = ", ".join(names)
+        internal_category_label = "; ".join(names) + ";"
     else:
         single_name = str(item.get("internal_category_name") or "").strip()
         internal_category_label = single_name or "Прочее"
@@ -693,6 +843,10 @@ def _project_admin_table_item(item: dict[str, Any]) -> dict[str, Any]:
         "id": int(item.get("id") or 0),
         "source_id": int(item.get("source_id") or 0),
         "title": str(item.get("title") or ""),
+        "vendor": item.get("vendor"),
+        "vendor_original": item.get("vendor_original"),
+        "vendor_mapped": item.get("vendor_mapped"),
+        "vendor_display": item.get("vendor_display"),
         "url": str(item.get("url") or ""),
         "product_type": item.get("product_type"),
         "status": str(item.get("status") or "hidden"),
@@ -790,7 +944,7 @@ def get_admin_products_table(
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
     category_index_service = CategoryIndexService(db)
-    category_index_service.ensure_fresh(require_counts=False)
+    category_index_service.ensure_fresh(require_counts=False, allow_match_rebuild=False)
     flat_tree = _flatten_tree(category_tree)
     category_node_by_id = {int(node.id): node for node in flat_tree if bool(getattr(node, "is_enabled", True))}
     fallback_node = next((node for node in flat_tree if bool(getattr(node, "is_fallback", False))), None)
@@ -809,10 +963,13 @@ def get_admin_products_table(
         int(source.id): source
         for source in source_repo.get_active_by_ids({int(item.source_id) for item in rows})
     }
+    brand_mapping_service = BrandMappingService(db)
+    mapping_by_key = brand_mapping_service.get_mapping_by_key()
 
     items: list[dict[str, Any]] = []
     for row in rows:
         raw_item = _product_row_to_item(row)
+        _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
         if int(row.id) in resolved_image_ids:
             raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
         _apply_internal_categories_from_ids(
@@ -837,6 +994,7 @@ def get_admin_products_table(
                 detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
             ) from exc
         items.append(_project_admin_table_item(enriched))
+    _sort_products_for_display(items)
 
     next_cursor = None
     has_more = False
@@ -913,17 +1071,13 @@ def get_admin_products_table_facets(
         product_type=normalized_type,
         status_filter=selected_status,
     )
-    normalized_vendor_expr = func.regexp_replace(
-        func.lower(func.trim(func.coalesce(ParserProduct.vendor, ""))),
-        "[^[:alnum:]]+",
-        "",
-        "g",
-    )
+    normalized_vendor_expr = _normalized_mapped_vendor_key_expr()
+    mapped_vendor_expr = _mapped_vendor_label_expr()
     vendor_rows = (
         vendor_query
         .with_entities(
             normalized_vendor_expr.label("vendor_key"),
-            func.min(func.trim(ParserProduct.vendor)).label("vendor_label"),
+            func.min(func.trim(mapped_vendor_expr)).label("vendor_label"),
             func.count(ParserProduct.id).label("vendor_count"),
         )
         .group_by(normalized_vendor_expr)
@@ -993,6 +1147,26 @@ def get_admin_products_table_facets(
     }
 
 
+@router.get("/admin/brand-mapping", response_model=BrandMappingListResponse)
+def get_admin_brand_mapping(
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+) -> dict[str, Any]:
+    return BrandMappingService(db).get_admin_brand_mapping_payload()
+
+
+@router.put("/admin/brand-mapping", response_model=BrandMappingListResponse)
+def put_admin_brand_mapping(
+    payload: BrandMappingUpdateRequest,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+) -> dict[str, Any]:
+    try:
+        return BrandMappingService(db).save_admin_brand_mapping([item.model_dump() for item in payload.items])
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
 @router.get("/products")
 async def get_products(request: Request, db: Session = Depends(get_db)) -> Response:
     upstream = forward_service_request(request=request, path="products", body=b"")
@@ -1028,7 +1202,7 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
     category_index_service = CategoryIndexService(db)
-    category_index_service.ensure_fresh(require_counts=False)
+    category_index_service.ensure_fresh(require_counts=False, allow_match_rebuild=False)
     flat_tree = _flatten_tree(category_tree)
     category_node_by_id = {int(node.id): node for node in flat_tree if bool(getattr(node, "is_enabled", True))}
     fallback_node = next((node for node in flat_tree if bool(getattr(node, "is_fallback", False))), None)
@@ -1045,6 +1219,8 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
         int(product_id): [int(category_id) for category_id in category_ids if int(category_id) in favorite_category_ids]
         for product_id, category_ids in manual_map.items()
     }
+    brand_mapping_service = BrandMappingService(db)
+    mapping_by_key = brand_mapping_service.get_mapping_by_key()
 
     try:
         enriched_items: list[Any] = []
@@ -1052,6 +1228,7 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
             if not isinstance(item, dict):
                 enriched_items.append(item)
                 continue
+            _apply_brand_mapping_to_item(item, brand_mapping_service, mapping_by_key)
             product_id = _safe_int(item.get("id"))
             if product_id is not None:
                 _apply_internal_categories_from_ids(
@@ -1071,6 +1248,7 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
                     favorite_manual_category_ids_by_product=favorite_manual_map,
                 )
             )
+        _sort_products_for_display(enriched_items)
         payload["items"] = enriched_items
     except InvalidProductStatusError as exc:
         raise HTTPException(
@@ -1162,7 +1340,7 @@ def get_catalog_products(
     categories = category_repo.get_all_active()
     category_tree = build_tree(categories, keyword_repo)
     category_index_service = CategoryIndexService(db)
-    category_index_service.ensure_fresh(require_counts=False)
+    category_index_service.ensure_fresh(require_counts=False, allow_match_rebuild=False)
     flat_tree = _flatten_tree(category_tree)
     category_node_by_id = {int(node.id): node for node in flat_tree if bool(getattr(node, "is_enabled", True))}
     fallback_node = next((node for node in flat_tree if bool(getattr(node, "is_fallback", False))), None)
@@ -1193,6 +1371,8 @@ def get_catalog_products(
     product_repo = ParserProductRepository(db)
     manual_repo = ParserCategoryManualProductRepository(db)
     source_repo = ParserSourceRepository(db)
+    brand_mapping_service = BrandMappingService(db)
+    mapping_by_key = brand_mapping_service.get_mapping_by_key()
     favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
 
     normalized_search = (search or "").strip()
@@ -1210,10 +1390,11 @@ def get_catalog_products(
             query = query.filter(ParserProduct.source_id == int(source_id))
         if normalized_search:
             pattern = f"%{normalized_search}%"
+            mapped_vendor_expr = _mapped_vendor_label_expr()
             query = query.filter(
                 or_(
                     ParserProduct.title.ilike(pattern),
-                    ParserProduct.vendor.ilike(pattern),
+                    mapped_vendor_expr.ilike(pattern),
                     ParserProduct.product_type.ilike(pattern),
                     ParserProduct.handle.ilike(pattern),
                     ParserProduct.url.ilike(pattern),
@@ -1278,6 +1459,7 @@ def get_catalog_products(
 
         for row in rows:
             raw_item = _product_row_to_item(row)
+            _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
             if int(row.id) in resolved_image_ids:
                 raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
             _apply_internal_categories_from_ids(
@@ -1325,8 +1507,10 @@ def get_catalog_products(
             break
         next_cursor = _encode_cursor(last_cursor_ts, last_cursor_id)
 
+    page_items = accepted_items[: int(limit)]
+    _sort_products_for_display(page_items)
     return {
-        "items": accepted_items[: int(limit)],
+        "items": page_items,
         "next_cursor": next_cursor,
         "has_more": bool(next_cursor),
         "limit": int(limit),
@@ -1407,7 +1591,7 @@ def get_admin_products(
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
     category_index_service = CategoryIndexService(db)
-    category_index_service.ensure_fresh(require_counts=False)
+    category_index_service.ensure_fresh(require_counts=False, allow_match_rebuild=False)
     flat_tree = _flatten_tree(category_tree)
     category_node_by_id = {int(node.id): node for node in flat_tree if bool(getattr(node, "is_enabled", True))}
     fallback_node = next((node for node in flat_tree if bool(getattr(node, "is_fallback", False))), None)
@@ -1426,10 +1610,13 @@ def get_admin_products(
         int(source.id): source
         for source in source_repo.get_active_by_ids({int(item.source_id) for item in rows})
     }
+    brand_mapping_service = BrandMappingService(db)
+    mapping_by_key = brand_mapping_service.get_mapping_by_key()
 
     items: list[dict[str, Any]] = []
     for row in rows:
         raw_item = _product_row_to_item(row)
+        _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
         if int(row.id) in resolved_image_ids:
             raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
         _apply_internal_categories_from_ids(
@@ -1454,6 +1641,7 @@ def get_admin_products(
                 detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
             ) from exc
         items.append(enriched)
+    _sort_products_for_display(items)
 
     next_cursor = None
     has_more = False
@@ -1522,10 +1710,13 @@ def get_pricing_example_product(
         weight_rules = []
 
     source_repo = ParserSourceRepository(db)
+    brand_mapping_service = BrandMappingService(db)
+    mapping_by_key = brand_mapping_service.get_mapping_by_key()
     source_profile_map = {
         int(source.id): source
         for source in source_repo.get_active_by_ids({int(row.source_id)})
     }
+    _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
     enriched = _safe_apply_backend_pricing_to_item(
         item=raw_item,
         settings_service=settings_service,
@@ -1599,6 +1790,9 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
     if not isinstance(payload, dict):
         return upstream
     payload["description"] = _extract_product_description(payload)
+    brand_mapping_service = BrandMappingService(db)
+    mapping_by_key = brand_mapping_service.get_mapping_by_key()
+    _apply_brand_mapping_to_item(payload, brand_mapping_service, mapping_by_key)
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
@@ -1615,7 +1809,7 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
     category_index_service = CategoryIndexService(db)
-    category_index_service.ensure_fresh(require_counts=False)
+    category_index_service.ensure_fresh(require_counts=False, allow_match_rebuild=False)
     flat_tree = _flatten_tree(category_tree)
     category_node_by_id = {int(node.id): node for node in flat_tree if bool(getattr(node, "is_enabled", True))}
     fallback_node = next((node for node in flat_tree if bool(getattr(node, "is_fallback", False))), None)
@@ -1634,6 +1828,8 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
         payload["image_ids"] = list(resolved_single.get(int(local_product.id), list(local_product.image_asset_ids or [])))
         if isinstance(local_product.image_urls, list) and local_product.image_urls:
             payload["image_urls"] = list(local_product.image_urls or [])
+        _apply_product_overrides_to_item(payload, local_product)
+        _apply_brand_mapping_to_item(payload, brand_mapping_service, mapping_by_key)
     _apply_internal_categories_from_ids(
         payload,
         product_id=int(product_id),
@@ -1670,6 +1866,15 @@ async def update_product(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректный payload")
 
+    reset_fields_raw = payload.get("reset_to_default")
+    reset_fields: set[str] = set()
+    if isinstance(reset_fields_raw, list):
+        reset_fields = {
+            str(item or "").strip().lower()
+            for item in reset_fields_raw
+            if str(item or "").strip().lower() in {"title", "description", "images"}
+        }
+
     next_status_raw = payload.get("status")
     next_status = None
     if next_status_raw is not None:
@@ -1680,7 +1885,14 @@ async def update_product(
                 detail="Допустимые статусы: available, out_of_stock, hidden",
             )
 
-    if next_status is None:
+    title_override_payload = payload.get("title") if "title" in payload else None
+    has_title_override = "title" in payload
+    description_override_payload = payload.get("description") if "description" in payload else None
+    has_description_override = "description" in payload
+    image_patch = payload.get("images") if isinstance(payload.get("images"), dict) else None
+    has_image_patch = image_patch is not None
+
+    if next_status is None and not reset_fields and not has_title_override and not has_description_override and not has_image_patch:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет поддерживаемых полей для обновления")
 
     product_repo = ParserProductRepository(db)
@@ -1688,26 +1900,64 @@ async def update_product(
     product = product_repo.get_active_by_id(product_id)
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
+
+    if "title" in reset_fields:
+        product.title_override = None
+        product.title_sync_locked = False
+    if "description" in reset_fields:
+        product.description_override = None
+        product.description_sync_locked = False
+    if "images" in reset_fields:
+        product.images_sync_locked = False
+        product.hidden_source_image_asset_ids = []
+        product.manual_image_asset_ids = []
+        product.manual_image_order = []
+
+    if has_title_override:
+        next_title = str(title_override_payload or "").strip()
+        if not next_title:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Название не может быть пустым")
+        product.title_override = next_title
+        product.title_sync_locked = True
+
+    if has_description_override:
+        if description_override_payload is None:
+            next_description = ""
+        else:
+            next_description = str(description_override_payload).strip()
+        product.description_override = next_description
+        product.description_sync_locked = True
+
+    if has_image_patch:
+        hidden_source_ids = _normalize_int_list(image_patch.get("hidden_source_image_ids"))
+        manual_image_ids = _normalize_int_list(image_patch.get("manual_image_ids"))
+        manual_image_order = _normalize_image_order_tokens(image_patch.get("manual_image_order"))
+        product.hidden_source_image_asset_ids = hidden_source_ids
+        product.manual_image_asset_ids = manual_image_ids
+        product.manual_image_order = manual_image_order
+        product.images_sync_locked = True
+
     source_profile = source_repo.get_active_by_id(int(product.source_id))
     source_auto_hide = bool(getattr(source_profile, "hide_auto_added_products", False))
     is_auto_added = bool(getattr(product, "is_auto_added", True))
     is_force_visible = bool(getattr(product, "auto_hide_force_visible", False))
     current_stored_status = str(product.status or "").strip().lower()
 
-    if next_status == "hidden":
-        if source_auto_hide and is_auto_added and is_force_visible and current_stored_status != "hidden":
-            # Return to source-level auto-hidden state (global rule), not a manual hidden lock.
-            product.auto_hide_force_visible = False
+    if next_status is not None:
+        if next_status == "hidden":
+            if source_auto_hide and is_auto_added and is_force_visible and current_stored_status != "hidden":
+                # Return to source-level auto-hidden state (global rule), not a manual hidden lock.
+                product.auto_hide_force_visible = False
+            else:
+                product.status = "hidden"
+                product.auto_hide_force_visible = False
         else:
-            product.status = "hidden"
-            product.auto_hide_force_visible = False
-    else:
-        product.status = next_status
-        if source_auto_hide and is_auto_added:
-            # User explicitly unhid auto-hidden product: keep visible until user hides it back.
-            product.auto_hide_force_visible = True
-        else:
-            product.auto_hide_force_visible = False
+            product.status = next_status
+            if source_auto_hide and is_auto_added:
+                # User explicitly unhid auto-hidden product: keep visible until user hides it back.
+                product.auto_hide_force_visible = True
+            else:
+                product.auto_hide_force_visible = False
 
     db.commit()
     effective_status = _effective_status_from_variants(
@@ -1723,7 +1973,11 @@ async def update_product(
         "source_id": int(product.source_id),
         "handle": str(product.handle),
         "title": str(product.title),
+        "description": product.description,
         "vendor": product.vendor,
+        "vendor_original": product.vendor,
+        "vendor_mapped": product.vendor,
+        "vendor_display": product.vendor,
         "product_type": product.product_type,
         "url": str(product.url),
         "price": product.price,
@@ -1743,6 +1997,9 @@ async def update_product(
         "created_at": product.created_at.isoformat() if product.created_at is not None else None,
         "updated_at": product.updated_at.isoformat() if product.updated_at is not None else None,
     }
+    _apply_product_overrides_to_item(patched_payload, product)
+    brand_mapping_service = BrandMappingService(db)
+    _apply_brand_mapping_to_item(patched_payload, brand_mapping_service, brand_mapping_service.get_mapping_by_key())
 
     patched_payload.update(
         {

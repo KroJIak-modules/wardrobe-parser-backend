@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
-from app.models import ParserCategory, ParserCategoryKeyword, ParserCategoryManualProduct, ParserProduct
+from app.models import ParserBrandMapping, ParserCategory, ParserCategoryKeyword, ParserCategoryManualProduct, ParserProduct
 from app.repositories import (
     ParserCategoryCountSnapshotRepository,
     ParserCategoryIndexStateRepository,
@@ -24,9 +24,13 @@ class CategoryIndexService:
         self.count_repo = ParserCategoryCountSnapshotRepository(db)
         self.state_repo = ParserCategoryIndexStateRepository(db)
 
-    def ensure_fresh(self, *, require_counts: bool = False) -> None:
+    def ensure_fresh(self, *, require_counts: bool = False, allow_match_rebuild: bool = True) -> None:
         if self._should_rebuild_matches():
-            self.rebuild_full()
+            # Heavy full match rebuild may take long under active sync load.
+            # For latency-sensitive read endpoints we can skip blocking rebuild
+            # and serve using the last consistent snapshot.
+            if allow_match_rebuild:
+                self.rebuild_full()
             return
         if require_counts and (self._snapshot_is_empty() or self._should_rebuild_counts()):
             self.rebuild_counts()
@@ -136,6 +140,77 @@ class CategoryIndexService:
         state.counts_built_at = None
         self.db.commit()
 
+    def refresh_auto_matches_for_category(self, *, category_id: int) -> None:
+        cid = int(category_id)
+        self.db.execute(
+            text(
+                """
+                DELETE FROM parser_product_category_match
+                WHERE category_id = :category_id
+                  AND match_source = 'auto'
+                """
+            ),
+            {"category_id": cid},
+        )
+        self.db.execute(
+            text(
+                """
+                INSERT INTO parser_product_category_match (product_id, category_id, match_source, score, created_at, updated_at)
+                WITH product_with_vendor AS (
+                    SELECT
+                        p.id,
+                        p.title,
+                        p.product_type,
+                        p.status,
+                        p.deleted_at,
+                        trim(coalesce(
+                            (
+                                SELECT bm.target_brand
+                                FROM parser_brand_mapping bm
+                                WHERE bm.source_brand_key = regexp_replace(lower(trim(coalesce(p.vendor, ''))), '[^[:alnum:]]+', '', 'g')
+                                LIMIT 1
+                            ),
+                            p.vendor
+                        )) AS mapped_vendor
+                    FROM parser_product p
+                )
+                SELECT
+                    p.id AS product_id,
+                    :category_id AS category_id,
+                    'auto' AS match_source,
+                    SUM(char_length(k.keyword))::int AS score,
+                    now(),
+                    now()
+                FROM product_with_vendor p
+                JOIN parser_category c ON c.id = :category_id
+                JOIN parser_category_keyword k ON k.category_id = c.id
+                WHERE p.deleted_at IS NULL
+                  AND c.deleted_at IS NULL
+                  AND c.is_fallback IS FALSE
+                  AND c.is_enabled IS TRUE
+                  AND char_length(trim(k.keyword)) > 0
+                  AND (
+                    (k.keyword_scope = 'local' AND strpos(lower(trim(coalesce(p.mapped_vendor, '') || ' ' || coalesce(p.product_type, ''))), lower(k.keyword)) > 0)
+                    OR
+                    (k.keyword_scope = 'title' AND strpos(lower(trim(coalesce(p.title, ''))), lower(k.keyword)) > 0)
+                    OR
+                    (k.keyword_scope = 'status' AND lower(trim(p.status::text)) = lower(trim(k.keyword)))
+                  )
+                GROUP BY p.id
+                ON CONFLICT (product_id, category_id, match_source)
+                DO UPDATE SET
+                    score = EXCLUDED.score,
+                    updated_at = now()
+                """
+            ),
+            {"category_id": cid},
+        )
+        now = datetime.now(timezone.utc)
+        state = self.state_repo.get_or_create_singleton()
+        state.matches_built_at = now
+        state.counts_built_at = None
+        self.db.commit()
+
     def _snapshot_is_empty(self) -> bool:
         total = self.db.query(func.count(ParserCategory.id)).filter(ParserCategory.deleted_at.is_(None)).scalar() or 0
         if total == 0:
@@ -158,8 +233,9 @@ class CategoryIndexService:
         latest_product = self.db.query(func.max(ParserProduct.updated_at)).filter(ParserProduct.deleted_at.is_(None)).scalar()
         latest_keyword = self.db.query(func.max(ParserCategoryKeyword.created_at)).scalar()
         latest_manual = self.db.query(func.max(ParserCategoryManualProduct.created_at)).scalar()
+        latest_brand_mapping = self.db.query(func.max(ParserBrandMapping.updated_at)).scalar()
 
-        candidates = [latest_product, latest_keyword, latest_manual]
+        candidates = [latest_product, latest_keyword, latest_manual, latest_brand_mapping]
         for item in candidates:
             if item is not None and item > matches_built_at:
                 return True
@@ -217,13 +293,31 @@ class CategoryIndexService:
                     JOIN designers_root r ON c.parent_id = r.id
                     WHERE c.deleted_at IS NULL
                 ),
+                product_with_vendor AS (
+                    SELECT
+                        p.id,
+                        p.title,
+                        p.product_type,
+                        p.status,
+                        p.deleted_at,
+                        trim(coalesce(
+                            (
+                                SELECT bm.target_brand
+                                FROM parser_brand_mapping bm
+                                WHERE bm.source_brand_key = regexp_replace(lower(trim(coalesce(p.vendor, ''))), '[^[:alnum:]]+', '', 'g')
+                                LIMIT 1
+                            ),
+                            p.vendor
+                        )) AS mapped_vendor
+                    FROM parser_product p
+                ),
                 auto_matches AS (
                     SELECT
                         p.id AS product_id,
                         k.category_id,
                         'auto' AS match_source,
                         SUM(char_length(k.keyword))::int AS score
-                    FROM parser_product p
+                    FROM product_with_vendor p
                     JOIN parser_category_keyword k ON TRUE
                     JOIN parser_category c ON c.id = k.category_id
                     WHERE p.deleted_at IS NULL
@@ -232,9 +326,11 @@ class CategoryIndexService:
                       AND c.is_enabled IS TRUE
                       AND char_length(trim(k.keyword)) > 0
                       AND (
-                        (k.keyword_scope = 'local' AND strpos(lower(trim(coalesce(p.vendor, '') || ' ' || coalesce(p.product_type, ''))), lower(k.keyword)) > 0)
+                        (k.keyword_scope = 'local' AND strpos(lower(trim(coalesce(p.mapped_vendor, '') || ' ' || coalesce(p.product_type, ''))), lower(k.keyword)) > 0)
                         OR
                         (k.keyword_scope = 'title' AND strpos(lower(trim(coalesce(p.title, ''))), lower(k.keyword)) > 0)
+                        OR
+                        (k.keyword_scope = 'status' AND lower(trim(p.status::text)) = lower(trim(k.keyword)))
                       )
                     GROUP BY p.id, k.category_id
                 ),
@@ -244,13 +340,13 @@ class CategoryIndexService:
                         d.id AS category_id,
                         'designer' AS match_source,
                         GREATEST(char_length(trim(d.name)), 1)::int AS score
-                    FROM parser_product p
+                    FROM product_with_vendor p
                     JOIN designers_branch d ON TRUE
                     JOIN parser_category c ON c.id = d.id
                     WHERE p.deleted_at IS NULL
                       AND c.is_enabled IS TRUE
-                      AND char_length(trim(coalesce(p.vendor, ''))) > 0
-                      AND lower(trim(coalesce(p.vendor, ''))) = lower(trim(d.name))
+                      AND char_length(trim(coalesce(p.mapped_vendor, ''))) > 0
+                      AND lower(trim(coalesce(p.mapped_vendor, ''))) = lower(trim(d.name))
                 )
                 SELECT product_id, category_id, match_source, score, now(), now()
                 FROM auto_matches

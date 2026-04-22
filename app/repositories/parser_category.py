@@ -72,7 +72,12 @@ class ParserCategoryKeywordRepository(BaseRepository[ParserCategoryKeyword]):
 
     @staticmethod
     def _normalize_scope(scope: str | None) -> str:
-        return "title" if (scope or "").strip().lower() == "title" else "local"
+        normalized = (scope or "").strip().lower()
+        if normalized == "title":
+            return "title"
+        if normalized == "status":
+            return "status"
+        return "local"
 
     def get_by_category(self, category_id: int, scope: str | None = None) -> list[ParserCategoryKeyword]:
         normalized_scope = self._normalize_scope(scope) if scope is not None else None

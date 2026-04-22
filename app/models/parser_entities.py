@@ -39,6 +39,7 @@ class ParserProduct(Base):
     source_id = Column(Integer, ForeignKey("parser_source.id"), nullable=False)
     handle = Column(String(1024), nullable=False)
     title = Column(String(2048), nullable=False)
+    description = Column(Text, nullable=True)
     vendor = Column(String(255), nullable=True)
     product_type = Column(String(255), nullable=True)
     url = Column(String(2048), nullable=False)
@@ -105,4 +106,22 @@ class ParserDedupDecision(Base):
         Index("idx_parser_dedup_decision_action", "action"),
         Index("idx_parser_dedup_decision_left", "left_product_id"),
         Index("idx_parser_dedup_decision_right", "right_product_id"),
+    )
+
+
+class ParserBrandMapping(Base):
+    """Manual mapping of original brand names to canonical display brand names."""
+
+    __tablename__ = "parser_brand_mapping"
+
+    id = Column(Integer, primary_key=True)
+    source_brand = Column(String(255), nullable=False)
+    source_brand_key = Column(String(255), nullable=False, unique=True)
+    target_brand = Column(String(255), nullable=False)
+    include_in_designers = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_parser_brand_mapping_source_brand", "source_brand"),
     )
