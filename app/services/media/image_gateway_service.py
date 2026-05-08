@@ -22,6 +22,20 @@ class ImageGatewayService:
         self.db = db
 
     @staticmethod
+    def _representation_variant_key(*, prefer_webp: bool) -> str:
+        return "webp" if prefer_webp else "legacy"
+
+    @staticmethod
+    def _if_none_match_contains(request: Request, etag: str) -> bool:
+        raw = request.headers.get("if-none-match")
+        if not raw:
+            return False
+        if raw.strip() == "*":
+            return True
+        candidates = [item.strip() for item in raw.split(",") if item.strip()]
+        return etag in candidates
+
+    @staticmethod
     def _parse_resize_params(request: Request) -> tuple[int | None, int | None, int]:
         def _parse_int(raw: str | None, *, min_value: int, max_value: int) -> int | None:
             if raw is None:
@@ -41,6 +55,11 @@ class ImageGatewayService:
         return width, height, quality
 
     @staticmethod
+    def _supports_webp(accept_header: str | None) -> bool:
+        raw = (accept_header or "").lower()
+        return "image/webp" in raw
+
+    @staticmethod
     def _transform_image(
         content: bytes,
         *,
@@ -48,13 +67,15 @@ class ImageGatewayService:
         height: int | None,
         quality: int,
         fallback_media_type: str,
+        prefer_webp: bool,
     ) -> tuple[bytes, str]:
         if width is None and height is None:
             return content, fallback_media_type
         try:
             with Image.open(io.BytesIO(content)) as image:
                 image.load()
-                source = image.convert("RGB")
+                has_alpha = "A" in image.getbands()
+                source = image.convert("RGBA" if has_alpha else "RGB")
                 src_w, src_h = source.size
                 if src_w <= 0 or src_h <= 0:
                     return content, fallback_media_type
@@ -72,8 +93,14 @@ class ImageGatewayService:
                 else:
                     resized = source.resize((target_w, target_h), Image.Resampling.LANCZOS)
                 output = io.BytesIO()
-                resized.save(output, format="WEBP", quality=quality, method=5)
-                return output.getvalue(), "image/webp"
+                if prefer_webp:
+                    resized.save(output, format="WEBP", quality=quality, method=5)
+                    return output.getvalue(), "image/webp"
+                if has_alpha:
+                    resized.save(output, format="PNG", optimize=True)
+                    return output.getvalue(), "image/png"
+                resized.convert("RGB").save(output, format="JPEG", quality=quality, optimize=True)
+                return output.getvalue(), "image/jpeg"
         except (UnidentifiedImageError, OSError, ValueError):
             return content, fallback_media_type
 
@@ -81,6 +108,7 @@ class ImageGatewayService:
         client_ip = request.client.host if request.client else "unknown"
         check_rate_limit(client_ip, per_minute_limit=settings.image_rate_limit_per_minute)
         width, height, quality = self._parse_resize_params(request)
+        prefer_webp = self._supports_webp(request.headers.get("accept"))
 
         asset = (
             self.db.query(ImageAsset)
@@ -91,13 +119,15 @@ class ImageGatewayService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
 
         base_etag = build_etag(asset.id, asset.created_at, asset.source_url)
-        variant_etag = f'{base_etag}:w{width or 0}:h{height or 0}:q{quality}'
+        variant_key = self._representation_variant_key(prefer_webp=prefer_webp)
+        variant_etag = f'{base_etag}:w{width or 0}:h{height or 0}:q{quality}:fmt-{variant_key}'
         headers = cache_headers(
             etag=variant_etag,
             created_at=asset.created_at,
             max_age_sec=settings.image_cache_max_age_sec,
         )
-        if request.headers.get("if-none-match") == variant_etag:
+        headers["Vary"] = "Accept"
+        if self._if_none_match_contains(request, variant_etag):
             return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
 
         if asset.storage_mode == "stored_file" and asset.stored_path:
@@ -111,6 +141,7 @@ class ImageGatewayService:
                             height=height,
                             quality=quality,
                             fallback_media_type="image/jpeg",
+                            prefer_webp=prefer_webp,
                         )
                         return Response(content=transformed, media_type=media_type, headers=headers)
                     except OSError:
@@ -137,6 +168,7 @@ class ImageGatewayService:
             height=height,
             quality=quality,
             fallback_media_type=media_type,
+            prefer_webp=prefer_webp,
         )
         final_media_type = transformed_media_type or media_type
         image_cache.set(image_id=asset.id, etag=variant_etag, body=transformed_content, content_type=final_media_type)
