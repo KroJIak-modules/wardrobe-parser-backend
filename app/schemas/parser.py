@@ -123,6 +123,16 @@ class WeightRuleResponse(BaseModel):
         from_attributes = True
 
 
+class ParserWeightRuleItem(BaseModel):
+    weight_grams: int
+    keywords: list[str] = Field(default_factory=list)
+
+
+class ParserWeightRulesContractResponse(BaseModel):
+    revision: str
+    rules: list[ParserWeightRuleItem] = Field(default_factory=list)
+
+
 class WeightMissingProductResponse(BaseModel):
     id: int
     title: str

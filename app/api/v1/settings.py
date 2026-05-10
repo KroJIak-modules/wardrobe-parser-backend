@@ -1,6 +1,7 @@
 """API endpoints for parser/admin settings."""
 
 import logging
+import hashlib
 import time
 from datetime import datetime, timezone
 from io import BytesIO
@@ -20,6 +21,8 @@ from app.schemas.parser import (
     ShowcaseMediaSettingsUpdateRequest,
     PricingSupplierCreateRequest,
     PricingSupplierResponse,
+    ParserWeightRuleItem,
+    ParserWeightRulesContractResponse,
     PricingSupplierUpdateRequest,
     SettingsTransferPayload,
     SettingsTransferResponse,
@@ -122,6 +125,26 @@ def list_weight_rules(db: Session = Depends(get_db)):
     except Exception:
         LOGGER.exception("Failed to load weight rules, returning empty list")
         return []
+
+
+@router.get("/weight-rules/parser-contract", response_model=ParserWeightRulesContractResponse)
+def parser_weight_rules_contract(db: Session = Depends(get_db)):
+    try:
+        rules = WeightRuleService(db).list_rules()
+    except Exception:
+        LOGGER.exception("Failed to load weight rules for parser-contract, returning empty payload")
+        rules = []
+
+    payload_rules: list[ParserWeightRuleItem] = []
+    revision_parts: list[str] = []
+    for rule in rules:
+        keywords = sorted({str(item).strip().lower() for item in (rule.keywords or []) if str(item).strip()})
+        payload_rules.append(ParserWeightRuleItem(weight_grams=int(rule.weight_grams), keywords=keywords))
+        revision_parts.append(f'{int(rule.weight_grams)}:{"|".join(keywords)}')
+
+    revision_raw = ";".join(revision_parts).encode("utf-8")
+    revision = hashlib.sha1(revision_raw).hexdigest()[:12] if revision_parts else "empty-rules"
+    return ParserWeightRulesContractResponse(revision=revision, rules=payload_rules)
 
 
 @router.get("/weight-rules/missing-products", response_model=list[WeightMissingProductResponse])

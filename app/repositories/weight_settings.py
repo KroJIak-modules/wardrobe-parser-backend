@@ -16,7 +16,7 @@ class ParserWeightRuleRepository(BaseRepository[ParserWeightRule]):
         return (
             self.query()
             .filter(ParserWeightRule.deleted_at.is_(None))
-            .order_by(ParserWeightRule.sort_order.asc(), ParserWeightRule.weight_grams.asc(), ParserWeightRule.id.asc())
+            .order_by(ParserWeightRule.weight_grams.asc(), ParserWeightRule.id.asc())
             .all()
         )
 
