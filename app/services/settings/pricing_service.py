@@ -14,9 +14,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings as app_settings
-from app.models import ParserSource, ParserSupplier
+from app.models import AdminUiSettings, ParserSource, ParserSupplier
 from app.repositories import ParserPricingSettingsRepository, ParserSourceRepository, ParserSupplierRepository
 from app.schemas.parser import (
+    AdminUiSettingsResponse,
+    AdminUiSettingsUpdateRequest,
     PricingSettingsResponse,
     PricingSettingsUpdateRequest,
     PricingSupplierCreateRequest,
@@ -609,20 +611,11 @@ class PricingSettingsService:
         if getattr(entity, "tax_rate", None) is None:
             entity.tax_rate = 0.06
             changed = True
-        if getattr(entity, "designers_exclude_store_vendors", None) is None:
-            entity.designers_exclude_store_vendors = False
-            changed = True
         if getattr(entity, "dedup_only_available_products", None) is None:
             entity.dedup_only_available_products = False
             changed = True
         if getattr(entity, "show_product_description", None) is None:
             entity.show_product_description = True
-            changed = True
-        raw_designers_min = getattr(entity, "designers_min_products", None)
-        normalized_designers_min = int(raw_designers_min) if raw_designers_min is not None else 1
-        normalized_designers_min = max(1, normalized_designers_min)
-        if normalized_designers_min != raw_designers_min:
-            entity.designers_min_products = normalized_designers_min
             changed = True
         normalized_insurance = cls._normalize_range_rules(
             getattr(entity, "insurance_rules", None),
@@ -656,19 +649,6 @@ class PricingSettingsService:
         if normalized_shipping != (getattr(entity, "shipping_rules", None) or {}):
             entity.shipping_rules = normalized_shipping
             changed = True
-        raw_hero = getattr(entity, "showcase_hero_image_asset_id", None)
-        normalized_hero = int(raw_hero) if isinstance(raw_hero, int) and raw_hero > 0 else None
-        if raw_hero != normalized_hero:
-            entity.showcase_hero_image_asset_id = normalized_hero
-            changed = True
-        normalized_carousel = cls._normalize_image_asset_ids(
-            getattr(entity, "showcase_carousel_image_asset_ids", None),
-            limit=20,
-        )
-        if normalized_carousel != (getattr(entity, "showcase_carousel_image_asset_ids", None) or []):
-            entity.showcase_carousel_image_asset_ids = normalized_carousel
-            changed = True
-
         return changed
 
     @staticmethod
@@ -804,22 +784,10 @@ class PricingSettingsService:
             self._validate_svc_rules_no_overlap(patch["svc_rules"])
         if "shipping_rules" in patch:
             patch["shipping_rules"] = self._normalize_shipping_rules(patch.get("shipping_rules"))
-        if "designers_min_products" in patch:
-            patch["designers_min_products"] = max(1, int(patch.get("designers_min_products") or 1))
-        if "designers_exclude_store_vendors" in patch:
-            patch["designers_exclude_store_vendors"] = bool(patch.get("designers_exclude_store_vendors"))
         if "dedup_only_available_products" in patch:
             patch["dedup_only_available_products"] = bool(patch.get("dedup_only_available_products"))
         if "show_product_description" in patch:
             patch["show_product_description"] = bool(patch.get("show_product_description"))
-        if "showcase_hero_image_asset_id" in patch:
-            raw_hero = patch.get("showcase_hero_image_asset_id")
-            patch["showcase_hero_image_asset_id"] = int(raw_hero) if isinstance(raw_hero, int) and raw_hero > 0 else None
-        if "showcase_carousel_image_asset_ids" in patch:
-            patch["showcase_carousel_image_asset_ids"] = self._normalize_image_asset_ids(
-                patch.get("showcase_carousel_image_asset_ids"),
-                limit=20,
-            )
         for key, value in patch.items():
             setattr(entity, key, value)
         defaults_changed = self._coerce_settings_defaults(entity)
@@ -899,24 +867,12 @@ class PricingSettingsService:
             customs_fixed_rub=float(getattr(entity, "customs_fixed_rub", 540.0)),
             shipping_alt_threshold_eur=float(getattr(entity, "shipping_alt_threshold_eur", 300.0)),
             tax_rate=float(getattr(entity, "tax_rate", 0.06)),
-            designers_min_products=max(1, int(getattr(entity, "designers_min_products", 1) or 1)),
-            designers_exclude_store_vendors=bool(getattr(entity, "designers_exclude_store_vendors", False)),
             dedup_only_available_products=bool(getattr(entity, "dedup_only_available_products", False)),
             show_product_description=bool(getattr(entity, "show_product_description", True)),
             svc_rules=normalized_svc_rules,
             insurance_rules=normalized_insurance,
             service_fee_rules=normalized_service_fee,
             shipping_rules=normalized_shipping,
-            showcase_hero_image_asset_id=(
-                int(getattr(entity, "showcase_hero_image_asset_id"))
-                if isinstance(getattr(entity, "showcase_hero_image_asset_id", None), int)
-                and int(getattr(entity, "showcase_hero_image_asset_id")) > 0
-                else None
-            ),
-            showcase_carousel_image_asset_ids=PricingSettingsService._normalize_image_asset_ids(
-                getattr(entity, "showcase_carousel_image_asset_ids", None),
-                limit=20,
-            ),
             bybit_rate_status=bybit_rate_status,
             bybit_rate_warning=bybit_rate_warning,
             bybit_bucket_step_usdt=int(app_settings.pricing_bybit_bucket_step_usdt),
@@ -938,6 +894,52 @@ class PricingSettingsService:
             formula_lines=list(_FORMULA_LINES),
             formula_legend=[dict(item) for item in _FORMULA_LEGEND],
         )
+
+    def get_admin_ui_settings(self) -> AdminUiSettingsResponse:
+        entity = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
+        if entity is None:
+            entity = AdminUiSettings(id=1)
+            self.db.add(entity)
+            self.db.commit()
+            self.db.refresh(entity)
+        return AdminUiSettingsResponse(
+            designers_min_products=max(1, int(getattr(entity, "designers_min_products", 1) or 1)),
+            designers_exclude_store_vendors=bool(getattr(entity, "designers_exclude_store_vendors", False)),
+            showcase_hero_image_asset_id=(
+                int(getattr(entity, "showcase_hero_image_asset_id"))
+                if isinstance(getattr(entity, "showcase_hero_image_asset_id", None), int)
+                and int(getattr(entity, "showcase_hero_image_asset_id")) > 0
+                else None
+            ),
+            showcase_carousel_image_asset_ids=self._normalize_image_asset_ids(
+                getattr(entity, "showcase_carousel_image_asset_ids", None),
+                max_items=20,
+            ),
+        )
+
+    def update_admin_ui_settings(self, payload: AdminUiSettingsUpdateRequest) -> AdminUiSettingsResponse:
+        patch = payload.model_dump(exclude_unset=True)
+        if "designers_min_products" in patch:
+            patch["designers_min_products"] = max(1, int(patch.get("designers_min_products") or 1))
+        if "designers_exclude_store_vendors" in patch:
+            patch["designers_exclude_store_vendors"] = bool(patch.get("designers_exclude_store_vendors"))
+        if "showcase_hero_image_asset_id" in patch:
+            raw_hero = patch.get("showcase_hero_image_asset_id")
+            patch["showcase_hero_image_asset_id"] = int(raw_hero) if isinstance(raw_hero, int) and raw_hero > 0 else None
+        if "showcase_carousel_image_asset_ids" in patch:
+            patch["showcase_carousel_image_asset_ids"] = self._normalize_image_asset_ids(
+                patch.get("showcase_carousel_image_asset_ids"),
+                limit=20,
+            )
+        entity = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
+        if entity is None:
+            entity = AdminUiSettings(id=1)
+        for key, value in patch.items():
+            setattr(entity, key, value)
+        self.db.add(entity)
+        self.db.commit()
+        self.db.refresh(entity)
+        return self.get_admin_ui_settings()
 
     @staticmethod
     def _supplier_to_response(

@@ -10,9 +10,16 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.models import (
+    AdminUiSettings,
+    ParserBrandMapping,
     ParserCategory,
+    ParserCategoryCountSnapshot,
+    ParserCategoryIndexState,
     ParserCategoryKeyword,
+    ParserCategoryManualProduct,
+    ParserProductCategoryMatch,
     ParserSource,
+    ParserPricingSettings,
     ParserSupplier,
     ParserSupplierShippingRate,
     ParserWeightKeyword,
@@ -26,9 +33,11 @@ from app.repositories import (
     ParserWeightKeywordRepository,
     ParserWeightRuleRepository,
 )
+from app.services.settings.pricing_service import PricingSettingsService
 from app.schemas.parser import (
     SettingsTransferCategoryEntry,
     SettingsTransferCategoryKeywordEntry,
+    SettingsTransferAdminUiSettings,
     SettingsTransferPayload,
     SettingsTransferPricingSettings,
     SettingsTransferResponse,
@@ -56,16 +65,12 @@ _PRICING_EXPORT_FIELDS = [
     "customs_fixed_rub",
     "shipping_alt_threshold_eur",
     "tax_rate",
-    "designers_min_products",
-    "designers_exclude_store_vendors",
     "dedup_only_available_products",
     "show_product_description",
     "svc_rules",
     "insurance_rules",
     "service_fee_rules",
     "shipping_rules",
-    "showcase_hero_image_asset_id",
-    "showcase_carousel_image_asset_ids",
 ]
 
 _PRICING_IMPORT_FIELDS = set(_PRICING_EXPORT_FIELDS)
@@ -120,6 +125,21 @@ class SettingsTransferService:
                 field: getattr(pricing_row, field)
                 for field in _PRICING_EXPORT_FIELDS
             }
+        )
+        ui_row = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
+        admin_ui = SettingsTransferAdminUiSettings(
+            designers_min_products=max(1, int(getattr(ui_row, "designers_min_products", 1) or 1)),
+            designers_exclude_store_vendors=bool(getattr(ui_row, "designers_exclude_store_vendors", False)),
+            showcase_hero_image_asset_id=(
+                int(getattr(ui_row, "showcase_hero_image_asset_id"))
+                if isinstance(getattr(ui_row, "showcase_hero_image_asset_id", None), int)
+                and int(getattr(ui_row, "showcase_hero_image_asset_id")) > 0
+                else None
+            ),
+            showcase_carousel_image_asset_ids=PricingSettingsService._normalize_image_asset_ids(
+                getattr(ui_row, "showcase_carousel_image_asset_ids", None),
+                limit=20,
+            ),
         )
 
         supplier_entries = [
@@ -211,6 +231,7 @@ class SettingsTransferService:
             exported_at=datetime.now(timezone.utc).isoformat(),
             project=_PROJECT_NAME,
             pricing_settings=pricing,
+            admin_ui_settings=admin_ui,
             suppliers=supplier_entries,
             sources=source_entries,
             weight_rules=weight_entries,
@@ -227,6 +248,7 @@ class SettingsTransferService:
 
         supplier_map = self._import_suppliers(payload.suppliers)
         pricing_updated = self._import_pricing(payload.pricing_settings)
+        admin_ui_updated = self._import_admin_ui(payload.admin_ui_settings)
         source_count = self._import_sources(payload.sources, supplier_map=supplier_map)
         weight_count = self._import_weight_rules(payload.weight_rules)
         categories_updated, keywords_updated = self._import_categories(payload.categories, payload.category_keywords)
@@ -239,11 +261,74 @@ class SettingsTransferService:
             imported_at=datetime.now(timezone.utc).isoformat(),
             imported_counts={
                 "pricing_settings_updated": pricing_updated,
+                "admin_ui_settings_updated": admin_ui_updated,
                 "suppliers_upserted": len(supplier_map),
                 "sources_upserted": source_count,
                 "weight_rules_replaced": weight_count,
                 "categories_upserted": categories_updated,
                 "category_keywords_replaced": keywords_updated,
+            },
+        )
+
+    def reset_all(self) -> SettingsTransferResponse:
+        # 1) Reset pricing settings/suppliers to service defaults.
+        self.db.query(ParserSupplierShippingRate).delete(synchronize_session=False)
+        self.db.query(ParserSupplier).delete(synchronize_session=False)
+        self.db.query(ParserPricingSettings).delete(synchronize_session=False)
+        self.db.query(AdminUiSettings).delete(synchronize_session=False)
+        self.db.flush()
+
+        pricing_service = PricingSettingsService(self.db)
+        pricing_service.get_settings(refresh_bybit=False)
+        suppliers = self.supplier_repo.list_all_with_rates()
+        fallback_supplier = next((s for s in suppliers if str(getattr(s, "category", "")) == "main"), suppliers[0] if suppliers else None)
+
+        # 2) Reset sources to neutral defaults.
+        sources_reset = 0
+        for source in self.db.query(ParserSource).filter(ParserSource.deleted_at.is_(None)).all():
+            source.enabled = True
+            source.hide_auto_added_products = False
+            source.promo_factor = 1.0
+            source.promo_only_no_discount = False
+            source.buyout_surcharge_value = 0.0
+            source.buyout_surcharge_currency = "RUB"
+            if fallback_supplier is not None:
+                source.supplier_id = int(fallback_supplier.id)
+            sources_reset += 1
+
+        # 3) Reset weight rules.
+        self.db.query(ParserWeightKeyword).delete(synchronize_session=False)
+        self.db.query(ParserWeightRule).delete(synchronize_session=False)
+
+        # 4) Reset categories customizations.
+        self.db.query(ParserCategoryKeyword).delete(synchronize_session=False)
+        self.db.query(ParserCategoryManualProduct).delete(synchronize_session=False)
+        self.db.query(ParserProductCategoryMatch).delete(synchronize_session=False)
+        self.db.query(ParserCategoryCountSnapshot).delete(synchronize_session=False)
+        self.db.query(ParserCategoryIndexState).delete(synchronize_session=False)
+        categories_reset = 0
+        for category in self.db.query(ParserCategory).filter(ParserCategory.deleted_at.is_(None)).all():
+            category.is_favorite = False
+            category.is_enabled = True
+            categories_reset += 1
+
+        # 5) Reset designers remapping.
+        self.db.query(ParserBrandMapping).delete(synchronize_session=False)
+
+        self.db.commit()
+        return SettingsTransferResponse(
+            ok=True,
+            message="Настройки сброшены к значениям по умолчанию",
+            schema_version=_SCHEMA_VERSION,
+            imported_at=datetime.now(timezone.utc).isoformat(),
+            imported_counts={
+                "pricing_settings_updated": 1,
+                "admin_ui_settings_updated": 1,
+                "suppliers_upserted": len(suppliers),
+                "sources_upserted": sources_reset,
+                "weight_rules_replaced": 0,
+                "categories_upserted": categories_reset,
+                "category_keywords_replaced": 0,
             },
         )
 
@@ -254,6 +339,26 @@ class SettingsTransferService:
         for key, raw_value in values.items():
             if key not in _PRICING_IMPORT_FIELDS:
                 continue
+            if getattr(row, key) != raw_value:
+                setattr(row, key, raw_value)
+                updated_fields += 1
+        return updated_fields
+
+    def _import_admin_ui(self, payload: SettingsTransferAdminUiSettings) -> int:
+        row = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
+        if row is None:
+            row = AdminUiSettings(id=1)
+            self.db.add(row)
+            self.db.flush()
+        updated_fields = 0
+        values = payload.model_dump()
+        normalized = {
+            "designers_min_products": max(1, int(values.get("designers_min_products") or 1)),
+            "designers_exclude_store_vendors": bool(values.get("designers_exclude_store_vendors")),
+            "showcase_hero_image_asset_id": int(values["showcase_hero_image_asset_id"]) if isinstance(values.get("showcase_hero_image_asset_id"), int) and int(values.get("showcase_hero_image_asset_id")) > 0 else None,
+            "showcase_carousel_image_asset_ids": PricingSettingsService._normalize_image_asset_ids(values.get("showcase_carousel_image_asset_ids"), limit=20),
+        }
+        for key, raw_value in normalized.items():
             if getattr(row, key) != raw_value:
                 setattr(row, key, raw_value)
                 updated_fields += 1

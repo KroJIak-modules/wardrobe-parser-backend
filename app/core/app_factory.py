@@ -27,7 +27,9 @@ _SHOWCASE_OPENAPI_PATHS = {
     "/api/v1/catalog/categories/root/{root_slug}",
     "/api/v1/catalog/products",
     "/api/v1/products/{product_id}",
-    "/api/v1/images/{image_id}",
+    "/api/v1/showcase/hero/image",
+    "/api/v1/showcase/carousel",
+    "/api/v1/showcase/carousel/{image_id}/image",
 }
 _SHOWCASE_OPENAPI_OPERATIONS = {
     "/health": {"get"},
@@ -35,7 +37,9 @@ _SHOWCASE_OPENAPI_OPERATIONS = {
     "/api/v1/catalog/categories/root/{root_slug}": {"get"},
     "/api/v1/catalog/products": {"get"},
     "/api/v1/products/{product_id}": {"get"},
-    "/api/v1/images/{image_id}": {"get"},
+    "/api/v1/showcase/hero/image": {"get"},
+    "/api/v1/showcase/carousel": {"get"},
+    "/api/v1/showcase/carousel/{image_id}/image": {"get"},
 }
 
 

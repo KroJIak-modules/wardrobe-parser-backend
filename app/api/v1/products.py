@@ -9,10 +9,14 @@ import logging
 import random
 import unicodedata
 from datetime import datetime
+from io import BytesIO
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -52,6 +56,8 @@ _CATALOG_MAX_LIMIT = 120
 _CATALOG_SCAN_BATCH = 240
 _CATALOG_MAX_SCAN_PAGES = 8
 _NO_BRAND_FILTER_TOKEN = "__NO_BRAND__"
+_PRODUCT_UPLOAD_DIR = Path(__file__).resolve().parents[3] / "uploads" / "products"
+_ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 class InvalidProductStatusError(ValueError):
@@ -195,37 +201,37 @@ def _apply_brand_mapping_to_item(item: dict[str, Any], mapping_service: BrandMap
     item["vendor"] = vendor_display
 
 
-def _compose_effective_image_ids(
+def _compose_effective_image_urls(
     *,
-    source_image_ids: list[int],
+    source_image_urls: list[str],
     images_sync_locked: bool,
-    hidden_source_image_ids: list[int],
-    manual_image_ids: list[int],
+    hidden_source_image_urls: list[str],
+    manual_image_urls: list[str],
     manual_image_order: list[str],
-) -> list[int]:
+) -> list[str]:
     if not images_sync_locked:
-        return list(source_image_ids)
+        return list(source_image_urls)
 
-    hidden_set = set(hidden_source_image_ids)
-    visible_source = [image_id for image_id in source_image_ids if image_id not in hidden_set]
-    source_map = {f"s:{image_id}": image_id for image_id in visible_source}
-    manual_map = {f"m:{image_id}": image_id for image_id in manual_image_ids}
-    merged_map: dict[str, int] = {}
+    hidden_set = set(hidden_source_image_urls)
+    visible_source = [url for url in source_image_urls if url not in hidden_set]
+    source_map = {f"s:{url}": url for url in visible_source}
+    manual_map = {f"m:{url}": url for url in manual_image_urls}
+    merged_map: dict[str, str] = {}
     merged_map.update(source_map)
     merged_map.update(manual_map)
-    ordered: list[int] = []
-    used: set[int] = set()
+    ordered: list[str] = []
+    used: set[str] = set()
     for token in manual_image_order:
-        image_id = merged_map.get(token)
-        if image_id is None or image_id in used:
+        image_url = merged_map.get(token)
+        if image_url is None or image_url in used:
             continue
-        used.add(image_id)
-        ordered.append(image_id)
-    for image_id in [*visible_source, *manual_image_ids]:
-        if image_id in used:
+        used.add(image_url)
+        ordered.append(image_url)
+    for image_url in [*visible_source, *manual_image_urls]:
+        if image_url in used:
             continue
-        used.add(image_id)
-        ordered.append(image_id)
+        used.add(image_url)
+        ordered.append(image_url)
     return ordered
 
 
@@ -243,16 +249,16 @@ def _apply_product_overrides_to_item(
     images_sync_locked = bool(getattr(product, "images_sync_locked", False))
     title_override = getattr(product, "title_override", None)
     description_override = getattr(product, "description_override", None)
-    hidden_source_image_ids = _normalize_int_list(getattr(product, "hidden_source_image_asset_ids", None))
-    manual_image_ids = _normalize_int_list(getattr(product, "manual_image_asset_ids", None))
+    hidden_source_image_urls = _normalize_image_urls(getattr(product, "hidden_source_image_asset_ids", None))
+    manual_image_urls = _normalize_image_urls(getattr(product, "manual_image_asset_ids", None))
     manual_image_order = _normalize_image_order_tokens(getattr(product, "manual_image_order", None))
 
-    source_image_ids = _normalize_int_list(item.get("image_ids"))
-    effective_image_ids = _compose_effective_image_ids(
-        source_image_ids=source_image_ids,
+    source_image_urls = _normalize_image_urls(item.get("image_urls"))
+    effective_image_urls = _compose_effective_image_urls(
+        source_image_urls=source_image_urls,
         images_sync_locked=images_sync_locked,
-        hidden_source_image_ids=hidden_source_image_ids,
-        manual_image_ids=manual_image_ids,
+        hidden_source_image_urls=hidden_source_image_urls,
+        manual_image_urls=manual_image_urls,
         manual_image_order=manual_image_order,
     )
 
@@ -267,8 +273,8 @@ def _apply_product_overrides_to_item(
     )
     if not effective_show_description:
         item["description"] = None
-    item["image_ids"] = effective_image_ids
-    item["image_count"] = len(effective_image_ids)
+    item["image_urls"] = effective_image_urls
+    item["image_count"] = len(effective_image_urls)
     item["product_edit"] = {
         "title_sync_locked": title_sync_locked,
         "description_sync_locked": description_sync_locked,
@@ -277,10 +283,10 @@ def _apply_product_overrides_to_item(
         "images_sync_locked": images_sync_locked,
         "title_override": title_override,
         "description_override": description_override,
-        "hidden_source_image_ids": hidden_source_image_ids,
-        "manual_image_ids": manual_image_ids,
+        "hidden_source_image_urls": hidden_source_image_urls,
+        "manual_image_urls": manual_image_urls,
         "manual_image_order": manual_image_order,
-        "source_image_ids": source_image_ids,
+        "source_image_urls": source_image_urls,
     }
 
 
@@ -300,59 +306,34 @@ def _normalize_image_urls(raw: Any) -> list[str]:
     return result
 
 
-def _resolve_image_asset_ids_for_products(db: Session, products: list[ParserProduct]) -> dict[int, list[int]]:
-    """Resolve image ids for response without mutating parser_product rows."""
-    if not products:
-        return {}
-
-    targets: list[tuple[int, list[str], list[int]]] = []
-    all_urls: set[str] = set()
-    for product in products:
-        existing_ids = _normalize_int_list(product.image_asset_ids)
-        urls = _normalize_image_urls(product.image_urls)
-        if existing_ids:
-            targets.append((int(product.id), urls, existing_ids))
-            continue
-        if not urls:
-            continue
-        targets.append((int(product.id), urls, []))
-        all_urls.update(urls)
-
-    if not targets:
-        return {}
-
-    asset_by_url: dict[str, ImageAsset] = {}
-    if all_urls:
-        existing_assets = (
-            db.query(ImageAsset)
-            .filter(ImageAsset.deleted_at.is_(None))
-            .filter(ImageAsset.source_url.in_(list(all_urls)))
-            .all()
-        )
-        asset_by_url = {str(asset.source_url): asset for asset in existing_assets}
-    created_any = False
-
-    for url in all_urls:
-        if url in asset_by_url:
-            continue
-        asset = ImageAsset(source_url=url, storage_mode="proxy")
-        db.add(asset)
-        asset_by_url[url] = asset
-        created_any = True
-
-    if created_any:
-        db.flush()
-        db.commit()
-
-    resolved_by_product_id: dict[int, list[int]] = {}
-    for product_id, urls, existing_ids in targets:
-        if existing_ids:
-            resolved_by_product_id[product_id] = existing_ids
-            continue
-        resolved_ids = [int(asset_by_url[url].id) for url in urls if asset_by_url.get(url) is not None and asset_by_url[url].id is not None]
-        if resolved_ids:
-            resolved_by_product_id[product_id] = resolved_ids
-    return resolved_by_product_id
+def _save_manual_product_image(file: UploadFile, db: Session) -> int:
+    if not file.filename:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Файл не передан")
+    extension = Path(file.filename).suffix.lower()
+    if extension not in _ALLOWED_IMAGE_EXTENSIONS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Недопустимый формат изображения")
+    content = file.file.read()
+    if not content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Пустой файл")
+    try:
+        with Image.open(BytesIO(content)) as img:
+            img.verify()
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Файл не является корректным изображением")
+    _PRODUCT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    safe_stem = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in Path(file.filename).stem.lower()).strip("-") or "product"
+    file_name = f"{safe_stem}-{int(datetime.now().timestamp() * 1000)}-{random.randint(1000, 9999)}{extension}"
+    target = _PRODUCT_UPLOAD_DIR / file_name
+    target.write_bytes(content)
+    asset = ImageAsset(
+        source_url=f"stored://product/{file_name}",
+        storage_mode="stored_file",
+        stored_path=str(target),
+    )
+    db.add(asset)
+    db.commit()
+    db.refresh(asset)
+    return int(asset.id)
 
 
 def _extract_product_description(item: dict[str, Any]) -> str | None:
@@ -393,7 +374,6 @@ def _project_catalog_item(item: dict[str, Any]) -> dict[str, Any]:
         "status": str(item.get("status") or "hidden"),
         "image_count": int(item.get("image_count") or 0),
         "image_urls": list(item.get("image_urls") or []),
-        "image_ids": _normalize_int_list(item.get("image_ids")),
         "buyout_price_rub": _extract_buyout_price_rub(item),
         "is_favorite": bool(item.get("is_favorite")),
     }
@@ -423,7 +403,6 @@ def _project_showcase_product_detail(item: dict[str, Any]) -> dict[str, Any]:
         "final_currency": item.get("final_currency"),
         "status": str(item.get("status") or "hidden"),
         "image_urls": list(item.get("image_urls") or []),
-        "image_ids": _normalize_int_list(item.get("image_ids")),
         "variants": list(item.get("variants") or []),
         "internal_category_name": item.get("internal_category_name"),
         "internal_category_names": list(item.get("internal_category_names") or []),
@@ -464,9 +443,6 @@ def _sort_products_for_display(items: list[dict[str, Any]]) -> None:
 
 
 def _resolve_primary_image_url(item: dict[str, Any]) -> str | None:
-    image_ids = _normalize_int_list(item.get("image_ids"))
-    if image_ids:
-        return f"/api/v1/images/{int(image_ids[0])}"
     image_urls = _normalize_image_urls(item.get("image_urls"))
     if image_urls:
         return image_urls[0]
@@ -785,7 +761,6 @@ def _product_row_to_item(product: ParserProduct, *, default_show_description: bo
         "auto_hide_force_visible": bool(getattr(product, "auto_hide_force_visible", False)),
         "image_count": int(product.image_count or 0),
         "image_urls": list(product.image_urls or []),
-        "image_ids": list(product.image_asset_ids or []),
         "variants": list(product.variants or []),
         "weight_grams": product.weight_grams,
         "weight_source": product.weight_source,
@@ -867,7 +842,6 @@ def _project_admin_table_item(item: dict[str, Any]) -> dict[str, Any]:
         "status": str(item.get("status") or "hidden"),
         "image_count": int(item.get("image_count") or 0),
         "image_urls": list(item.get("image_urls") or []),
-        "image_ids": _normalize_int_list(item.get("image_ids")),
         "source_price": _safe_float(item.get("source_price")),
         "source_currency": item.get("source_currency"),
         "final_price": _safe_float(item.get("final_price")),
@@ -945,7 +919,6 @@ def get_admin_products_table(
         .limit(int(limit))
         .all()
     )
-    resolved_image_ids = _resolve_image_asset_ids_for_products(db, rows)
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
@@ -986,8 +959,6 @@ def get_admin_products_table(
     for row in rows:
         raw_item = _product_row_to_item(row, default_show_description=default_show_description)
         _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
-        if int(row.id) in resolved_image_ids:
-            raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
         _apply_internal_categories_from_ids(
             raw_item,
             product_id=int(row.id),
@@ -1338,7 +1309,6 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
                                 "status": "available",
                                 "image_count": 4,
                                 "image_urls": [],
-                                "image_ids": [5011, 5012],
                                 "buyout_price_rub": 15450.0,
                                 "is_favorite": False,
                             }
@@ -1492,8 +1462,7 @@ def get_catalog_products(
         )
         if not rows:
             break
-        resolved_image_ids = _resolve_image_asset_ids_for_products(db, rows)
-
+    
         product_ids = {int(item.id) for item in rows}
         manual_map = manual_repo.get_grouped_by_product_ids(product_ids)
         indexed_category_ids = category_index_service.get_grouped_category_ids(product_ids)
@@ -1509,8 +1478,6 @@ def get_catalog_products(
         for row in rows:
             raw_item = _product_row_to_item(row, default_show_description=default_show_description)
             _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
-            if int(row.id) in resolved_image_ids:
-                raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
             _apply_internal_categories_from_ids(
                 raw_item,
                 product_id=int(row.id),
@@ -1626,7 +1593,6 @@ def get_admin_products(
         .limit(int(limit))
         .all()
     )
-    resolved_image_ids = _resolve_image_asset_ids_for_products(db, rows)
 
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
@@ -1667,8 +1633,6 @@ def get_admin_products(
     for row in rows:
         raw_item = _product_row_to_item(row, default_show_description=default_show_description)
         _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
-        if int(row.id) in resolved_image_ids:
-            raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
         _apply_internal_categories_from_ids(
             raw_item,
             product_id=int(row.id),
@@ -1746,13 +1710,10 @@ def get_pricing_example_product(
             detail="Не удалось выбрать товар для примера ценообразования",
         )
 
-    resolved_image_ids = _resolve_image_asset_ids_for_products(db, [row])
     settings_service = PricingSettingsService(db)
     settings = settings_service.get_settings(refresh_bybit=False)
     default_show_description = bool(getattr(settings, "show_product_description", True))
     raw_item = _product_row_to_item(row, default_show_description=default_show_description)
-    if int(row.id) in resolved_image_ids:
-        raw_item["image_ids"] = list(resolved_image_ids[int(row.id)])
     try:
         weight_rules = WeightRuleService(db).get_matching_rules()
     except Exception:
@@ -1817,7 +1778,6 @@ def get_pricing_example_product(
                         "final_currency": "RUB",
                         "status": "available",
                         "image_urls": [],
-                        "image_ids": [5011, 5012, 5013],
                         "variants": [
                             {"title": "M", "available": True, "inventory_quantity": 2, "price": "165.0"},
                             {"title": "L", "available": False, "inventory_quantity": 0, "price": "165.0"},
@@ -1875,8 +1835,6 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
     if local_product is not None and str(local_product.status or "").strip().lower() == "unavailable":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
     if local_product is not None:
-        resolved_single = _resolve_image_asset_ids_for_products(db, [local_product])
-        payload["image_ids"] = list(resolved_single.get(int(local_product.id), list(local_product.image_asset_ids or [])))
         if isinstance(local_product.image_urls, list) and local_product.image_urls:
             payload["image_urls"] = list(local_product.image_urls or [])
         _apply_product_overrides_to_item(
@@ -2003,11 +1961,11 @@ async def update_product(
             product.description_visible_override = bool(description_visible_override_payload)
 
     if has_image_patch:
-        hidden_source_ids = _normalize_int_list(image_patch.get("hidden_source_image_ids"))
-        manual_image_ids = _normalize_int_list(image_patch.get("manual_image_ids"))
+        hidden_source_urls = _normalize_image_urls(image_patch.get("hidden_source_image_urls"))
+        manual_image_urls = _normalize_image_urls(image_patch.get("manual_image_urls"))
         manual_image_order = _normalize_image_order_tokens(image_patch.get("manual_image_order"))
-        product.hidden_source_image_asset_ids = hidden_source_ids
-        product.manual_image_asset_ids = manual_image_ids
+        product.hidden_source_image_asset_ids = hidden_source_urls
+        product.manual_image_asset_ids = manual_image_urls
         product.manual_image_order = manual_image_order
         product.images_sync_locked = True
 
@@ -2061,7 +2019,6 @@ async def update_product(
         "status": effective_status,
         "image_count": int(product.image_count or 0),
         "image_urls": list(product.image_urls or []),
-        "image_ids": list(product.image_asset_ids or []),
         "variants": list(product.variants or []),
         "weight_grams": product.weight_grams,
         "weight_source": product.weight_source,
@@ -2102,6 +2059,27 @@ async def update_product(
         }
     )
     return JSONResponse(content=patched_payload)
+
+
+@router.post("/products/upload-image")
+async def upload_product_image(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+):
+    image_asset_id = _save_manual_product_image(file, db)
+    return {"ok": True, "image_asset_id": image_asset_id}
+
+
+@router.get("/products/images/{image_id}")
+def get_product_manual_image(image_id: int, db: Session = Depends(get_db)):
+    asset = db.query(ImageAsset).filter(ImageAsset.id == image_id, ImageAsset.deleted_at.is_(None)).one_or_none()
+    if asset is None or asset.storage_mode != "stored_file" or not asset.stored_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Изображение не найдено")
+    path = Path(asset.stored_path)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Файл изображения не найден")
+    return FileResponse(path)
 
 
 @router.get("/products/{product_id}/starred-categories")

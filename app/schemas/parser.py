@@ -89,7 +89,6 @@ class CatalogProductCardResponse(BaseModel):
     status: str
     image_count: int = 0
     image_urls: list[str] = Field(default_factory=list)
-    image_ids: list[int] = Field(default_factory=list)
     buyout_price_rub: float | None = None
     is_favorite: bool = False
 
@@ -155,16 +154,12 @@ class PricingSettingsUpdateRequest(BaseModel):
     customs_fixed_rub: float | None = Field(default=None, ge=0.0, le=1_000_000.0)
     shipping_alt_threshold_eur: float | None = Field(default=None, ge=0.0, le=100_000.0)
     tax_rate: float | None = Field(default=None, ge=0.0, le=1.0)
-    designers_min_products: int | None = Field(default=None, ge=1, le=1_000_000)
-    designers_exclude_store_vendors: bool | None = None
     dedup_only_available_products: bool | None = None
     show_product_description: bool | None = None
     svc_rules: list[dict] | None = None
     insurance_rules: list[dict] | None = None
     service_fee_rules: list[dict] | None = None
     shipping_rules: dict[str, dict[str, list[dict]]] | None = None
-    showcase_hero_image_asset_id: int | None = None
-    showcase_carousel_image_asset_ids: list[int] | None = None
 
 
 class ShowcaseMediaSettingsUpdateRequest(BaseModel):
@@ -176,6 +171,28 @@ class ShowcaseMediaSettingsResponse(BaseModel):
     showcase_hero_image_asset_id: int | None = None
     showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
     carousel_limit: int = 20
+
+
+class ShowcaseHeroSetRequest(BaseModel):
+    image_asset_id: int = Field(ge=1)
+
+
+class ShowcaseCarouselOrderRequest(BaseModel):
+    items: list[int] = Field(default_factory=list)
+
+
+class AdminUiSettingsResponse(BaseModel):
+    designers_min_products: int = Field(ge=1, le=1_000_000)
+    designers_exclude_store_vendors: bool = False
+    showcase_hero_image_asset_id: int | None = None
+    showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
+
+
+class AdminUiSettingsUpdateRequest(BaseModel):
+    designers_min_products: int | None = Field(default=None, ge=1, le=1_000_000)
+    designers_exclude_store_vendors: bool | None = None
+    showcase_hero_image_asset_id: int | None = None
+    showcase_carousel_image_asset_ids: list[int] | None = None
 
 
 class PricingSupplierRateResponse(BaseModel):
@@ -230,16 +247,12 @@ class PricingSettingsResponse(BaseModel):
     customs_fixed_rub: float
     shipping_alt_threshold_eur: float
     tax_rate: float
-    designers_min_products: int
-    designers_exclude_store_vendors: bool
     dedup_only_available_products: bool
     show_product_description: bool
     svc_rules: list[dict] = Field(default_factory=list)
     insurance_rules: list[dict] = Field(default_factory=list)
     service_fee_rules: list[dict] = Field(default_factory=list)
     shipping_rules: dict[str, dict[str, list[dict]]] = Field(default_factory=dict)
-    showcase_hero_image_asset_id: int | None = None
-    showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
     bybit_rate_status: str = "unknown"
     bybit_rate_warning: str | None = None
     bybit_bucket_step_usdt: int = 0
@@ -271,14 +284,17 @@ class SettingsTransferPricingSettings(BaseModel):
     customs_fixed_rub: float
     shipping_alt_threshold_eur: float
     tax_rate: float
-    designers_min_products: int = Field(ge=1, le=1_000_000)
-    designers_exclude_store_vendors: bool = False
     dedup_only_available_products: bool = False
     show_product_description: bool = True
     svc_rules: list[dict] = Field(default_factory=list)
     insurance_rules: list[dict] = Field(default_factory=list)
     service_fee_rules: list[dict] = Field(default_factory=list)
     shipping_rules: dict[str, dict[str, list[dict]]] = Field(default_factory=dict)
+
+
+class SettingsTransferAdminUiSettings(BaseModel):
+    designers_min_products: int = Field(ge=1, le=1_000_000)
+    designers_exclude_store_vendors: bool = False
     showcase_hero_image_asset_id: int | None = None
     showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
 
@@ -336,6 +352,7 @@ class SettingsTransferPayload(BaseModel):
     exported_at: str | None = None
     project: str | None = None
     pricing_settings: SettingsTransferPricingSettings
+    admin_ui_settings: SettingsTransferAdminUiSettings
     suppliers: list[SettingsTransferSupplierEntry] = Field(default_factory=list)
     sources: list[SettingsTransferSourceEntry] = Field(default_factory=list)
     weight_rules: list[SettingsTransferWeightRuleEntry] = Field(default_factory=list)
@@ -367,7 +384,6 @@ class ProductResponse(BaseModel):
     status: str = "available"
     image_count: int = 0
     image_urls: list[str] = Field(default_factory=list)
-    image_ids: list[int] = Field(default_factory=list)
     weight_grams: float | None = None
     weight_source: str | None = None
     weight_match_keyword: str | None = None
@@ -406,7 +422,6 @@ class ShowcaseProductResponse(BaseModel):
     final_currency: str | None = None
     status: str = "available"
     image_urls: list[str] = Field(default_factory=list)
-    image_ids: list[int] = Field(default_factory=list)
     variants: list[dict] = Field(default_factory=list)
     internal_category_name: str | None = None
     internal_category_names: list[str] = Field(default_factory=list)

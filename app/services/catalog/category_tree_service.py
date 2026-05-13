@@ -10,11 +10,10 @@ from fastapi import HTTPException, status
 from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
-from app.models import ParserBrandMapping, ParserCategory, ParserCategoryKeyword, ParserProduct, ParserSource
+from app.models import AdminUiSettings, ParserBrandMapping, ParserCategory, ParserCategoryKeyword, ParserProduct, ParserSource
 from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
-    ParserPricingSettingsRepository,
     ParserCategoryRepository,
     ParserProductRepository,
     ParserSourceRepository,
@@ -54,7 +53,6 @@ class CategoryTreeService:
         self.manual_product_repo = ParserCategoryManualProductRepository(db)
         self.product_repo = ParserProductRepository(db)
         self.source_repo = ParserSourceRepository(db)
-        self.pricing_repo = ParserPricingSettingsRepository(db)
         self.category_index_service = CategoryIndexService(db)
 
     def _build_tree(self, categories: list[ParserCategory], designers_root: ParserCategory | None) -> list[CategoryTreeNodeResponse]:
@@ -122,7 +120,7 @@ class CategoryTreeService:
         cls._last_designers_mapping_signature = mapping_signature
 
     def _get_designers_min_products(self) -> int:
-        settings_row = self.pricing_repo.get_singleton()
+        settings_row = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
         if settings_row is None:
             return 1
         raw_value = getattr(settings_row, "designers_min_products", 1)
@@ -132,7 +130,7 @@ class CategoryTreeService:
             return 1
 
     def _get_designers_exclude_store_vendors(self) -> bool:
-        settings_row = self.pricing_repo.get_singleton()
+        settings_row = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
         if settings_row is None:
             return False
         return bool(getattr(settings_row, "designers_exclude_store_vendors", False))
