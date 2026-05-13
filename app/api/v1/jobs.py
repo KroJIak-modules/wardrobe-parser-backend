@@ -232,6 +232,32 @@ def _find_backend_source(db, source_key: str) -> ParserSource | None:
     return None
 
 
+def _update_source_sync_telemetry(
+    source_key: str,
+    *,
+    status: str | None = None,
+    finished_at: datetime | None = None,
+    duration_sec: int | None = None,
+) -> None:
+    db = SessionLocal()
+    try:
+        source = _find_backend_source(db, source_key)
+        if source is None:
+            return
+        if finished_at is not None:
+            source.last_sync_at = finished_at
+        if duration_sec is not None:
+            source.last_sync_duration_sec = max(0, int(duration_sec))
+        if status is not None:
+            source.last_sync_status = str(status).strip().lower()[:32] or None
+        db.commit()
+    except Exception:
+        db.rollback()
+        LOGGER.exception("failed to update source sync telemetry source_key=%s", source_key)
+    finally:
+        db.close()
+
+
 def _derive_status(variants: Any) -> str:
     if not isinstance(variants, list) or not variants:
         return "available"
@@ -392,6 +418,7 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
     terminal = {"completed", "failed", "cancelled"}
     if agg_job.applied_batch_ids is None:
         agg_job.applied_batch_ids = set()
+    source_started_at: dict[str, datetime] = {}
     while True:
         latest = STATE.get_latest()
         if latest is None or latest.job_id != agg_job.job_id:
@@ -443,6 +470,25 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
                     agg_job.current_stage = evt_type
                 agg_job.current_source_name = str(evt_payload.get("source_key") or agg_job.current_source_name or "").strip() or agg_job.current_source_name
                 agg_job.current_source_index = int(evt_payload.get("source_index") or agg_job.current_source_index or 0)
+            if evt_type == "source_started":
+                source_key = str(evt_payload.get("source_key") or "").strip()
+                if source_key:
+                    source_started_at[source_key] = _utcnow()
+            if evt_type == "source_finished":
+                source_key = str(evt_payload.get("source_key") or "").strip()
+                source_status = str(evt_payload.get("status") or "").strip().lower() or "completed"
+                finished_at = _utcnow()
+                started_at = source_started_at.get(source_key)
+                duration_sec = None
+                if started_at is not None:
+                    duration_sec = int(max(0.0, (finished_at - started_at).total_seconds()))
+                if source_key:
+                    _update_source_sync_telemetry(
+                        source_key,
+                        status=source_status,
+                        finished_at=finished_at,
+                        duration_sec=duration_sec,
+                    )
             if str(evt.get("type") or "") != "product_batch":
                 continue
             event_payload = evt_payload
@@ -456,6 +502,18 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
             items = event_payload.get("items") if isinstance(event_payload.get("items"), list) else []
             cast_items = [item for item in items if isinstance(item, dict)]
             expected, applied = _upsert_products_from_items(source_key=source_key, items=cast_items)
+            if source_key:
+                finished_at = _utcnow()
+                duration_sec = None
+                started_at = source_started_at.get(source_key)
+                if started_at is not None:
+                    duration_sec = int(max(0.0, (finished_at - started_at).total_seconds()))
+                _update_source_sync_telemetry(
+                    source_key,
+                    status="completed",
+                    finished_at=finished_at,
+                    duration_sec=duration_sec,
+                )
             agg_job.expected_db_upserts += expected
             agg_job.db_upserts_done += applied
             agg_job.failed_products += max(0, expected - applied)
@@ -476,6 +534,10 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
         _persist_runtime(agg_job)
 
         if agg_job.status in terminal:
+            try:
+                _backfill_source_sync_telemetry_from_events(agg_job.service_job_id)
+            except Exception:
+                LOGGER.exception("failed to backfill source sync telemetry service_job_id=%s", agg_job.service_job_id)
             agg_job.completed_at = _utcnow()
             agg_job.can_cancel = False
             if not agg_job.current_stage:
@@ -484,6 +546,61 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
             return
 
         sleep(POLL_INTERVAL_SEC)
+
+
+def _parse_event_ts(raw: Any) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        txt = str(raw).strip()
+        if not txt:
+            return None
+        if txt.endswith("Z"):
+            txt = txt[:-1] + "+00:00"
+        return datetime.fromisoformat(txt)
+    except Exception:
+        return None
+
+
+def _backfill_source_sync_telemetry_from_events(service_job_id: str) -> None:
+    base = _service_sync_base()
+    cursor = 0
+    started: dict[str, datetime] = {}
+    while True:
+        res = requests.get(
+            f"{base}/jobs/{service_job_id}/events",
+            params={"cursor": cursor, "limit": 250},
+            timeout=(5, 30),
+        )
+        res.raise_for_status()
+        payload = res.json() if isinstance(res.json(), dict) else {}
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        next_cursor = int(payload.get("next_cursor") or cursor)
+        for evt in items:
+            if not isinstance(evt, dict):
+                continue
+            evt_type = str(evt.get("type") or "").strip()
+            evt_payload = evt.get("payload") if isinstance(evt.get("payload"), dict) else {}
+            source_key = str(evt_payload.get("source_key") or "").strip()
+            if not source_key:
+                continue
+            ts = _parse_event_ts(evt.get("ts")) or _utcnow()
+            if evt_type == "source_started":
+                started[source_key] = ts
+            elif evt_type == "source_finished":
+                status = str(evt_payload.get("status") or "").strip().lower() or "completed"
+                duration_sec = None
+                if source_key in started:
+                    duration_sec = int(max(0.0, (ts - started[source_key]).total_seconds()))
+                _update_source_sync_telemetry(
+                    source_key,
+                    status=status,
+                    finished_at=ts,
+                    duration_sec=duration_sec,
+                )
+        if next_cursor <= cursor:
+            break
+        cursor = next_cursor
 
 
 @router.post("/jobs")

@@ -21,7 +21,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models import ImageAsset, ParserBrandMapping, ParserCategory, ParserProduct, ParserProductCategoryMatch
+from app.models import ImageAsset, ParserBrandMapping, ParserCategory, ParserProduct, ParserProductCategoryMatch, ParserSource
 from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
@@ -92,6 +92,14 @@ def _assert_allowed_product_status(value: Any) -> str:
     if normalized not in _ALLOWED_PRODUCT_STATUSES:
         raise InvalidProductStatusError(f"Invalid product status in storage: {normalized!r}")
     return normalized
+
+
+def _with_active_sources(query):
+    return (
+        query.join(ParserSource, ParserSource.id == ParserProduct.source_id)
+        .filter(ParserSource.deleted_at.is_(None))
+        .filter(ParserSource.enabled.is_(True))
+    )
 
 
 def _variant_is_available(variant: Any) -> bool:
@@ -589,6 +597,41 @@ def _apply_backend_pricing_to_item(
         is_auto_added=bool(item.get("is_auto_added", True)),
         auto_hide_force_visible=bool(item.get("auto_hide_force_visible", False)),
     )
+    if source_profile is not None and not bool(getattr(source_profile, "enabled", True)):
+        item["status"] = "unavailable"
+
+    # Source-level attribute visibility rules.
+    if source_profile is not None and not bool(getattr(source_profile, "show_description", True)):
+        item["description"] = None
+        product_edit = item.get("product_edit")
+        if isinstance(product_edit, dict):
+            product_edit["description_visible_effective"] = False
+
+    if source_profile is not None and not bool(getattr(source_profile, "show_images", True)):
+        product_edit = item.get("product_edit")
+        manual_urls = []
+        manual_order = []
+        if isinstance(product_edit, dict):
+            manual_urls = _normalize_image_urls(product_edit.get("manual_image_urls"))
+            manual_order = _normalize_image_order_tokens(product_edit.get("manual_image_order"))
+        manual_map = {f"m:{url}": url for url in manual_urls}
+        ordered: list[str] = []
+        used: set[str] = set()
+        for token in manual_order:
+            if not token.startswith("m:"):
+                continue
+            image_url = manual_map.get(token)
+            if image_url is None or image_url in used:
+                continue
+            used.add(image_url)
+            ordered.append(image_url)
+        for image_url in manual_urls:
+            if image_url in used:
+                continue
+            used.add(image_url)
+            ordered.append(image_url)
+        item["image_urls"] = ordered
+        item["image_count"] = len(ordered)
     product_id = _safe_int(item.get("id"))
     starred_ids = []
     if favorite_manual_category_ids_by_product is not None and product_id is not None:
@@ -877,7 +920,7 @@ def get_admin_products_table(
     decoded_cursor: tuple[datetime, int] | None = _decode_cursor(cursor) if cursor else None
 
     base_query = (
-        db.query(ParserProduct)
+        _with_active_sources(db.query(ParserProduct))
         .filter(ParserProduct.deleted_at.is_(None))
         .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
     )
@@ -897,7 +940,7 @@ def get_admin_products_table(
         or 0
     )
     overall_total = (
-        db.query(func.count(ParserProduct.id))
+        _with_active_sources(db.query(func.count(ParserProduct.id)))
         .filter(ParserProduct.deleted_at.is_(None))
         .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
         .scalar()
@@ -1160,7 +1203,7 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
     if upstream.status_code >= 400:
         limit = max(1, min(200, _safe_int(request.query_params.get("limit")) or 100))
         offset = max(0, _safe_int(request.query_params.get("offset")) or 0)
-        q = db.query(ParserProduct).filter(ParserProduct.deleted_at.is_(None)).order_by(ParserProduct.id.desc())
+        q = _with_active_sources(db.query(ParserProduct)).filter(ParserProduct.deleted_at.is_(None)).order_by(ParserProduct.id.desc())
         total = int(q.count())
         rows = q.offset(offset).limit(limit).all()
         return JSONResponse(
@@ -1216,7 +1259,7 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
     local_product_map: dict[int, ParserProduct] = {}
     if product_ids:
         for local_product in (
-            db.query(ParserProduct)
+            _with_active_sources(db.query(ParserProduct))
             .filter(ParserProduct.deleted_at.is_(None))
             .filter(ParserProduct.id.in_(list(product_ids)))
             .all()
@@ -1402,6 +1445,9 @@ def get_catalog_products(
     for _ in range(_CATALOG_MAX_SCAN_PAGES):
         query = (
             product_repo.query()
+            .join(ParserSource, ParserSource.id == ParserProduct.source_id)
+            .filter(ParserSource.deleted_at.is_(None))
+            .filter(ParserSource.enabled.is_(True))
             .filter(ParserProduct.deleted_at.is_(None))
             .filter(ParserProduct.status.in_(tuple(_PUBLIC_PRODUCT_STATUSES)))
         )
@@ -1558,7 +1604,7 @@ def get_admin_products(
     decoded_cursor: tuple[datetime, int] | None = _decode_cursor(cursor) if cursor else None
 
     base_query = (
-        db.query(ParserProduct)
+        _with_active_sources(db.query(ParserProduct))
         .filter(ParserProduct.deleted_at.is_(None))
         .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
     )
@@ -1679,7 +1725,7 @@ def get_pricing_example_product(
     _: object = Depends(require_admin_access),
 ) -> dict[str, Any]:
     base_query = (
-        db.query(ParserProduct)
+        _with_active_sources(db.query(ParserProduct))
         .filter(ParserProduct.deleted_at.is_(None))
         .filter(ParserProduct.status.in_(tuple(_ALLOWED_PRODUCT_STATUSES)))
         .filter(ParserProduct.status == "available")

@@ -87,6 +87,36 @@ def _products_count(db: Session, source_id: int) -> int:
     )
 
 
+def _as_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _variant_available(variant: object) -> bool:
+    if not isinstance(variant, dict):
+        return False
+    raw = variant.get("available")
+    if isinstance(raw, bool):
+        return raw
+    if raw is not None and str(raw).strip().lower() in {"1", "true", "yes", "y", "in_stock"}:
+        return True
+    try:
+        qty = float(variant.get("inventory_quantity"))
+        return qty > 0
+    except Exception:
+        return False
+
+
+def _derive_status_from_variants(current_status: str, variants: object) -> str:
+    normalized = str(current_status or "").strip().lower()
+    if normalized == "unavailable":
+        return normalized
+    if isinstance(variants, list) and any(_variant_available(v) for v in variants):
+        return "available"
+    return "out_of_stock"
+
+
 def _map_source(db: Session, item: dict) -> dict:
     source_key = str(item.get("key") or "").strip()
     source_url = str(item.get("url") or "").strip()
@@ -98,19 +128,19 @@ def _map_source(db: Session, item: dict) -> dict:
         "name": str(profile.name if profile is not None else source_key),
         "base_url": source_url,
         "parser_type": "parser",
-        "enabled": bool(profile.enabled) if profile is not None else True,
+        "enabled": _as_bool(getattr(profile, "enabled", None), True) if profile is not None else True,
         "sync_enabled": bool(item.get("sync_enabled", True)),
-        "hide_auto_added_products": bool(profile.hide_auto_added_products) if profile is not None else False,
-        "show_description": bool(getattr(profile, "show_description", True)) if profile is not None else True,
-        "show_images": bool(getattr(profile, "show_images", True)) if profile is not None else True,
+        "hide_auto_added_products": _as_bool(getattr(profile, "hide_auto_added_products", None), False) if profile is not None else False,
+        "show_description": _as_bool(getattr(profile, "show_description", None), True) if profile is not None else True,
+        "show_images": _as_bool(getattr(profile, "show_images", None), True) if profile is not None else True,
         "currency_priority": _currency_priority_from_config(item.get("config")),
         "notes": None,
         "status_label": None,
         "products_count": _products_count(db, profile_id) if profile is not None else 0,
         "categories_count": 0,
-        "last_sync_at": None,
-        "last_sync_duration_sec": None,
-        "last_sync_status": None,
+        "last_sync_at": getattr(profile, "last_sync_at", None) if profile is not None else None,
+        "last_sync_duration_sec": int(getattr(profile, "last_sync_duration_sec", 0) or 0) if profile is not None else 0,
+        "last_sync_status": str(getattr(profile, "last_sync_status", "") or "").strip() or None if profile is not None else None,
     }
 
 
@@ -176,6 +206,25 @@ def patch_hide_auto(source_key: str, payload: HideAutoPayload, db: Session = Dep
     if profile is None:
         raise HTTPException(status_code=404, detail=f"backend source profile not found: {source_key}")
     profile.hide_auto_added_products = bool(payload.hide_auto_added_products)
+    rows = (
+        db.query(ParserProduct)
+        .filter(ParserProduct.deleted_at.is_(None))
+        .filter(ParserProduct.source_id == int(profile.id))
+        .all()
+    )
+    if bool(payload.hide_auto_added_products):
+        for product in rows:
+            if bool(getattr(product, "is_auto_added", True)):
+                product.status = "hidden"
+                product.auto_hide_force_visible = False
+    else:
+        for product in rows:
+            if str(getattr(product, "status", "")).strip().lower() != "hidden":
+                continue
+            if not bool(getattr(product, "is_auto_added", True)):
+                continue
+            product.status = _derive_status_from_variants(str(product.status or ""), product.variants)
+            product.auto_hide_force_visible = False
     db.commit()
     db.refresh(profile)
     return _map_source(db, src)
