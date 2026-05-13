@@ -46,7 +46,7 @@ class DedupService:
         self.source_repo = ParserSourceRepository(db)
 
     @staticmethod
-    def _normalize_legacy_source_price(price: float | None, currency: str | None) -> float | None:
+    def _normalize_source_price(price: float | None, currency: str | None) -> float | None:
         _ = currency
         if price is None:
             return None
@@ -67,7 +67,7 @@ class DedupService:
         effective_prices: dict[int, float | None] = {}
         for product in products:
             source_profile = source_profile_map.get(int(product.source_id))
-            source_price = self._normalize_legacy_source_price(product.price, product.currency)
+            source_price = self._normalize_source_price(product.price, product.currency)
             source_currency = str(product.currency or "").upper() or None
             pricing = settings_service.calculate_for_product(
                 source_price=source_price,

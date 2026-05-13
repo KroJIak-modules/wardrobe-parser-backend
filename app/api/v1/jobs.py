@@ -1,31 +1,32 @@
-"""Backend sync orchestrator over parser-service /sync API.
-
-Runs one service job per source with sync_enabled=true and exposes legacy
-/admin-friendly /jobs endpoints consumed by frontend.
-"""
+"""Backend sync orchestration over parser-service /sync/jobs contract."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Lock, Thread
-from time import monotonic, sleep
+from time import sleep
 from typing import Any
 
+import logging
 import requests
 from fastapi import APIRouter, HTTPException, status
-import logging
+from pydantic import BaseModel
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.models import ParserProduct, ParserSource
+from app.models import ParserProduct, ParserSource, SyncAppliedBatch, SyncJobRuntime
 
 
 router = APIRouter(tags=["jobs"])
 LOGGER = logging.getLogger(__name__)
 
-SOURCE_JOB_TIMEOUT_SEC = 20 * 60
 POLL_INTERVAL_SEC = 2.0
+
+
+class StartSyncRequest(BaseModel):
+    triggered_by: str | None = "manual"
+    sources: list[str] | None = None
 
 
 def _utcnow() -> datetime:
@@ -51,36 +52,16 @@ def _service_sync_base() -> str:
     return f"{settings.service_base_url.rstrip('/')}/api/v1/sync"
 
 
-def _load_sync_enabled_sources() -> list[dict[str, Any]]:
-    base = _service_sync_base()
-    res = requests.get(f"{base}/sources", timeout=(5, 30))
-    res.raise_for_status()
-    items = res.json()
-    if not isinstance(items, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        if not bool(item.get("enabled", True)):
-            continue
-        if not bool(item.get("sync_enabled", True)):
-            continue
-        out.append(item)
-    return out
-
-
 @dataclass
 class AggregateJob:
     job_id: str
+    service_job_id: str
     status: str
     created_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
     total_sources: int = 0
     processed_sources: int = 0
-    expected_products: int = 0
-    processed_products: int = 0
     expected_db_upserts: int = 0
     db_upserts_done: int = 0
     failed_products: int = 0
@@ -88,7 +69,10 @@ class AggregateJob:
     current_source_index: int = 0
     current_stage: str | None = None
     can_cancel: bool = True
-    source_jobs: dict[str, str] = field(default_factory=dict)
+    products_success: int = 0
+    products_error: int = 0
+    event_cursor: int = 0
+    applied_batch_ids: set[str] | None = None
 
 
 class JobsState:
@@ -106,6 +90,98 @@ class JobsState:
 
 
 STATE = JobsState()
+
+
+def _persist_runtime(job: AggregateJob, *, error_message: str | None = None) -> None:
+    db = SessionLocal()
+    try:
+        row = db.query(SyncJobRuntime).filter(SyncJobRuntime.aggregate_job_id == job.job_id).first()
+        if row is None:
+            row = SyncJobRuntime(
+                aggregate_job_id=job.job_id,
+                service_job_id=job.service_job_id,
+                status=job.status,
+                created_at=job.created_at,
+            )
+            db.add(row)
+        row.service_job_id = job.service_job_id
+        row.status = job.status
+        row.created_at = job.created_at
+        row.started_at = job.started_at
+        row.completed_at = job.completed_at
+        row.total_sources = int(job.total_sources or 0)
+        row.processed_sources = int(job.processed_sources or 0)
+        row.expected_db_upserts = int(job.expected_db_upserts or 0)
+        row.db_upserts_done = int(job.db_upserts_done or 0)
+        row.failed_products = int(job.failed_products or 0)
+        row.current_source_name = job.current_source_name
+        row.current_source_index = int(job.current_source_index or 0)
+        row.current_stage = job.current_stage
+        row.products_success = int(job.products_success or 0)
+        row.products_error = int(job.products_error or 0)
+        row.event_cursor = int(job.event_cursor or 0)
+        row.can_cancel = bool(job.can_cancel)
+        row.error_message = error_message
+        db.commit()
+    except Exception:
+        db.rollback()
+        LOGGER.exception("failed to persist sync runtime state job_id=%s", job.job_id)
+    finally:
+        db.close()
+
+
+def _load_latest_runtime() -> AggregateJob | None:
+    db = SessionLocal()
+    try:
+        row = db.query(SyncJobRuntime).order_by(SyncJobRuntime.created_at.desc(), SyncJobRuntime.id.desc()).first()
+        if row is None:
+            return None
+        return AggregateJob(
+            job_id=row.aggregate_job_id,
+            service_job_id=row.service_job_id,
+            status=row.status,
+            created_at=row.created_at,
+            started_at=row.started_at,
+            completed_at=row.completed_at,
+            total_sources=row.total_sources or 0,
+            processed_sources=row.processed_sources or 0,
+            expected_db_upserts=row.expected_db_upserts or 0,
+            db_upserts_done=row.db_upserts_done or 0,
+            failed_products=row.failed_products or 0,
+            current_source_name=row.current_source_name,
+            current_source_index=row.current_source_index or 0,
+            current_stage=row.current_stage,
+            can_cancel=bool(row.can_cancel),
+            products_success=row.products_success or 0,
+            products_error=row.products_error or 0,
+            event_cursor=row.event_cursor or 0,
+            applied_batch_ids=set(),
+        )
+    finally:
+        db.close()
+
+
+def mark_interrupted_jobs_on_startup() -> None:
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(SyncJobRuntime)
+            .filter(SyncJobRuntime.status.in_(["queued", "in_progress"]))
+            .all()
+        )
+        now = _utcnow()
+        for row in rows:
+            row.status = "failed"
+            row.can_cancel = False
+            row.completed_at = now
+            row.current_stage = "Прервано из-за перезапуска backend"
+            row.error_message = "backend_restart_interrupted_job"
+        db.commit()
+    except Exception:
+        db.rollback()
+        LOGGER.exception("failed to mark interrupted sync jobs on startup")
+    finally:
+        db.close()
 
 
 def _map_latest_response(job: AggregateJob | None) -> dict[str, Any] | None:
@@ -129,138 +205,20 @@ def _map_latest_response(job: AggregateJob | None) -> dict[str, Any] | None:
         "processed_sources": job.processed_sources,
         "progress_percent": round(progress, 2),
         "processed_products": job.db_upserts_done,
-        "expected_products": job.expected_db_upserts if job.expected_db_upserts > 0 else job.expected_products,
+        "expected_products": job.expected_db_upserts,
         "failed_products": job.failed_products,
         "products_progress_percent": round(products_progress, 2),
         "current_source_name": job.current_source_name,
         "current_source_parser_type": "service_rework",
         "current_source_index": job.current_source_index,
         "current_stage": job.current_stage,
-        "current_source_processed_products": 0,
-        "current_source_total_products": 0,
+        "current_source_processed_products": job.products_success,
+        "current_source_total_products": max(job.products_success + job.products_error, 0),
         "current_product_title": None,
         "site_products_total": 0,
         "can_cancel": job.can_cancel,
         "sync_period_minutes": 0,
     }
-
-
-def _poll_and_finalize(agg_job: AggregateJob) -> None:
-    base = _service_sync_base()
-    agg_job.started_at = _utcnow()
-    agg_job.status = "in_progress"
-
-    for idx, (source_key, service_job_id) in enumerate(list(agg_job.source_jobs.items()), start=1):
-        agg_job.current_source_index = idx
-        agg_job.current_source_name = source_key
-        agg_job.current_stage = "service_job_pending"
-        started_monotonic = monotonic()
-        while True:
-            try:
-                res = requests.get(f"{base}/jobs/{service_job_id}", timeout=(5, 30))
-                res.raise_for_status()
-                payload = res.json()
-                st = str(payload.get("status") or "").lower()
-            except Exception:
-                st = "failed"
-                payload = {}
-
-            if st == "pending":
-                agg_job.current_stage = "service_job_pending"
-            elif st == "in_progress":
-                agg_job.current_stage = "service_job_running"
-
-            if st in {"pending", "in_progress"} and (monotonic() - started_monotonic) > SOURCE_JOB_TIMEOUT_SEC:
-                st = "failed"
-                payload = {
-                    "report": {
-                        "total_found_products": 0,
-                        "parsed_visible_products": 0,
-                    },
-                }
-                agg_job.current_stage = "service_job_timeout"
-
-            if st in {"success", "partial", "failed", "cancelled"}:
-                report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
-                agg_job.expected_products += int(report.get("total_found_products") or 0)
-                agg_job.processed_products += int(report.get("parsed_visible_products") or 0)
-                up_expected, up_done = _upsert_products_from_service_report(source_key, report)
-                agg_job.expected_db_upserts += up_expected
-                agg_job.db_upserts_done += up_done
-                if st == "failed":
-                    agg_job.failed_products += 1
-                break
-            sleep(POLL_INTERVAL_SEC)
-        agg_job.processed_sources += 1
-
-    agg_job.completed_at = _utcnow()
-    agg_job.can_cancel = False
-    agg_job.current_stage = "completed"
-    agg_job.status = "completed" if agg_job.failed_products == 0 else "failed"
-
-
-@router.post("/jobs")
-def run_sync_all_enabled_sources(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    latest = STATE.get_latest()
-    if latest and latest.status in {"pending", "in_progress"}:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="sync already in progress")
-
-    sources = _load_sync_enabled_sources()
-    if not sources:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="no sync-enabled sources")
-
-    base = _service_sync_base()
-    created_at = _utcnow()
-    aggregate_id = f"agg-{int(created_at.timestamp())}"
-    agg = AggregateJob(
-        job_id=aggregate_id,
-        status="pending",
-        created_at=created_at,
-        total_sources=len(sources),
-    )
-
-    for source in sources:
-        source_key = str(source.get("key") or "").strip()
-        if not source_key:
-            continue
-        res = requests.post(f"{base}/sources/{source_key}/run-async", params={"dry_run": "false"}, timeout=(10, 30))
-        if not res.ok:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"failed to start source {source_key}: {res.status_code}")
-        body = res.json()
-        sid = str(body.get("job_id") or "").strip()
-        if not sid:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"empty service job id for {source_key}")
-        agg.source_jobs[source_key] = sid
-
-    STATE.set_latest(agg)
-    Thread(target=_poll_and_finalize, args=(agg,), daemon=True).start()
-    return {"ok": True, "job_id": agg.job_id}
-
-
-@router.get("/jobs/latest")
-def jobs_latest() -> dict[str, Any] | None:
-    return _map_latest_response(STATE.get_latest())
-
-
-@router.post("/jobs/{job_id}/cancel")
-def cancel_job(job_id: str) -> dict[str, Any]:
-    latest = STATE.get_latest()
-    if latest is None or latest.job_id != job_id:
-        raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
-    if latest.status not in {"pending", "in_progress"}:
-        return {"ok": False, "message": "already finished"}
-
-    base = _service_sync_base()
-    for service_job_id in latest.source_jobs.values():
-        try:
-            requests.post(f"{base}/jobs/{service_job_id}/cancel", timeout=(5, 15))
-        except Exception:
-            pass
-    latest.status = "cancelled"
-    latest.completed_at = _utcnow()
-    latest.can_cancel = False
-    latest.current_stage = "cancelled"
-    return {"ok": True, "job_id": latest.job_id, "status": latest.status}
 
 
 def _find_backend_source(db, source_key: str) -> ParserSource | None:
@@ -277,17 +235,14 @@ def _find_backend_source(db, source_key: str) -> ParserSource | None:
 def _derive_status(variants: Any) -> str:
     if not isinstance(variants, list) or not variants:
         return "available"
-    for v in variants:
-        if isinstance(v, dict) and bool(v.get("available")):
+    for variant in variants:
+        if isinstance(variant, dict) and bool(variant.get("available")):
             return "available"
     return "out_of_stock"
 
 
-def _upsert_products_from_service_report(source_key: str, report: dict[str, Any]) -> tuple[int, int]:
-    valid_products = report.get("valid_products") if isinstance(report.get("valid_products"), list) else []
-    unavailable_products = report.get("unavailable_products") if isinstance(report.get("unavailable_products"), list) else []
-    products = [*valid_products, *unavailable_products]
-    expected = len(products)
+def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) -> tuple[int, int]:
+    expected = len(items)
     if expected == 0:
         return (0, 0)
     db = SessionLocal()
@@ -297,40 +252,85 @@ def _upsert_products_from_service_report(source_key: str, report: dict[str, Any]
         if source is None:
             LOGGER.warning("jobs_ingest: source not found for key=%s", source_key)
             return (expected, 0)
-        for item in products:
+        for item in items:
             if not isinstance(item, dict):
                 continue
+            external_id = str(item.get("external_id") or "").strip() or None
+            canonical_url = str(item.get("canonical_url") or "").strip() or None
+            source_product_url = str(item.get("source_product_url") or item.get("url") or "").strip()
             handle = str(item.get("handle") or "").strip()
             if not handle:
+                if source_product_url:
+                    handle = source_product_url.rsplit("/", 1)[-1][:200]
+            if not handle:
                 continue
-            row = (
+            query = (
                 db.query(ParserProduct)
                 .filter(ParserProduct.deleted_at.is_(None))
                 .filter(ParserProduct.source_id == int(source.id))
-                .filter(ParserProduct.handle == handle)
-                .first()
             )
+            row = None
+            if external_id:
+                row = query.filter(ParserProduct.source_external_id == external_id).first()
+            if row is None and canonical_url:
+                row = query.filter(ParserProduct.canonical_url == canonical_url).first()
             if row is None:
-                row = ParserProduct(source_id=int(source.id), handle=handle, title=str(item.get("title") or handle), url=str(item.get("url") or ""))
+                row = query.filter(ParserProduct.handle == handle).first()
+            if row is None:
+                row = ParserProduct(
+                    source_id=int(source.id),
+                    source_external_id=external_id,
+                    canonical_url=canonical_url,
+                    handle=handle,
+                    title=str(item.get("title") or handle),
+                    url=source_product_url,
+                )
                 db.add(row)
-            row.title = str(item.get("title") or row.title or handle)
-            row.description = item.get("description")
-            row.vendor = str(item.get("vendor") or "").strip() or None
-            row.product_type = str(item.get("product_type") or "").strip() or None
-            row.url = str(item.get("url") or row.url or "").strip()
+            else:
+                if external_id:
+                    row.source_external_id = external_id
+                if canonical_url:
+                    row.canonical_url = canonical_url
+            incoming_title = str(item.get("title") or row.title or handle)
+            incoming_description = item.get("description")
+            row.vendor = str(item.get("vendor") or item.get("brand") or "").strip() or None
+            row.product_type = str(item.get("product_type") or item.get("category") or "").strip() or None
+            row.url = source_product_url or str(row.url or "").strip()
             row.price = _safe_float(item.get("price"))
             row.currency = str(item.get("currency") or row.currency or "USD").strip().upper()[:3] or "USD"
             images = item.get("images") if isinstance(item.get("images"), list) else []
-            row.image_urls = [str(x).strip() for x in images if str(x).strip()]
-            row.image_count = len(row.image_urls)
+            incoming_image_urls = [str(url).strip() for url in images if str(url).strip()]
             row.variants = item.get("variants") if isinstance(item.get("variants"), list) else []
             parsed_weight = _safe_float(item.get("weight_grams"))
             row.weight_grams = parsed_weight if parsed_weight is not None else row.weight_grams
-            reasons = item.get("unavailable_reasons") if isinstance(item.get("unavailable_reasons"), list) else []
-            if reasons:
+            validation = item.get("validation") if isinstance(item.get("validation"), dict) else {}
+            validation_errors = validation.get("errors") if isinstance(validation.get("errors"), list) else []
+            current_status = str(getattr(row, "status", "") or "").strip().lower()
+            title_sync_locked = bool(getattr(row, "title_sync_locked", False))
+            description_sync_locked = bool(getattr(row, "description_sync_locked", False))
+            images_sync_locked = bool(getattr(row, "images_sync_locked", False))
+
+            if not title_sync_locked:
+                row.title = incoming_title
+            if not description_sync_locked:
+                row.description = incoming_description
+            if not images_sync_locked:
+                row.image_urls = incoming_image_urls
+                row.image_count = len(incoming_image_urls)
+
+            # Manual moderation states must survive sync.
+            if current_status in {"hidden", "unavailable"}:
+                pass
+            elif validation_errors:
                 row.status = "unavailable"
             else:
-                row.status = _derive_status(row.variants)
+                raw_availability = str(item.get("raw_availability") or "").strip().lower()
+                if raw_availability in {"sold_out", "out_of_stock"}:
+                    row.status = "out_of_stock"
+                elif raw_availability in {"unavailable"}:
+                    row.status = "unavailable"
+                else:
+                    row.status = _derive_status(row.variants)
             upserts += 1
         db.commit()
     except Exception:
@@ -340,3 +340,218 @@ def _upsert_products_from_service_report(source_key: str, report: dict[str, Any]
     finally:
         db.close()
     return (expected, upserts)
+
+
+def _is_batch_applied(service_job_id: str, batch_id: str) -> bool:
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(SyncAppliedBatch.id)
+            .filter(SyncAppliedBatch.service_job_id == service_job_id)
+            .filter(SyncAppliedBatch.batch_id == batch_id)
+            .first()
+        )
+        return row is not None
+    finally:
+        db.close()
+
+
+def _mark_batch_applied(aggregate_job_id: str, service_job_id: str, batch_id: str, source_key: str | None) -> None:
+    db = SessionLocal()
+    try:
+        exists = (
+            db.query(SyncAppliedBatch.id)
+            .filter(SyncAppliedBatch.service_job_id == service_job_id)
+            .filter(SyncAppliedBatch.batch_id == batch_id)
+            .first()
+        )
+        if exists:
+            return
+        db.add(
+            SyncAppliedBatch(
+                aggregate_job_id=aggregate_job_id,
+                service_job_id=service_job_id,
+                batch_id=batch_id,
+                source_key=source_key,
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _poll_and_apply(agg_job: AggregateJob) -> None:
+    base = _service_sync_base()
+    agg_job.started_at = _utcnow()
+    agg_job.status = "in_progress"
+    _persist_runtime(agg_job)
+
+    terminal = {"completed", "failed", "cancelled"}
+    if agg_job.applied_batch_ids is None:
+        agg_job.applied_batch_ids = set()
+    while True:
+        latest = STATE.get_latest()
+        if latest is None or latest.job_id != agg_job.job_id:
+            return
+
+        try:
+            status_res = requests.get(f"{base}/jobs/{agg_job.service_job_id}", timeout=(5, 30))
+            status_res.raise_for_status()
+            payload = status_res.json() if isinstance(status_res.json(), dict) else {}
+        except Exception:
+            payload = {}
+
+        agg_job.current_source_name = str(payload.get("current_source_name") or "").strip() or agg_job.current_source_name
+        agg_job.current_source_index = int(payload.get("current_source_index") or agg_job.current_source_index or 0)
+        agg_job.total_sources = int(payload.get("total_sources") or agg_job.total_sources or 0)
+        agg_job.current_stage = str(payload.get("current_stage") or "").strip() or agg_job.current_stage
+        agg_job.products_success = int(payload.get("products_success") or agg_job.products_success or 0)
+        agg_job.products_error = int(payload.get("products_error") or agg_job.products_error or 0)
+        agg_job.status = str(payload.get("status") or agg_job.status).strip().lower()
+        _persist_runtime(agg_job)
+
+        try:
+            events_res = requests.get(
+                f"{base}/jobs/{agg_job.service_job_id}/events",
+                params={"cursor": agg_job.event_cursor, "limit": 250},
+                timeout=(5, 30),
+            )
+            events_res.raise_for_status()
+            events_payload = events_res.json() if isinstance(events_res.json(), dict) else {}
+            events = events_payload.get("items") if isinstance(events_payload.get("items"), list) else []
+            next_cursor = int(events_payload.get("next_cursor") or agg_job.event_cursor)
+        except Exception:
+            events = []
+            next_cursor = agg_job.event_cursor
+
+        for evt in events:
+            if not isinstance(evt, dict):
+                continue
+            evt_type = str(evt.get("type") or "").strip()
+            evt_payload = evt.get("payload") if isinstance(evt.get("payload"), dict) else {}
+            if evt_type in {"source_progress", "source_started", "source_finished", "job_finished", "job_failed", "job_cancelled"}:
+                strategy_value = str(evt_payload.get("strategy") or "").strip()
+                stage_label = str(evt_payload.get("stage_label") or "").strip()
+                if strategy_value:
+                    agg_job.current_stage = f"{strategy_value}: {stage_label or evt_type}"
+                elif stage_label:
+                    agg_job.current_stage = stage_label
+                else:
+                    agg_job.current_stage = evt_type
+                agg_job.current_source_name = str(evt_payload.get("source_key") or agg_job.current_source_name or "").strip() or agg_job.current_source_name
+                agg_job.current_source_index = int(evt_payload.get("source_index") or agg_job.current_source_index or 0)
+            if str(evt.get("type") or "") != "product_batch":
+                continue
+            event_payload = evt_payload
+            batch_id = str(event_payload.get("batch_id") or "").strip()
+            if batch_id and batch_id in agg_job.applied_batch_ids:
+                continue
+            if batch_id and _is_batch_applied(agg_job.service_job_id, batch_id):
+                agg_job.applied_batch_ids.add(batch_id)
+                continue
+            source_key = str(event_payload.get("source_key") or "").strip()
+            items = event_payload.get("items") if isinstance(event_payload.get("items"), list) else []
+            cast_items = [item for item in items if isinstance(item, dict)]
+            expected, applied = _upsert_products_from_items(source_key=source_key, items=cast_items)
+            agg_job.expected_db_upserts += expected
+            agg_job.db_upserts_done += applied
+            agg_job.failed_products += max(0, expected - applied)
+            if batch_id:
+                try:
+                    _mark_batch_applied(
+                        aggregate_job_id=agg_job.job_id,
+                        service_job_id=agg_job.service_job_id,
+                        batch_id=batch_id,
+                        source_key=source_key or None,
+                    )
+                    agg_job.applied_batch_ids.add(batch_id)
+                except Exception:
+                    LOGGER.exception("failed to mark batch as applied service_job_id=%s batch_id=%s", agg_job.service_job_id, batch_id)
+
+        agg_job.event_cursor = max(agg_job.event_cursor, next_cursor)
+        agg_job.processed_sources = min(agg_job.total_sources, max(agg_job.processed_sources, agg_job.current_source_index))
+        _persist_runtime(agg_job)
+
+        if agg_job.status in terminal:
+            agg_job.completed_at = _utcnow()
+            agg_job.can_cancel = False
+            if not agg_job.current_stage:
+                agg_job.current_stage = agg_job.status
+            _persist_runtime(agg_job)
+            return
+
+        sleep(POLL_INTERVAL_SEC)
+
+
+@router.post("/jobs")
+def run_sync_all_enabled_sources(payload: StartSyncRequest | None = None) -> dict[str, Any]:
+    latest = STATE.get_latest()
+    if latest and latest.status in {"pending", "queued", "in_progress"}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="sync already in progress")
+
+    base = _service_sync_base()
+    request_payload: dict[str, Any] = {
+        "triggered_by": str((payload.triggered_by if payload else None) or "manual"),
+        "dry_run": False,
+    }
+    source_keys = [str(s).strip() for s in ((payload.sources if payload else None) or []) if str(s).strip()]
+    if source_keys:
+        request_payload["sources"] = source_keys
+    try:
+        response = requests.post(f"{base}/jobs", json=request_payload, timeout=(10, 30))
+        response.raise_for_status()
+        body = response.json() if isinstance(response.json(), dict) else {}
+    except requests.HTTPError as exc:
+        detail = f"failed to start sync job: {exc.response.status_code if exc.response is not None else 'http_error'}"
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="failed to start sync job") from exc
+
+    service_job_id = str(body.get("job_id") or "").strip()
+    if not service_job_id:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="empty service job id")
+
+    created_at = _utcnow()
+    agg = AggregateJob(
+        job_id=f"agg-{int(created_at.timestamp())}",
+        service_job_id=service_job_id,
+        status="queued",
+        created_at=created_at,
+    )
+    STATE.set_latest(agg)
+    _persist_runtime(agg)
+    Thread(target=_poll_and_apply, args=(agg,), daemon=True).start()
+    return {"ok": True, "job_id": agg.job_id}
+
+
+@router.get("/jobs/latest")
+def jobs_latest() -> dict[str, Any] | None:
+    latest = STATE.get_latest()
+    if latest is None:
+        latest = _load_latest_runtime()
+    return _map_latest_response(latest)
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> dict[str, Any]:
+    latest = STATE.get_latest()
+    if latest is None or latest.job_id != job_id:
+        raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
+    if latest.status not in {"queued", "in_progress"}:
+        return {"ok": False, "message": "already finished"}
+
+    base = _service_sync_base()
+    try:
+        requests.post(f"{base}/jobs/{latest.service_job_id}/cancel", timeout=(5, 15)).raise_for_status()
+    except Exception:
+        pass
+
+    latest.status = "cancelled"
+    latest.completed_at = _utcnow()
+    latest.can_cancel = False
+    latest.current_stage = "cancelled"
+    _persist_runtime(latest)
+    return {"ok": True, "job_id": latest.job_id, "status": latest.status}

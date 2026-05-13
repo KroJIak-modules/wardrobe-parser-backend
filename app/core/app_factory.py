@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette import status
 
 from app.api.v1 import api_router
+from app.api.v1.jobs import mark_interrupted_jobs_on_startup
 from app.core.config import settings
 from app.core.exceptions import IntegrityError, NotFoundError, ValidationError
 
@@ -109,6 +110,10 @@ def create_app() -> FastAPI:
         openapi_url="/api/openapi.json",
         redoc_url=None,
     )
+
+    @app.on_event("startup")
+    def _on_startup_sync_runtime() -> None:
+        mark_interrupted_jobs_on_startup()
 
     @app.get("/health", summary="Health check")
     def health() -> dict[str, str]:

@@ -150,14 +150,14 @@ _DEFAULT_SHIPPING_RULES: dict[str, dict[str, list[dict[str, Any]]]] = {
 
 _PRODUCTION_SUPPLIER_PRESETS: list[dict[str, Any]] = [
     {
-        "legacy_keys": ["us-express-test", "us-main", "default"],
+        "alias_keys": ["us-express-test", "us-main", "default"],
         "key": "usa",
         "name": "США",
         "category": "main",
         "rate_currency": "RUB",
     },
     {
-        "legacy_keys": ["us-alt", "usa-alt-1"],
+        "alias_keys": ["us-alt", "usa-alt-1"],
         "key": "usa-alt-1",
         "name": "ALT 1 США",
         "category": "alt",
@@ -166,14 +166,14 @@ _PRODUCTION_SUPPLIER_PRESETS: list[dict[str, Any]] = [
         "rate_currency": "RUB",
     },
     {
-        "legacy_keys": ["eu-priority-test", "eu-main"],
+        "alias_keys": ["eu-priority-test", "eu-main"],
         "key": "eu",
         "name": "ЕС",
         "category": "main",
         "rate_currency": "RUB",
     },
     {
-        "legacy_keys": ["eu-economy-test", "eu-alt", "eu-alt-1"],
+        "alias_keys": ["eu-economy-test", "eu-alt", "eu-alt-1"],
         "key": "eu-alt-1",
         "name": "ALT 1 ЕС",
         "category": "alt",
@@ -182,7 +182,7 @@ _PRODUCTION_SUPPLIER_PRESETS: list[dict[str, Any]] = [
         "rate_currency": "RUB",
     },
     {
-        "legacy_keys": ["uk-main", "gb-main"],
+        "alias_keys": ["uk-main", "gb-main"],
         "key": "uk",
         "name": "Великобритания",
         "category": "main",
@@ -213,12 +213,12 @@ class PricingSettingsService:
         created_or_matched: dict[str, ParserSupplier] = {}
         for preset in _PRODUCTION_SUPPLIER_PRESETS:
             canonical = self.supplier_repo.get_by_key(str(preset["key"]))
-            legacy_items = [
+            alias_items = [
                 item
-                for item in (self.supplier_repo.get_by_key(str(raw_key)) for raw_key in preset["legacy_keys"])
+                for item in (self.supplier_repo.get_by_key(str(raw_key)) for raw_key in preset["alias_keys"])
                 if item is not None
             ]
-            target = canonical or (legacy_items[0] if legacy_items else None)
+            target = canonical or (alias_items[0] if alias_items else None)
             if target is None:
                 target = self.supplier_repo.create(
                     key=str(preset["key"]),
@@ -229,17 +229,17 @@ class PricingSettingsService:
                 self.supplier_repo.flush()
                 changed = True
 
-            for legacy in legacy_items:
-                if legacy.id == target.id:
+            for alias in alias_items:
+                if alias.id == target.id:
                     continue
-                self.db.query(ParserSource).filter(ParserSource.supplier_id == legacy.id).update(
+                self.db.query(ParserSource).filter(ParserSource.supplier_id == alias.id).update(
                     {ParserSource.supplier_id: target.id},
                     synchronize_session=False,
                 )
-                self.db.delete(legacy)
+                self.db.delete(alias)
                 changed = True
 
-            # One-time key migration from legacy key to canonical key.
+            # One-time key migration from alias key to canonical key.
             if canonical is None and target.key != preset["key"]:
                 target.key = str(preset["key"])
                 changed = True
@@ -516,7 +516,7 @@ class PricingSettingsService:
         if not isinstance(rows, list):
             return []
         normalized: list[dict[str, Any]] = []
-        legacy_thresholds: list[tuple[float, float]] = []
+        threshold_points: list[tuple[float, float]] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -533,11 +533,11 @@ class PricingSettingsService:
                 normalized.append({"min_kg": safe_min, "max_kg": safe_max, "rub": safe_rub})
                 continue
             if kg is not None and kg > 0:
-                legacy_thresholds.append((float(kg), safe_rub))
-        if not normalized and legacy_thresholds:
-            legacy_thresholds.sort(key=lambda item: item[0])
+                threshold_points.append((float(kg), safe_rub))
+        if not normalized and threshold_points:
+            threshold_points.sort(key=lambda item: item[0])
             previous_kg = 0.0
-            for threshold_kg, rub in legacy_thresholds:
+            for threshold_kg, rub in threshold_points:
                 if threshold_kg <= previous_kg:
                     continue
                 normalized.append({"min_kg": previous_kg, "max_kg": threshold_kg, "rub": rub})

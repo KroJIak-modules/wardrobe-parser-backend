@@ -492,7 +492,7 @@ def _json_response_headers(upstream: Response) -> dict[str, str]:
     return headers
 
 
-def _normalize_legacy_source_price(raw_price: Any, currency: str | None) -> float | None:
+def _normalize_source_price(raw_price: Any, currency: str | None) -> float | None:
     _ = currency
     return _safe_float(raw_price)
 
@@ -505,7 +505,7 @@ def _price_input_from_item(item: dict[str, Any]) -> tuple[float | None, str | No
     raw_source_price = item.get("source_price")
     if raw_source_price is None:
         raw_source_price = item.get("price")
-    source_price = _normalize_legacy_source_price(raw_source_price, source_currency)
+    source_price = _normalize_source_price(raw_source_price, source_currency)
     return source_price, source_currency
 
 
@@ -1792,13 +1792,13 @@ def get_pricing_example_product(
     },
 )
 async def get_product(product_id: int, request: Request, db: Session = Depends(get_db)) -> Response:
-    upstream = forward_service_request(request=request, path=f"products/{product_id}", body=b"")
-    if upstream.status_code >= 400:
-        return upstream
+    local_product = ParserProductRepository(db).get_active_by_id(product_id)
+    if local_product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
+    if str(local_product.status or "").strip().lower() == "unavailable":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
 
-    payload = _upstream_json_or_none(upstream)
-    if not isinstance(payload, dict):
-        return upstream
+    payload = _product_row_to_item(local_product)
     payload["description"] = _extract_product_description(payload)
     brand_mapping_service = BrandMappingService(db)
     mapping_by_key = brand_mapping_service.get_mapping_by_key()
@@ -1831,9 +1831,6 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
     favorite_manual_map = {
         int(product_id): [int(category_id) for category_id in manual_map.get(int(product_id), []) if int(category_id) in favorite_category_ids]
     }
-    local_product = ParserProductRepository(db).get_active_by_id(product_id)
-    if local_product is not None and str(local_product.status or "").strip().lower() == "unavailable":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
     if local_product is not None:
         if isinstance(local_product.image_urls, list) and local_product.image_urls:
             payload["image_urls"] = list(local_product.image_urls or [])
@@ -1867,7 +1864,7 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
             detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
         ) from exc
     projected = _project_showcase_product_detail(priced)
-    return JSONResponse(content=projected, status_code=upstream.status_code, headers=_json_response_headers(upstream))
+    return JSONResponse(content=projected, status_code=200)
 
 
 @router.patch("/products/{product_id}")

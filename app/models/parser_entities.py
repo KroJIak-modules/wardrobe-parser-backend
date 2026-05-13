@@ -18,6 +18,8 @@ class ParserSource(Base):
     url = Column(String(2048), nullable=False)
     enabled = Column(Boolean, nullable=False, default=True)
     hide_auto_added_products = Column(Boolean, nullable=False, default=False)
+    show_description = Column(Boolean, nullable=False, default=True)
+    show_images = Column(Boolean, nullable=False, default=True)
     supplier_id = Column(Integer, ForeignKey("parser_supplier.id", ondelete="RESTRICT"), nullable=False)
     promo_factor = Column(Float, nullable=False, default=1.0)
     promo_only_no_discount = Column(Boolean, nullable=False, default=False)
@@ -38,6 +40,8 @@ class ParserProduct(Base):
 
     id = Column(Integer, primary_key=True)
     source_id = Column(Integer, ForeignKey("parser_source.id"), nullable=False)
+    source_external_id = Column(String(255), nullable=True)
+    canonical_url = Column(String(2048), nullable=True)
     handle = Column(String(1024), nullable=False)
     title = Column(String(2048), nullable=False)
     description = Column(Text, nullable=True)
@@ -83,6 +87,11 @@ class ParserProduct(Base):
     deleted_at = Column(DateTime(timezone=True), nullable=True)
 
     source = relationship("ParserSource", back_populates="products")
+
+    __table_args__ = (
+        Index("idx_parser_product_source_external_id", "source_id", "source_external_id"),
+        Index("idx_parser_product_source_canonical_url", "source_id", "canonical_url"),
+    )
 
 
 class ParserFavoriteProduct(Base):

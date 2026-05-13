@@ -13,6 +13,8 @@ from app.models.pricing import ParserPricingSettings, ParserSupplier, ParserSupp
 from app.models.product import Product
 from app.models.product_image import ProductImage
 from app.models.site import Site
+from app.models.sync_runtime import SyncAppliedBatch
+from app.models.sync_job_runtime import SyncJobRuntime
 from app.models.weight import ParserWeightKeyword, ParserWeightRule
 
 __all__ = [
@@ -37,4 +39,6 @@ __all__ = [
     "Product",
     "ProductImage",
     "Site",
+    "SyncAppliedBatch",
+    "SyncJobRuntime",
 ]
