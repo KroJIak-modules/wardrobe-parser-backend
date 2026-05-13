@@ -1187,7 +1187,20 @@ def put_admin_brand_mapping(
 async def get_products(request: Request, db: Session = Depends(get_db)) -> Response:
     upstream = forward_service_request(request=request, path="products", body=b"")
     if upstream.status_code >= 400:
-        return upstream
+        limit = max(1, min(200, _safe_int(request.query_params.get("limit")) or 100))
+        offset = max(0, _safe_int(request.query_params.get("offset")) or 0)
+        q = db.query(ParserProduct).filter(ParserProduct.deleted_at.is_(None)).order_by(ParserProduct.id.desc())
+        total = int(q.count())
+        rows = q.offset(offset).limit(limit).all()
+        return JSONResponse(
+            content={
+                "items": [_product_to_dict(row) for row in rows],
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            },
+            status_code=200,
+        )
 
     payload = _upstream_json_or_none(upstream)
     if not isinstance(payload, dict):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class CategoryKeywordRequest(BaseModel):
@@ -61,8 +61,7 @@ class CategoryTreeNodeResponse(BaseModel):
     effective_keywords: list[str] = Field(default_factory=list)
     children: list["CategoryTreeNodeResponse"] = Field(default_factory=list)
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class CatalogCategoryNodeResponse(BaseModel):
@@ -119,8 +118,7 @@ class WeightRuleResponse(BaseModel):
     weight_grams: int
     keywords: list[str] = Field(default_factory=list)
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ParserWeightRuleItem(BaseModel):
@@ -388,8 +386,7 @@ class ProductResponse(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ShowcaseProductResponse(BaseModel):

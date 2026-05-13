@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Cookie, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.config import settings
@@ -19,6 +19,8 @@ _TOKEN_VERSION = 1
 _ACCESS_TOKEN_TYPE = "access"
 _REFRESH_TOKEN_TYPE = "refresh"
 _auth_scheme = HTTPBearer(auto_error=False)
+ACCESS_COOKIE_NAME = "admin_access_token"
+REFRESH_COOKIE_NAME = "admin_refresh_token"
 
 
 @dataclass(frozen=True)
@@ -104,17 +106,24 @@ def issue_admin_token_pair() -> dict[str, Any]:
 
 
 def verify_admin_credentials(login: str, password: str) -> bool:
-    return secrets.compare_digest(login, settings.admin_superuser_login) and secrets.compare_digest(
-        password, settings.admin_superuser_password
-    )
+    # compare_digest for str raises TypeError on non-ASCII input in Python 3.12.
+    # Compare UTF-8 bytes to keep constant-time semantics and avoid 500 on brute-force payloads.
+    login_ok = secrets.compare_digest(login.encode("utf-8"), settings.admin_superuser_login.encode("utf-8"))
+    password_ok = secrets.compare_digest(password.encode("utf-8"), settings.admin_superuser_password.encode("utf-8"))
+    return login_ok and password_ok
 
 
 def require_admin_access(
     credentials: HTTPAuthorizationCredentials | None = Depends(_auth_scheme),
+    access_cookie_token: str | None = Cookie(default=None, alias=ACCESS_COOKIE_NAME),
 ) -> AdminTokenClaims:
-    if credentials is None or str(credentials.scheme).lower() != "bearer" or not credentials.credentials:
+    bearer_token = None
+    if credentials is not None and str(credentials.scheme).lower() == "bearer" and credentials.credentials:
+        bearer_token = credentials.credentials
+    token = bearer_token or access_cookie_token
+    if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Требуется авторизация")
-    return _decode_and_validate(credentials.credentials, expected_type=_ACCESS_TOKEN_TYPE)
+    return _decode_and_validate(token, expected_type=_ACCESS_TOKEN_TYPE)
 
 
 def verify_refresh_token(refresh_token: str) -> AdminTokenClaims:

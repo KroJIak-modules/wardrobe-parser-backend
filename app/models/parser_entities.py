@@ -1,6 +1,7 @@
 """Core parser entities mirrored in backend for native business endpoints."""
 
 from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
+from sqlalchemy.dialects.postgresql import ENUM as PGEnum
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -45,7 +46,18 @@ class ParserProduct(Base):
     url = Column(String(2048), nullable=False)
     price = Column(Float, nullable=True)
     currency = Column(String(3), nullable=False, default="USD")
-    status = Column(String(32), nullable=False, default="available")
+    status = Column(
+        PGEnum(
+            "available",
+            "out_of_stock",
+            "hidden",
+            "unavailable",
+            name="productstatus",
+            create_type=False,
+        ),
+        nullable=False,
+        default="available",
+    )
     image_count = Column(Integer, nullable=False, default=0)
     image_urls = Column(JSON, nullable=False, default=list)
     image_asset_ids = Column(JSON, nullable=False, default=list)
