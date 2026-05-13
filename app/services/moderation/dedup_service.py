@@ -9,7 +9,6 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models import ParserPricingSettings
 from app.repositories import ParserDedupDecisionRepository, ParserProductRepository, ParserSourceRepository
 from app.schemas.parser import (
     DedupCandidateListResponse,
@@ -292,14 +291,8 @@ class DedupService:
         return None
 
     def _dedup_only_available_enabled(self) -> bool:
-        row = (
-            self.db.query(ParserPricingSettings)
-            .order_by(ParserPricingSettings.id.asc())
-            .first()
-        )
-        if row is None:
-            return False
-        return bool(getattr(row, "dedup_only_available_products", False))
+        # Product decision: dedup candidates are always built only from available products.
+        return True
 
     def get_candidates(self, limit: int = settings.dedup_candidates_default_limit) -> DedupCandidateListResponse:
         only_available = self._dedup_only_available_enabled()

@@ -1194,7 +1194,7 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
         rows = q.offset(offset).limit(limit).all()
         return JSONResponse(
             content={
-                "items": [_product_to_dict(row) for row in rows],
+                "items": [_product_row_to_item(row) for row in rows],
                 "total": total,
                 "limit": limit,
                 "offset": offset,
