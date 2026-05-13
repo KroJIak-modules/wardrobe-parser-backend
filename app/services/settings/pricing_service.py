@@ -913,7 +913,7 @@ class PricingSettingsService:
             ),
             showcase_carousel_image_asset_ids=self._normalize_image_asset_ids(
                 getattr(entity, "showcase_carousel_image_asset_ids", None),
-                max_items=20,
+                limit=20,
             ),
         )
 

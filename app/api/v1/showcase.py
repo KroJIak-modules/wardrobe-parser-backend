@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models import ImageAsset
 from app.schemas.parser import (
-    PricingSettingsUpdateRequest,
+    AdminUiSettingsUpdateRequest,
     ShowcaseCarouselOrderRequest,
     ShowcaseHeroSetRequest,
     ShowcaseMediaSettingsResponse,
@@ -68,18 +68,20 @@ def _file_response_for_asset(asset_id: int, db: Session) -> FileResponse:
 
 @router.get("/state", response_model=ShowcaseMediaSettingsResponse)
 def showcase_state(db: Session = Depends(get_db)):
-    pricing = PricingSettingsService(db).get_settings(refresh_bybit=False)
+    ui = PricingSettingsService(db).get_admin_ui_settings()
+    hero_id = int(ui.showcase_hero_image_asset_id or 0)
+    carousel_items = [int(x) for x in list(ui.showcase_carousel_image_asset_ids or []) if int(x) > 0 and int(x) != hero_id]
     return ShowcaseMediaSettingsResponse(
-        showcase_hero_image_asset_id=pricing.showcase_hero_image_asset_id,
-        showcase_carousel_image_asset_ids=list(pricing.showcase_carousel_image_asset_ids or []),
+        showcase_hero_image_asset_id=(hero_id if hero_id > 0 else None),
+        showcase_carousel_image_asset_ids=carousel_items,
         carousel_limit=_CAROUSEL_LIMIT,
     )
 
 
 @router.get("/hero/image")
 def hero_image(db: Session = Depends(get_db)):
-    pricing = PricingSettingsService(db).get_settings(refresh_bybit=False)
-    hero_id = int(pricing.showcase_hero_image_asset_id or 0)
+    ui = PricingSettingsService(db).get_admin_ui_settings()
+    hero_id = int(ui.showcase_hero_image_asset_id or 0)
     if hero_id <= 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Заставка не установлена")
     return _file_response_for_asset(hero_id, db)
@@ -88,9 +90,13 @@ def hero_image(db: Session = Depends(get_db)):
 @router.post("/hero/upload")
 def upload_hero(file: UploadFile = File(...), db: Session = Depends(get_db)):
     image_id = _save_upload(file, db)
-    PricingSettingsService(db).update_settings(
-        PricingSettingsUpdateRequest(
+    pricing_svc = PricingSettingsService(db)
+    ui = pricing_svc.get_admin_ui_settings()
+    carousel = [x for x in list(ui.showcase_carousel_image_asset_ids or []) if int(x) != int(image_id)]
+    pricing_svc.update_admin_ui_settings(
+        AdminUiSettingsUpdateRequest(
             showcase_hero_image_asset_id=image_id,
+            showcase_carousel_image_asset_ids=carousel,
         )
     )
     return {"ok": True, "image_asset_id": image_id}
@@ -98,8 +104,8 @@ def upload_hero(file: UploadFile = File(...), db: Session = Depends(get_db)):
 
 @router.delete("/hero")
 def clear_hero(db: Session = Depends(get_db)):
-    PricingSettingsService(db).update_settings(
-        PricingSettingsUpdateRequest(
+    PricingSettingsService(db).update_admin_ui_settings(
+        AdminUiSettingsUpdateRequest(
             showcase_hero_image_asset_id=None,
         )
     )
@@ -109,9 +115,13 @@ def clear_hero(db: Session = Depends(get_db)):
 @router.patch("/hero")
 def set_hero(payload: ShowcaseHeroSetRequest, db: Session = Depends(get_db)):
     image_id = int(payload.image_asset_id)
-    PricingSettingsService(db).update_settings(
-        PricingSettingsUpdateRequest(
+    pricing_svc = PricingSettingsService(db)
+    ui = pricing_svc.get_admin_ui_settings()
+    carousel = [x for x in list(ui.showcase_carousel_image_asset_ids or []) if int(x) != int(image_id)]
+    pricing_svc.update_admin_ui_settings(
+        AdminUiSettingsUpdateRequest(
             showcase_hero_image_asset_id=image_id,
+            showcase_carousel_image_asset_ids=carousel,
         )
     )
     return {"ok": True, "image_asset_id": image_id}
@@ -119,20 +129,24 @@ def set_hero(payload: ShowcaseHeroSetRequest, db: Session = Depends(get_db)):
 
 @router.get("/carousel")
 def carousel_state(db: Session = Depends(get_db)):
-    pricing = PricingSettingsService(db).get_settings(refresh_bybit=False)
-    return {"items": list(pricing.showcase_carousel_image_asset_ids or []), "limit": _CAROUSEL_LIMIT}
+    ui = PricingSettingsService(db).get_admin_ui_settings()
+    hero_id = int(ui.showcase_hero_image_asset_id or 0)
+    items = [int(x) for x in list(ui.showcase_carousel_image_asset_ids or []) if int(x) > 0 and int(x) != hero_id]
+    return {"items": items, "limit": _CAROUSEL_LIMIT}
 
 
 @router.post("/carousel/upload")
 def upload_carousel(file: UploadFile = File(...), db: Session = Depends(get_db)):
     image_id = _save_upload(file, db)
-    pricing = PricingSettingsService(db).get_settings(refresh_bybit=False)
-    items = list(pricing.showcase_carousel_image_asset_ids or [])
+    pricing_svc = PricingSettingsService(db)
+    ui = pricing_svc.get_admin_ui_settings()
+    hero_id = int(ui.showcase_hero_image_asset_id or 0)
+    items = [int(x) for x in list(ui.showcase_carousel_image_asset_ids or []) if int(x) != hero_id]
     if image_id not in items:
         items.append(image_id)
     items = items[:_CAROUSEL_LIMIT]
-    PricingSettingsService(db).update_settings(
-        PricingSettingsUpdateRequest(
+    pricing_svc.update_admin_ui_settings(
+        AdminUiSettingsUpdateRequest(
             showcase_carousel_image_asset_ids=items,
         )
     )
@@ -150,8 +164,8 @@ def reorder_carousel(payload: ShowcaseCarouselOrderRequest, db: Session = Depend
             items.append(value)
         if len(items) >= _CAROUSEL_LIMIT:
             break
-    PricingSettingsService(db).update_settings(
-        PricingSettingsUpdateRequest(
+    PricingSettingsService(db).update_admin_ui_settings(
+        AdminUiSettingsUpdateRequest(
             showcase_carousel_image_asset_ids=items,
         )
     )
@@ -160,10 +174,10 @@ def reorder_carousel(payload: ShowcaseCarouselOrderRequest, db: Session = Depend
 
 @router.delete("/carousel/{image_id}")
 def remove_carousel_item(image_id: int, db: Session = Depends(get_db)):
-    pricing = PricingSettingsService(db).get_settings(refresh_bybit=False)
-    items = [int(x) for x in (pricing.showcase_carousel_image_asset_ids or []) if int(x) != int(image_id)]
-    PricingSettingsService(db).update_settings(
-        PricingSettingsUpdateRequest(
+    ui = PricingSettingsService(db).get_admin_ui_settings()
+    items = [int(x) for x in (ui.showcase_carousel_image_asset_ids or []) if int(x) != int(image_id)]
+    PricingSettingsService(db).update_admin_ui_settings(
+        AdminUiSettingsUpdateRequest(
             showcase_carousel_image_asset_ids=items,
         )
     )
