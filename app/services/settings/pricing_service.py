@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import math
 import re
 from typing import Any
+import requests
 
 from fastapi import HTTPException, status
 from sqlalchemy import text
@@ -56,6 +57,7 @@ _FORMULA_LEGEND = [
     {"key": "BFX", "description": "Итоговый курс USDT/RUB: BBR + BEX."},
     {"key": "E2U", "description": "Коэффициент EUR -> USD."},
     {"key": "G2U", "description": "Коэффициент GBP -> USD."},
+    {"key": "J2U", "description": "Коэффициент JPY -> USD."},
     {"key": "PRM", "description": "Промо-коэффициент источника."},
     {"key": "BSC", "description": "Доплата к выкупу."},
     {"key": "BUY", "description": "Стоимость выкупа товара в RUB."},
@@ -198,6 +200,7 @@ class ProductPricingComputation:
 
 class PricingSettingsService:
     """Manage pricing settings and calculate final customer price."""
+    _SUPPORTED_CURRENCIES = {"RUB", "USD", "EUR", "GBP", "JPY"}
 
     def __init__(self, db: Session):
         self.db = db
@@ -265,13 +268,26 @@ class PricingSettingsService:
         return changed
 
     @staticmethod
-    def _normalize_currency(raw: str | None, *, default: str = "RUB", allow_gbp: bool = False) -> str:
+    def _normalize_currency(raw: str | None, *, default: str = "RUB", allowed: set[str] | None = None) -> str:
         value = (raw or default).strip().upper()
-        allowed = {"RUB", "USD", "EUR"}
-        if allow_gbp:
-            allowed.add("GBP")
-        if value not in allowed:
+        allowed_set = allowed if allowed is not None else PricingSettingsService._SUPPORTED_CURRENCIES
+        if value not in allowed_set:
             return default
+        return value
+
+    @staticmethod
+    def _fetch_jpy_to_usd_rate() -> float:
+        response = requests.get("https://api.frankfurter.app/latest?from=JPY&to=USD", timeout=6.0)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("invalid FX payload")
+        rates = payload.get("rates")
+        if not isinstance(rates, dict):
+            raise RuntimeError("invalid FX payload")
+        value = float(rates.get("USD"))
+        if value <= 0:
+            raise RuntimeError("invalid JPY->USD rate")
         return value
 
     @staticmethod
@@ -294,8 +310,8 @@ class PricingSettingsService:
         if ignore_supplier_id is not None:
             query = query.filter(ParserSupplier.id != int(ignore_supplier_id))
         count = int(query.count())
-        if count >= 3:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="У базового тарифа максимум 3 альтернативы")
+        if count >= 1:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="У базового тарифа может быть только 1 альтернатива")
 
     @staticmethod
     def _normalize_svc_rule_mode(raw: str | None, *, default: str = "fixed_rub") -> str:
@@ -596,6 +612,9 @@ class PricingSettingsService:
         if getattr(entity, "gbp_to_usd_rate", None) is None:
             entity.gbp_to_usd_rate = 1.4
             changed = True
+        if getattr(entity, "jpy_to_usd_rate", None) is None or float(getattr(entity, "jpy_to_usd_rate", 0.0) or 0.0) <= 0:
+            entity.jpy_to_usd_rate = PricingSettingsService._fetch_jpy_to_usd_rate()
+            changed = True
         if getattr(entity, "payment_fee_rate", None) is None:
             entity.payment_fee_rate = 0.02
             changed = True
@@ -756,9 +775,9 @@ class PricingSettingsService:
                 default=self._normalize_currency(
                     getattr(entity, "customs_threshold_currency", None),
                     default="EUR",
-                    allow_gbp=True,
+                    allowed={"EUR", "GBP"},
                 ),
-                allow_gbp=True,
+                allowed={"EUR", "GBP"},
             )
         if "final_rounding_mode" in patch:
             patch["final_rounding_mode"] = self._normalize_final_rounding_mode(
@@ -851,13 +870,14 @@ class PricingSettingsService:
             customs_threshold_currency=PricingSettingsService._normalize_currency(
                 getattr(entity, "customs_threshold_currency", None),
                 default="EUR",
-                allow_gbp=True,
+                allowed={"EUR", "GBP"},
             ),
             customs_duty_rate=float(entity.customs_duty_rate),
             bybit_usdt_to_rub=float(getattr(entity, "bybit_usdt_to_rub", 95.0) or 95.0),
             bybit_extra_rub=float(getattr(entity, "bybit_extra_rub", 1.0)),
             eur_to_usd_rate=float(getattr(entity, "eur_to_usd_rate", 1.18)),
             gbp_to_usd_rate=float(getattr(entity, "gbp_to_usd_rate", 1.4)),
+            jpy_to_usd_rate=float(getattr(entity, "jpy_to_usd_rate")),
             final_rounding_mode=PricingSettingsService._normalize_final_rounding_mode(
                 getattr(entity, "final_rounding_mode", None),
                 default="unit",
@@ -1479,6 +1499,7 @@ class PricingSettingsService:
         bybit_extra_rub = max(0.0, float(settings.bybit_extra_rub))
         eur_to_usd_rate = max(0.0001, float(settings.eur_to_usd_rate))
         gbp_to_usd_rate = max(0.0001, float(settings.gbp_to_usd_rate))
+        jpy_to_usd_rate = max(0.000001, float(settings.jpy_to_usd_rate))
         if base_usdt_to_rub <= 0:
             return ProductPricingComputation(
                 None,
@@ -1493,6 +1514,8 @@ class PricingSettingsService:
             sp_usd = float(source_price) * eur_to_usd_rate
         elif currency == "GBP":
             sp_usd = float(source_price) * gbp_to_usd_rate
+        elif currency == "JPY":
+            sp_usd = float(source_price) * jpy_to_usd_rate
         elif currency == "RUB":
             sp_usd = float(source_price) / base_usdt_to_rub
         else:
@@ -1529,11 +1552,13 @@ class PricingSettingsService:
         effective_buyout_surcharge_value = max(0.0, float(buyout_surcharge_value or 0.0))
         effective_buyout_surcharge_currency = PricingSettingsService._normalize_currency(
             buyout_surcharge_currency,
-            default=currency if currency in {"RUB", "USD", "EUR", "GBP"} else "RUB",
-            allow_gbp=True,
+            default=currency if currency in {"RUB", "USD", "EUR", "GBP", "JPY"} else "RUB",
+            allowed={"RUB", "USD", "EUR", "GBP", "JPY"},
         )
         if effective_buyout_surcharge_currency == "GBP":
             buyout_surcharge_rub = effective_buyout_surcharge_value * gbp_to_usd_rate * effective_usdt_to_rub
+        elif effective_buyout_surcharge_currency == "JPY":
+            buyout_surcharge_rub = effective_buyout_surcharge_value * jpy_to_usd_rate * effective_usdt_to_rub
         else:
             buyout_surcharge_rub = PricingSettingsService._to_rub(
                 effective_buyout_surcharge_value,
@@ -1660,6 +1685,7 @@ class PricingSettingsService:
                 "effective_usdt_to_rub": round(effective_usdt_to_rub, 6),
                 "eur_to_usd_rate": round(float(settings.eur_to_usd_rate), 6),
                 "gbp_to_usd_rate": round(float(settings.gbp_to_usd_rate), 6),
+                "jpy_to_usd_rate": round(float(settings.jpy_to_usd_rate), 8),
                 "eur_to_rub_effective": round(eur_to_rub_effective, 6),
                 "final_rounding_mode": final_rounding_mode,
                 "raw_final_price_rub": round(raw_final_price_rub, 4),

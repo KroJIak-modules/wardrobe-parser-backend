@@ -148,6 +148,7 @@ class PricingSettingsUpdateRequest(BaseModel):
     bybit_extra_rub: float | None = Field(default=None, ge=0.0, le=1000.0)
     eur_to_usd_rate: float | None = Field(default=None, ge=0.01, le=1000.0)
     gbp_to_usd_rate: float | None = Field(default=None, ge=0.01, le=1000.0)
+    jpy_to_usd_rate: float | None = Field(default=None, ge=0.000001, le=1000.0)
     final_rounding_mode: str | None = Field(default=None, min_length=1, max_length=32)
     payment_fee_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     customs_processing_rate: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -241,6 +242,7 @@ class PricingSettingsResponse(BaseModel):
     bybit_extra_rub: float
     eur_to_usd_rate: float
     gbp_to_usd_rate: float
+    jpy_to_usd_rate: float
     final_rounding_mode: str
     payment_fee_rate: float
     customs_processing_rate: float
@@ -278,6 +280,7 @@ class SettingsTransferPricingSettings(BaseModel):
     bybit_extra_rub: float
     eur_to_usd_rate: float
     gbp_to_usd_rate: float
+    jpy_to_usd_rate: float
     final_rounding_mode: str
     payment_fee_rate: float
     customs_processing_rate: float

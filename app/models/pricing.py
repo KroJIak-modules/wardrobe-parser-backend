@@ -153,6 +153,7 @@ class ParserPricingSettings(Base):
     bybit_last_error = Column(String(1024), nullable=True)
     eur_to_usd_rate = Column(Float, nullable=False, default=1.18)
     gbp_to_usd_rate = Column(Float, nullable=False, default=1.4)
+    jpy_to_usd_rate = Column(Float, nullable=True)
     payment_fee_rate = Column(Float, nullable=False, default=0.02)
     customs_processing_rate = Column(Float, nullable=False, default=0.08)
     customs_fixed_rub = Column(Float, nullable=False, default=540.0)

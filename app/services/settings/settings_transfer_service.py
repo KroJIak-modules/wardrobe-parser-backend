@@ -59,6 +59,7 @@ _PRICING_EXPORT_FIELDS = [
     "bybit_extra_rub",
     "eur_to_usd_rate",
     "gbp_to_usd_rate",
+    "jpy_to_usd_rate",
     "final_rounding_mode",
     "payment_fee_rate",
     "customs_processing_rate",
@@ -78,7 +79,7 @@ _PRICING_IMPORT_FIELDS = set(_PRICING_EXPORT_FIELDS)
 
 def _normalize_currency(raw: str | None, *, default: str = "RUB") -> str:
     value = (raw or default).strip().upper()
-    if value not in {"RUB", "USD", "EUR", "GBP"}:
+    if value not in {"RUB", "USD", "EUR", "GBP", "JPY"}:
         return default
     return value
 
