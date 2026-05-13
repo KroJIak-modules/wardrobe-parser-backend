@@ -63,7 +63,11 @@ def _file_response_for_asset(asset_id: int, db: Session) -> FileResponse:
     path = Path(asset.stored_path)
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Файл изображения не найден")
-    return FileResponse(path)
+    response = FileResponse(path)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @router.get("/state", response_model=ShowcaseMediaSettingsResponse)
