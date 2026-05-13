@@ -17,11 +17,13 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Res
 from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.models import ImageAsset, ParserBrandMapping, ParserCategory, ParserProduct, ParserProductCategoryMatch, ParserSource
+from app.models.pricing import ParserSupplier
 from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
@@ -58,6 +60,8 @@ _CATALOG_MAX_SCAN_PAGES = 8
 _NO_BRAND_FILTER_TOKEN = "__NO_BRAND__"
 _PRODUCT_UPLOAD_DIR = Path(__file__).resolve().parents[3] / "uploads" / "products"
 _ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+_MANUAL_SOURCE_NAME = "__manual_admin_source__"
+_MANUAL_SOURCE_URL = "manual://admin/products"
 
 
 class InvalidProductStatusError(ValueError):
@@ -92,6 +96,42 @@ def _assert_allowed_product_status(value: Any) -> str:
     if normalized not in _ALLOWED_PRODUCT_STATUSES:
         raise InvalidProductStatusError(f"Invalid product status in storage: {normalized!r}")
     return normalized
+
+
+class ProductVariantIn(BaseModel):
+    title: str
+    price: float | None = None
+    available: bool = True
+
+
+class CreateManualProductRequest(BaseModel):
+    title: str
+    description: str | None = None
+    vendor: str | None = None
+    product_type: str | None = None
+    currency: str = "USD"
+    variants: list[ProductVariantIn] = []
+    manual_image_asset_ids: list[int] = []
+
+
+def _normalize_manual_variants(raw_variants: list[ProductVariantIn]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in raw_variants:
+        title = str(item.title or "").strip()
+        if not title:
+            continue
+        price = _safe_float(item.price)
+        out.append(
+            {
+                "title": title,
+                "price": f"{price:.2f}" if price is not None and price >= 0 else None,
+                "available": bool(item.available),
+                "inventory_quantity": 1 if bool(item.available) else 0,
+            }
+        )
+    if out:
+        return out
+    return [{"title": "Default", "price": None, "available": True, "inventory_quantity": 1}]
 
 
 def _with_active_sources(query):
@@ -248,6 +288,7 @@ def _apply_product_overrides_to_item(
     product: ParserProduct | None,
     *,
     default_show_description: bool = True,
+    apply_visibility_rules: bool = True,
 ) -> None:
     if product is None:
         return
@@ -279,8 +320,8 @@ def _apply_product_overrides_to_item(
         if description_visible_override is not None
         else bool(default_show_description)
     )
-    if not effective_show_description:
-        item["description"] = None
+    # Do not erase description payload for admin product pages.
+    # Visibility is represented by product_edit.description_visible_effective and handled by UI.
     item["image_urls"] = effective_image_urls
     item["image_count"] = len(effective_image_urls)
     item["product_edit"] = {
@@ -352,6 +393,32 @@ def _extract_product_description(item: dict[str, Any]) -> str | None:
             if normalized:
                 return normalized
     return None
+
+
+def _get_or_create_manual_source(db: Session) -> ParserSource:
+    existing = (
+        db.query(ParserSource)
+        .filter(ParserSource.deleted_at.is_(None))
+        .filter(ParserSource.name == _MANUAL_SOURCE_NAME)
+        .first()
+    )
+    if existing is not None:
+        return existing
+    supplier = db.query(ParserSupplier).order_by(ParserSupplier.id.asc()).first()
+    if supplier is None:
+        raise HTTPException(status_code=500, detail="Нет доступного supplier для ручного источника")
+    source = ParserSource(
+        name=_MANUAL_SOURCE_NAME,
+        url=_MANUAL_SOURCE_URL,
+        enabled=True,
+        supplier_id=int(supplier.id),
+        show_description=True,
+        show_images=True,
+        hide_auto_added_products=False,
+    )
+    db.add(source)
+    db.flush()
+    return source
 
 
 def _extract_buyout_price_rub(item: dict[str, Any]) -> float | None:
@@ -524,6 +591,7 @@ def _apply_backend_pricing_to_item(
     settings,
     source_profile_map: dict[int, Any],
     weight_rules: list[Any],
+    apply_source_visibility_rules: bool = True,
     favorite_manual_category_ids_by_product: dict[int, list[int]] | None = None,
 ) -> dict[str, Any]:
     source_id = _safe_int(item.get("source_id"))
@@ -600,14 +668,13 @@ def _apply_backend_pricing_to_item(
     if source_profile is not None and not bool(getattr(source_profile, "enabled", True)):
         item["status"] = "unavailable"
 
-    # Source-level attribute visibility rules.
-    if source_profile is not None and not bool(getattr(source_profile, "show_description", True)):
-        item["description"] = None
+    # Source-level attribute visibility rules are for public projection.
+    if apply_source_visibility_rules and source_profile is not None and not bool(getattr(source_profile, "show_description", True)):
         product_edit = item.get("product_edit")
         if isinstance(product_edit, dict):
             product_edit["description_visible_effective"] = False
 
-    if source_profile is not None and not bool(getattr(source_profile, "show_images", True)):
+    if apply_source_visibility_rules and source_profile is not None and not bool(getattr(source_profile, "show_images", True)):
         product_edit = item.get("product_edit")
         manual_urls = []
         manual_order = []
@@ -648,6 +715,7 @@ def _safe_apply_backend_pricing_to_item(
     settings,
     source_profile_map: dict[int, Any],
     weight_rules: list[Any],
+    apply_source_visibility_rules: bool = True,
     favorite_manual_category_ids_by_product: dict[int, list[int]] | None = None,
 ) -> dict[str, Any]:
     try:
@@ -657,6 +725,7 @@ def _safe_apply_backend_pricing_to_item(
             settings=settings,
             source_profile_map=source_profile_map,
             weight_rules=weight_rules,
+            apply_source_visibility_rules=apply_source_visibility_rules,
             favorite_manual_category_ids_by_product=favorite_manual_category_ids_by_product,
         )
     except InvalidProductStatusError:
@@ -1837,7 +1906,11 @@ def get_pricing_example_product(
         }
     },
 )
-async def get_product(product_id: int, request: Request, db: Session = Depends(get_db)) -> Response:
+async def get_product(
+    product_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Response:
     local_product = ParserProductRepository(db).get_active_by_id(product_id)
     if local_product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
@@ -1884,6 +1957,7 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
             payload,
             local_product,
             default_show_description=default_show_description,
+            apply_visibility_rules=False,
         )
         _apply_brand_mapping_to_item(payload, brand_mapping_service, mapping_by_key)
     elif not default_show_description:
@@ -1902,6 +1976,7 @@ async def get_product(product_id: int, request: Request, db: Session = Depends(g
             settings=settings,
             source_profile_map=source_profile_map,
             weight_rules=weight_rules,
+            apply_source_visibility_rules=False,
             favorite_manual_category_ids_by_product=favorite_manual_map,
         )
     except InvalidProductStatusError as exc:
@@ -2112,6 +2187,76 @@ async def upload_product_image(
 ):
     image_asset_id = _save_manual_product_image(file, db)
     return {"ok": True, "image_asset_id": image_asset_id}
+
+
+@router.post("/products/manual")
+def create_manual_product(
+    payload: CreateManualProductRequest,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+) -> dict[str, Any]:
+    title = str(payload.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Название товара обязательно")
+
+    manual_source = _get_or_create_manual_source(db)
+    currency = str(payload.currency or "USD").strip().upper() or "USD"
+    description = str(payload.description or "").strip() or None
+    vendor = str(payload.vendor or "").strip() or None
+    product_type = str(payload.product_type or "").strip() or None
+    variants = _normalize_manual_variants(payload.variants)
+
+    variant_prices = [
+        _safe_float(item.get("price"))
+        for item in variants
+        if _safe_float(item.get("price")) is not None and _safe_float(item.get("price")) >= 0
+    ]
+    price = min(variant_prices) if variant_prices else None
+    status_value = "available" if any(bool(item.get("available")) for item in variants) else "out_of_stock"
+
+    image_ids = _normalize_int_list(payload.manual_image_asset_ids)
+    manual_image_urls: list[str] = []
+    if image_ids:
+        assets = (
+            db.query(ImageAsset)
+            .filter(ImageAsset.deleted_at.is_(None))
+            .filter(ImageAsset.id.in_(image_ids))
+            .all()
+        )
+        by_id = {int(asset.id): asset for asset in assets}
+        for image_id in image_ids:
+            asset = by_id.get(int(image_id))
+            if asset is None:
+                continue
+            manual_image_urls.append(f"/api/v1/products/images/{int(asset.id)}")
+
+    product = ParserProduct(
+        source_id=int(manual_source.id),
+        external_id=None,
+        handle=f"manual-{int(datetime.now().timestamp() * 1000)}-{random.randint(1000, 9999)}",
+        title=title,
+        description=description,
+        vendor=vendor,
+        product_type=product_type,
+        url=f"manual://product/{int(datetime.now().timestamp() * 1000)}",
+        price=price,
+        currency=currency,
+        status=status_value,
+        image_count=len(manual_image_urls),
+        image_urls=list(manual_image_urls),
+        variants=variants,
+        is_auto_added=False,
+        images_sync_locked=True,
+        manual_image_asset_ids=list(manual_image_urls),
+        manual_image_order=[f"m:{url}" for url in manual_image_urls],
+        hidden_source_image_asset_ids=[],
+        source_price=price,
+        source_currency=currency,
+    )
+    db.add(product)
+    db.commit()
+    db.refresh(product)
+    return {"ok": True, "id": int(product.id)}
 
 
 @router.get("/products/images/{image_id}")

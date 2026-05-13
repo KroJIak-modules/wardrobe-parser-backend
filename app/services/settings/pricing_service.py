@@ -925,6 +925,7 @@ class PricingSettingsService:
         return AdminUiSettingsResponse(
             designers_min_products=max(1, int(getattr(entity, "designers_min_products", 1) or 1)),
             designers_exclude_store_vendors=bool(getattr(entity, "designers_exclude_store_vendors", False)),
+            auto_sync_period_minutes=max(60, int(getattr(entity, "auto_sync_period_minutes", 60) or 60)),
             showcase_hero_image_asset_id=(
                 int(getattr(entity, "showcase_hero_image_asset_id"))
                 if isinstance(getattr(entity, "showcase_hero_image_asset_id", None), int)
@@ -943,6 +944,8 @@ class PricingSettingsService:
             patch["designers_min_products"] = max(1, int(patch.get("designers_min_products") or 1))
         if "designers_exclude_store_vendors" in patch:
             patch["designers_exclude_store_vendors"] = bool(patch.get("designers_exclude_store_vendors"))
+        if "auto_sync_period_minutes" in patch:
+            patch["auto_sync_period_minutes"] = max(60, int(patch.get("auto_sync_period_minutes") or 60))
         if "showcase_hero_image_asset_id" in patch:
             raw_hero = patch.get("showcase_hero_image_asset_id")
             patch["showcase_hero_image_asset_id"] = int(raw_hero) if isinstance(raw_hero, int) and raw_hero > 0 else None

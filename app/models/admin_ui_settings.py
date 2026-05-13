@@ -12,6 +12,7 @@ class AdminUiSettings(Base):
     designers_exclude_store_vendors = Column(Boolean, nullable=False, default=False)
     showcase_hero_image_asset_id = Column(Integer, nullable=True)
     showcase_carousel_image_asset_ids = Column(JSON, nullable=False, default=list)
+    auto_sync_period_minutes = Column(Integer, nullable=False, default=60)
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

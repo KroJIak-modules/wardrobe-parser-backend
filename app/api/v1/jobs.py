@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models import ParserProduct, ParserSource, SyncAppliedBatch, SyncJobRuntime
+from app.services.catalog.category_index_service import CategoryIndexService
 
 
 router = APIRouter(tags=["jobs"])
@@ -232,6 +233,57 @@ def _find_backend_source(db, source_key: str) -> ParserSource | None:
     return None
 
 
+def _default_supplier_id(db) -> int | None:
+    from app.models.pricing import ParserSupplier
+
+    row = (
+        db.query(ParserSupplier.id)
+        .filter(ParserSupplier.key == "eu")
+        .order_by(ParserSupplier.id.asc())
+        .first()
+    )
+    if row is not None:
+        return int(row[0])
+    row_any = db.query(ParserSupplier.id).order_by(ParserSupplier.id.asc()).first()
+    if row_any is None:
+        return None
+    return int(row_any[0])
+
+
+def _ensure_backend_source(db, source_key: str, sample_item: dict[str, Any] | None = None) -> ParserSource | None:
+    existing = _find_backend_source(db, source_key)
+    if existing is not None:
+        return existing
+    supplier_id = _default_supplier_id(db)
+    if supplier_id is None:
+        LOGGER.error("jobs_ingest: no supplier found, cannot create source key=%s", source_key)
+        return None
+    normalized_key = str(source_key or "").strip().lower()
+    if not normalized_key:
+        return None
+    sample_url = ""
+    if isinstance(sample_item, dict):
+        sample_url = str(sample_item.get("source_product_url") or sample_item.get("url") or "").strip()
+    base_url = f"https://{normalized_key}/"
+    name = normalized_key
+    row = ParserSource(
+        name=name,
+        url=base_url,
+        enabled=True,
+        supplier_id=supplier_id,
+    )
+    db.add(row)
+    db.flush()
+    LOGGER.info(
+        "jobs_ingest: auto-created parser_source id=%s key=%s url=%s sample=%s",
+        row.id,
+        source_key,
+        base_url,
+        sample_url or "-",
+    )
+    return row
+
+
 def _update_source_sync_telemetry(
     source_key: str,
     *,
@@ -274,7 +326,7 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
     db = SessionLocal()
     upserts = 0
     try:
-        source = _find_backend_source(db, source_key)
+        source = _ensure_backend_source(db, source_key, items[0] if items else None)
         if source is None:
             LOGGER.warning("jobs_ingest: source not found for key=%s", source_key)
             return (expected, 0)
@@ -538,6 +590,7 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
                 _backfill_source_sync_telemetry_from_events(agg_job.service_job_id)
             except Exception:
                 LOGGER.exception("failed to backfill source sync telemetry service_job_id=%s", agg_job.service_job_id)
+            _rebuild_category_index_after_sync()
             agg_job.completed_at = _utcnow()
             agg_job.can_cancel = False
             if not agg_job.current_stage:
@@ -601,6 +654,17 @@ def _backfill_source_sync_telemetry_from_events(service_job_id: str) -> None:
         if next_cursor <= cursor:
             break
         cursor = next_cursor
+
+
+def _rebuild_category_index_after_sync() -> None:
+    db = SessionLocal()
+    try:
+        CategoryIndexService(db).rebuild_full()
+    except Exception:
+        db.rollback()
+        LOGGER.exception("failed to rebuild category index after sync")
+    finally:
+        db.close()
 
 
 @router.post("/jobs")

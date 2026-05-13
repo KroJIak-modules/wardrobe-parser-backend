@@ -185,6 +185,7 @@ class ShowcaseCarouselOrderRequest(BaseModel):
 class AdminUiSettingsResponse(BaseModel):
     designers_min_products: int = Field(ge=1, le=1_000_000)
     designers_exclude_store_vendors: bool = False
+    auto_sync_period_minutes: int = Field(ge=60, le=1_000_000, default=60)
     showcase_hero_image_asset_id: int | None = None
     showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
 
@@ -192,6 +193,7 @@ class AdminUiSettingsResponse(BaseModel):
 class AdminUiSettingsUpdateRequest(BaseModel):
     designers_min_products: int | None = Field(default=None, ge=1, le=1_000_000)
     designers_exclude_store_vendors: bool | None = None
+    auto_sync_period_minutes: int | None = Field(default=None, ge=60, le=1_000_000)
     showcase_hero_image_asset_id: int | None = None
     showcase_carousel_image_asset_ids: list[int] | None = None
 
@@ -298,6 +300,7 @@ class SettingsTransferPricingSettings(BaseModel):
 class SettingsTransferAdminUiSettings(BaseModel):
     designers_min_products: int = Field(ge=1, le=1_000_000)
     designers_exclude_store_vendors: bool = False
+    auto_sync_period_minutes: int = Field(ge=60, le=1_000_000, default=60)
     showcase_hero_image_asset_id: int | None = None
     showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
 

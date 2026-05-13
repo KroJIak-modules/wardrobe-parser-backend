@@ -124,7 +124,9 @@ def _map_source(db: Session, item: dict) -> dict:
     profile_id = int(profile.id) if profile is not None else 0
     return {
         "key": source_key,
-        "source_id": int(item.get("id") or 0),
+        # Must match ParserProduct.source_id from backend DB, otherwise UI source mapping is corrupted.
+        "source_id": profile_id,
+        "service_source_id": int(item.get("id") or 0),
         "name": str(profile.name if profile is not None else source_key),
         "base_url": source_url,
         "parser_type": "parser",

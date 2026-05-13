@@ -131,6 +131,7 @@ class SettingsTransferService:
         admin_ui = SettingsTransferAdminUiSettings(
             designers_min_products=max(1, int(getattr(ui_row, "designers_min_products", 1) or 1)),
             designers_exclude_store_vendors=bool(getattr(ui_row, "designers_exclude_store_vendors", False)),
+            auto_sync_period_minutes=max(60, int(getattr(ui_row, "auto_sync_period_minutes", 60) or 60)),
             showcase_hero_image_asset_id=(
                 int(getattr(ui_row, "showcase_hero_image_asset_id"))
                 if isinstance(getattr(ui_row, "showcase_hero_image_asset_id", None), int)
@@ -356,6 +357,7 @@ class SettingsTransferService:
         normalized = {
             "designers_min_products": max(1, int(values.get("designers_min_products") or 1)),
             "designers_exclude_store_vendors": bool(values.get("designers_exclude_store_vendors")),
+            "auto_sync_period_minutes": max(60, int(values.get("auto_sync_period_minutes") or 60)),
             "showcase_hero_image_asset_id": int(values["showcase_hero_image_asset_id"]) if isinstance(values.get("showcase_hero_image_asset_id"), int) and int(values.get("showcase_hero_image_asset_id")) > 0 else None,
             "showcase_carousel_image_asset_ids": PricingSettingsService._normalize_image_asset_ids(values.get("showcase_carousel_image_asset_ids"), limit=20),
         }
