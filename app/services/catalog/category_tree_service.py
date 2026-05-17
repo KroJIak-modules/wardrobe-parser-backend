@@ -10,7 +10,15 @@ from fastapi import HTTPException, status
 from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
-from app.models import AdminUiSettings, ParserBrandMapping, ParserCategory, ParserCategoryKeyword, ParserProduct, ParserSource
+from app.models import (
+    AdminUiSettings,
+    ParserBrandMapping,
+    ParserCategory,
+    ParserCategoryKeyword,
+    ParserProduct,
+    ParserProductOriginVariant,
+    ParserSource,
+)
 from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
@@ -623,10 +631,18 @@ class CategoryTreeService:
         if not rows:
             return []
         product_ids = {int(row.product_id) for row in rows}
+        origin_source_subq = (
+            self.db.query(
+                ParserProductOriginVariant.product_id.label("product_id"),
+                func.min(ParserProductOriginVariant.source_id).label("source_id"),
+            )
+            .group_by(ParserProductOriginVariant.product_id)
+            .subquery()
+        )
         products = (
             self.db.query(
                 ParserProduct.id.label("id"),
-                ParserProduct.source_id.label("source_id"),
+                origin_source_subq.c.source_id.label("source_id"),
                 ParserProduct.title.label("title"),
                 ParserProduct.url.label("url"),
                 ParserProduct.status.label("status"),
@@ -634,7 +650,8 @@ class CategoryTreeService:
                 ParserProduct.product_type.label("product_type"),
                 ParserSource.name.label("source_name"),
             )
-            .join(ParserSource, ParserSource.id == ParserProduct.source_id)
+            .join(origin_source_subq, origin_source_subq.c.product_id == ParserProduct.id)
+            .join(ParserSource, ParserSource.id == origin_source_subq.c.source_id)
             .filter(ParserProduct.id.in_(list(product_ids)))
             .filter(ParserProduct.deleted_at.is_(None))
             .all()
@@ -672,10 +689,18 @@ class CategoryTreeService:
         scan_limit = max(40, min(200, safe_limit * 20))
         existing = {int(item.product_id) for item in self.manual_product_repo.get_by_category(category_id)}
         pattern = f"%{normalized}%"
+        origin_source_subq = (
+            self.db.query(
+                ParserProductOriginVariant.product_id.label("product_id"),
+                func.min(ParserProductOriginVariant.source_id).label("source_id"),
+            )
+            .group_by(ParserProductOriginVariant.product_id)
+            .subquery()
+        )
         rows = (
             self.db.query(
                 ParserProduct.id.label("id"),
-                ParserProduct.source_id.label("source_id"),
+                origin_source_subq.c.source_id.label("source_id"),
                 ParserProduct.title.label("title"),
                 ParserProduct.url.label("url"),
                 ParserProduct.status.label("status"),
@@ -683,7 +708,8 @@ class CategoryTreeService:
                 ParserProduct.product_type.label("product_type"),
                 ParserSource.name.label("source_name"),
             )
-            .join(ParserSource, ParserSource.id == ParserProduct.source_id)
+            .join(origin_source_subq, origin_source_subq.c.product_id == ParserProduct.id)
+            .join(ParserSource, ParserSource.id == origin_source_subq.c.source_id)
             .filter(ParserProduct.deleted_at.is_(None))
             .filter(ParserProduct.status == "available")
             .filter(

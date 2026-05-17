@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models import ParserProduct
+from app.models import ParserProduct, ParserProductOriginVariant
 from app.repositories.base import BaseRepository
 
 
@@ -69,9 +69,10 @@ class ParserProductRepository(BaseRepository[ParserProduct]):
             self.query()
             .with_entities(
                 func.min(func.trim(ParserProduct.vendor)).label("vendor"),
-                func.array_agg(func.distinct(ParserProduct.source_id)).label("source_ids"),
+                func.array_agg(func.distinct(ParserProductOriginVariant.source_id)).label("source_ids"),
                 func.count(ParserProduct.id).label("cnt"),
             )
+            .join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
             .filter(ParserProduct.deleted_at.is_(None))
             .filter(ParserProduct.vendor.isnot(None))
             .filter(func.trim(ParserProduct.vendor) != "")
@@ -108,17 +109,18 @@ class ParserProductRepository(BaseRepository[ParserProduct]):
             self.query()
             .with_entities(
                 func.min(func.trim(ParserProduct.vendor)).label("vendor"),
-                ParserProduct.source_id.label("source_id"),
+                ParserProductOriginVariant.source_id.label("source_id"),
                 func.count(ParserProduct.id).label("source_count"),
                 vendor_totals_subq.c.total_count.label("total_count"),
             )
+            .join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
             .join(vendor_totals_subq, vendor_totals_subq.c.vendor_key == normalized_vendor)
             .filter(ParserProduct.deleted_at.is_(None))
             .filter(ParserProduct.vendor.isnot(None))
             .filter(func.trim(ParserProduct.vendor) != "")
-            .group_by(normalized_vendor, ParserProduct.source_id, vendor_totals_subq.c.total_count)
+            .group_by(normalized_vendor, ParserProductOriginVariant.source_id, vendor_totals_subq.c.total_count)
             .having(vendor_totals_subq.c.total_count >= safe_min)
-            .order_by(normalized_vendor.asc(), ParserProduct.source_id.asc())
+            .order_by(normalized_vendor.asc(), ParserProductOriginVariant.source_id.asc())
             .all()
         )
         result: list[tuple[str, int, int]] = []

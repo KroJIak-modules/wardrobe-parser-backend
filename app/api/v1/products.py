@@ -22,7 +22,15 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models import ImageAsset, ParserBrandMapping, ParserCategory, ParserProduct, ParserProductCategoryMatch, ParserSource
+from app.models import (
+    ImageAsset,
+    ParserBrandMapping,
+    ParserCategory,
+    ParserProduct,
+    ParserProductCategoryMatch,
+    ParserProductOriginVariant,
+    ParserSource,
+)
 from app.models.pricing import ParserSupplier
 from app.repositories import (
     ParserCategoryKeywordRepository,
@@ -135,11 +143,86 @@ def _normalize_manual_variants(raw_variants: list[ProductVariantIn]) -> list[dic
 
 
 def _with_active_sources(query):
-    return (
-        query.join(ParserSource, ParserSource.id == ParserProduct.source_id)
-        .filter(ParserSource.deleted_at.is_(None))
-        .filter(ParserSource.enabled.is_(True))
+    return query.filter(
+        select(ParserProductOriginVariant.id)
+        .join(ParserSource, ParserSource.id == ParserProductOriginVariant.source_id)
+        .where(ParserProductOriginVariant.product_id == ParserProduct.id)
+        .where(ParserSource.deleted_at.is_(None))
+        .where(ParserSource.enabled.is_(True))
+        .exists()
     )
+
+
+def _source_profile_map_for_products(
+    db: Session,
+    *,
+    product_ids: set[int],
+    fallback_source_ids: set[int] | None = None,
+) -> dict[int, ParserSource]:
+    if not product_ids and not fallback_source_ids:
+        return {}
+    origin_source_ids = {
+        int(row[0])
+        for row in (
+            db.query(ParserProductOriginVariant.source_id)
+            .filter(ParserProductOriginVariant.product_id.in_(list(product_ids)))
+            .distinct()
+            .all()
+        )
+        if row and row[0] is not None
+    }
+    if fallback_source_ids:
+        origin_source_ids.update(int(source_id) for source_id in fallback_source_ids)
+    if not origin_source_ids:
+        return {}
+    source_repo = ParserSourceRepository(db)
+    return {
+        int(source.id): source
+        for source in source_repo.get_active_by_ids(origin_source_ids)
+    }
+
+
+def _primary_source_ids_for_products(
+    db: Session,
+    *,
+    product_ids: set[int],
+    fallback_source_ids_by_product: dict[int, int] | None = None,
+) -> dict[int, int]:
+    if not product_ids and not fallback_source_ids_by_product:
+        return {}
+    rows = (
+        db.query(
+            ParserProductOriginVariant.product_id.label("product_id"),
+            func.min(ParserProductOriginVariant.source_id).label("source_id"),
+        )
+        .filter(ParserProductOriginVariant.product_id.in_(list(product_ids or set())))
+        .group_by(ParserProductOriginVariant.product_id)
+        .all()
+        if product_ids
+        else []
+    )
+    out = {
+        int(row.product_id): int(row.source_id)
+        for row in rows
+        if row.product_id is not None and row.source_id is not None
+    }
+    for product_id, source_id in (fallback_source_ids_by_product or {}).items():
+        out.setdefault(int(product_id), int(source_id))
+    return out
+
+
+def _inject_effective_source_id(
+    item: dict[str, Any],
+    *,
+    product_id: int | None,
+    primary_source_by_product: dict[int, int],
+) -> None:
+    if product_id is None:
+        return
+    source_id = primary_source_by_product.get(int(product_id))
+    if source_id is None:
+        return
+    item["source_id"] = int(source_id)
 
 
 def _variant_is_available(variant: Any) -> bool:
@@ -899,7 +982,12 @@ def _apply_admin_product_filters(
     mapped_vendor_expr = _mapped_vendor_label_expr()
     normalized_type_expr = func.lower(func.trim(func.coalesce(ParserProduct.product_type, "")))
     if source_id is not None:
-        query = query.filter(ParserProduct.source_id == int(source_id))
+        query = query.filter(
+            select(ParserProductOriginVariant.id)
+            .where(ParserProductOriginVariant.product_id == ParserProduct.id)
+            .where(ParserProductOriginVariant.source_id == int(source_id))
+            .exists()
+        )
     if vendor:
         if vendor == _NO_BRAND_FILTER_TOKEN:
             query = query.filter(
@@ -1059,17 +1147,23 @@ def get_admin_products_table(
         for product_id, category_ids in manual_map.items()
     }
 
-    source_repo = ParserSourceRepository(db)
-    source_profile_map = {
-        int(source.id): source
-        for source in source_repo.get_active_by_ids({int(item.source_id) for item in rows})
-    }
+    source_profile_map = _source_profile_map_for_products(db, product_ids={int(item.id) for item in rows})
+    primary_source_by_product = _primary_source_ids_for_products(
+        db,
+        product_ids={int(item.id) for item in rows},
+        fallback_source_ids_by_product={
+            int(item.id): int(item.source_id)
+            for item in rows
+            if getattr(item, "source_id", None) is not None
+        },
+    )
     brand_mapping_service = BrandMappingService(db)
     mapping_by_key = brand_mapping_service.get_mapping_by_key()
 
     items: list[dict[str, Any]] = []
     for row in rows:
         raw_item = _product_row_to_item(row, default_show_description=default_show_description)
+        _inject_effective_source_id(raw_item, product_id=int(row.id), primary_source_by_product=primary_source_by_product)
         _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
         _apply_internal_categories_from_ids(
             raw_item,
@@ -1275,9 +1369,23 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
         q = _with_active_sources(db.query(ParserProduct)).filter(ParserProduct.deleted_at.is_(None)).order_by(ParserProduct.id.desc())
         total = int(q.count())
         rows = q.offset(offset).limit(limit).all()
+        primary_source_by_product = _primary_source_ids_for_products(
+            db,
+            product_ids={int(row.id) for row in rows},
+            fallback_source_ids_by_product={
+                int(row.id): int(row.source_id)
+                for row in rows
+                if getattr(row, "source_id", None) is not None
+            },
+        )
+        normalized_items: list[dict[str, Any]] = []
+        for row in rows:
+            item = _product_row_to_item(row)
+            _inject_effective_source_id(item, product_id=int(row.id), primary_source_by_product=primary_source_by_product)
+            normalized_items.append(item)
         return JSONResponse(
             content={
-                "items": [_product_row_to_item(row) for row in rows],
+                "items": normalized_items,
                 "total": total,
                 "limit": limit,
                 "offset": offset,
@@ -1301,16 +1409,6 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
     except Exception:
         LOGGER.exception("Failed to load weight rules for /products; fallback to empty rules")
         weight_rules = []
-    source_repo = ParserSourceRepository(db)
-    source_ids = {
-        source_id
-        for source_id in (_safe_int(item.get("source_id")) for item in items if isinstance(item, dict))
-        if source_id is not None
-    }
-    source_profile_map = {
-        int(source.id): source
-        for source in source_repo.get_active_by_ids(source_ids)
-    }
     category_repo = ParserCategoryRepository(db)
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
@@ -1325,6 +1423,31 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
         for product_id in (_safe_int(item.get("id")) for item in items if isinstance(item, dict))
         if product_id is not None
     }
+    fallback_source_ids = {
+        source_id
+        for source_id in (_safe_int(item.get("source_id")) for item in items if isinstance(item, dict))
+        if source_id is not None
+    }
+    source_profile_map = _source_profile_map_for_products(
+        db,
+        product_ids=product_ids,
+        fallback_source_ids=fallback_source_ids,
+    )
+    primary_source_by_product = _primary_source_ids_for_products(
+        db,
+        product_ids=product_ids,
+        fallback_source_ids_by_product={
+            int(product_id): int(source_id)
+            for product_id, source_id in (
+                (
+                    _safe_int(item.get("id")) if isinstance(item, dict) else None,
+                    _safe_int(item.get("source_id")) if isinstance(item, dict) else None,
+                )
+                for item in items
+            )
+            if product_id is not None and source_id is not None
+        },
+    )
     local_product_map: dict[int, ParserProduct] = {}
     if product_ids:
         for local_product in (
@@ -1360,6 +1483,7 @@ async def get_products(request: Request, db: Session = Depends(get_db)) -> Respo
                 )
             elif not default_show_description:
                 item["description"] = None
+            _inject_effective_source_id(item, product_id=product_id, primary_source_by_product=primary_source_by_product)
             _apply_brand_mapping_to_item(item, brand_mapping_service, mapping_by_key)
             if product_id is not None:
                 _apply_internal_categories_from_ids(
@@ -1501,7 +1625,6 @@ def get_catalog_products(
     decoded_cursor: tuple[datetime, int] | None = _decode_cursor(cursor) if cursor else None
     product_repo = ParserProductRepository(db)
     manual_repo = ParserCategoryManualProductRepository(db)
-    source_repo = ParserSourceRepository(db)
     brand_mapping_service = BrandMappingService(db)
     mapping_by_key = brand_mapping_service.get_mapping_by_key()
     favorite_category_ids = {int(category.id) for category in category_repo.get_favorites()}
@@ -1513,15 +1636,17 @@ def get_catalog_products(
 
     for _ in range(_CATALOG_MAX_SCAN_PAGES):
         query = (
-            product_repo.query()
-            .join(ParserSource, ParserSource.id == ParserProduct.source_id)
-            .filter(ParserSource.deleted_at.is_(None))
-            .filter(ParserSource.enabled.is_(True))
+            _with_active_sources(product_repo.query())
             .filter(ParserProduct.deleted_at.is_(None))
             .filter(ParserProduct.status.in_(tuple(_PUBLIC_PRODUCT_STATUSES)))
         )
         if source_id is not None:
-            query = query.filter(ParserProduct.source_id == int(source_id))
+            query = query.filter(
+                select(ParserProductOriginVariant.id)
+                .where(ParserProductOriginVariant.product_id == ParserProduct.id)
+                .where(ParserProductOriginVariant.source_id == int(source_id))
+                .exists()
+            )
         if normalized_search:
             pattern = f"%{normalized_search}%"
             mapped_vendor_expr = _mapped_vendor_label_expr()
@@ -1585,13 +1710,23 @@ def get_catalog_products(
             int(product_id): [int(category_id) for category_id in category_ids if int(category_id) in favorite_category_ids]
             for product_id, category_ids in manual_map.items()
         }
-        source_profile_map = {
-            int(source.id): source
-            for source in source_repo.get_active_by_ids({int(item.source_id) for item in rows})
-        }
+        source_profile_map = _source_profile_map_for_products(
+            db,
+            product_ids={int(item.id) for item in rows},
+        )
+        primary_source_by_product = _primary_source_ids_for_products(
+            db,
+            product_ids={int(item.id) for item in rows},
+            fallback_source_ids_by_product={
+                int(item.id): int(item.source_id)
+                for item in rows
+                if getattr(item, "source_id", None) is not None
+            },
+        )
 
         for row in rows:
             raw_item = _product_row_to_item(row, default_show_description=default_show_description)
+            _inject_effective_source_id(raw_item, product_id=int(row.id), primary_source_by_product=primary_source_by_product)
             _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
             _apply_internal_categories_from_ids(
                 raw_item,
@@ -1736,17 +1871,23 @@ def get_admin_products(
         for product_id, category_ids in manual_map.items()
     }
 
-    source_repo = ParserSourceRepository(db)
-    source_profile_map = {
-        int(source.id): source
-        for source in source_repo.get_active_by_ids({int(item.source_id) for item in rows})
-    }
+    source_profile_map = _source_profile_map_for_products(db, product_ids={int(item.id) for item in rows})
+    primary_source_by_product = _primary_source_ids_for_products(
+        db,
+        product_ids={int(item.id) for item in rows},
+        fallback_source_ids_by_product={
+            int(item.id): int(item.source_id)
+            for item in rows
+            if getattr(item, "source_id", None) is not None
+        },
+    )
     brand_mapping_service = BrandMappingService(db)
     mapping_by_key = brand_mapping_service.get_mapping_by_key()
 
     items: list[dict[str, Any]] = []
     for row in rows:
         raw_item = _product_row_to_item(row, default_show_description=default_show_description)
+        _inject_effective_source_id(raw_item, product_id=int(row.id), primary_source_by_product=primary_source_by_product)
         _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
         _apply_internal_categories_from_ids(
             raw_item,
@@ -1835,13 +1976,18 @@ def get_pricing_example_product(
         LOGGER.exception("Failed to load weight rules for /products/pricing-example; fallback to empty rules")
         weight_rules = []
 
-    source_repo = ParserSourceRepository(db)
     brand_mapping_service = BrandMappingService(db)
     mapping_by_key = brand_mapping_service.get_mapping_by_key()
-    source_profile_map = {
-        int(source.id): source
-        for source in source_repo.get_active_by_ids({int(row.source_id)})
-    }
+    primary_source_by_product = _primary_source_ids_for_products(
+        db,
+        product_ids={int(row.id)},
+        fallback_source_ids_by_product={int(row.id): int(row.source_id)} if getattr(row, "source_id", None) is not None else None,
+    )
+    source_profile_map = _source_profile_map_for_products(
+        db,
+        product_ids={int(row.id)},
+        fallback_source_ids={int(row.source_id)} if getattr(row, "source_id", None) is not None else None,
+    )
     _apply_brand_mapping_to_item(raw_item, brand_mapping_service, mapping_by_key)
     enriched = _safe_apply_backend_pricing_to_item(
         item=raw_item,
@@ -1854,7 +2000,7 @@ def get_pricing_example_product(
     components = enriched.get("pricing_components")
     if not isinstance(components, dict):
         components = {}
-    source_profile = source_profile_map.get(int(row.source_id))
+    source_profile = source_profile_map.get(primary_source_by_product.get(int(row.id), -1))
 
     return {
         "product_id": int(row.id),
@@ -1931,10 +2077,20 @@ async def get_product(
     except Exception:
         LOGGER.exception("Failed to load weight rules for /products/{product_id}; fallback to empty rules")
         weight_rules = []
-    source_repo = ParserSourceRepository(db)
     source_id = _safe_int(payload.get("source_id"))
-    source_profile = source_repo.get_active_by_id(source_id) if source_id is not None else None
-    source_profile_map = {int(source_profile.id): source_profile} if source_profile is not None else {}
+    primary_source_by_product = _primary_source_ids_for_products(
+        db,
+        product_ids={int(local_product.id)},
+        fallback_source_ids_by_product={int(local_product.id): source_id} if source_id is not None else None,
+    )
+    effective_source_id = primary_source_by_product.get(int(local_product.id), source_id if source_id is not None else None)
+    if effective_source_id is not None:
+        payload["source_id"] = int(effective_source_id)
+    source_profile_map = _source_profile_map_for_products(
+        db,
+        product_ids={int(local_product.id)},
+        fallback_source_ids={int(effective_source_id)} if effective_source_id is not None else None,
+    )
     category_repo = ParserCategoryRepository(db)
     keyword_repo = ParserCategoryKeywordRepository(db)
     category_tree = build_tree(category_repo.get_all_active(), keyword_repo)
@@ -2038,7 +2194,6 @@ async def update_product(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет поддерживаемых полей для обновления")
 
     product_repo = ParserProductRepository(db)
-    source_repo = ParserSourceRepository(db)
     product = product_repo.get_active_by_id(product_id)
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
@@ -2087,7 +2242,22 @@ async def update_product(
         product.manual_image_order = manual_image_order
         product.images_sync_locked = True
 
-    source_profile = source_repo.get_active_by_id(int(product.source_id))
+    primary_source_by_product = _primary_source_ids_for_products(
+        db,
+        product_ids={int(product.id)},
+        fallback_source_ids_by_product={int(product.id): int(product.source_id)} if getattr(product, "source_id", None) is not None else None,
+    )
+    effective_source_id = primary_source_by_product.get(int(product.id), int(product.source_id) if getattr(product, "source_id", None) is not None else None)
+    source_profile_map = _source_profile_map_for_products(
+        db,
+        product_ids={int(product.id)},
+        fallback_source_ids={int(effective_source_id)} if effective_source_id is not None else None,
+    )
+    source_profile = (
+        source_profile_map.get(int(effective_source_id))
+        if effective_source_id is not None
+        else None
+    )
     source_auto_hide = bool(getattr(source_profile, "hide_auto_added_products", False))
     is_auto_added = bool(getattr(product, "is_auto_added", True))
     is_force_visible = bool(getattr(product, "auto_hide_force_visible", False))
@@ -2120,7 +2290,7 @@ async def update_product(
 
     patched_payload = {
         "id": int(product.id),
-        "source_id": int(product.source_id),
+        "source_id": int(effective_source_id) if effective_source_id is not None else int(product.source_id),
         "handle": str(product.handle),
         "title": str(product.title),
         "description": product.description,

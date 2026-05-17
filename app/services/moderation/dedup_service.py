@@ -6,9 +6,11 @@ from itertools import combinations
 from typing import Any, Iterable
 
 from fastapi import HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.models import ParserProductOriginVariant
 from app.repositories import ParserDedupDecisionRepository, ParserProductRepository, ParserSourceRepository
 from app.schemas.parser import (
     DedupCandidateListResponse,
@@ -58,7 +60,23 @@ class DedupService:
 
         settings_service = PricingSettingsService(self.db)
         pricing_settings = settings_service.get_settings(refresh_bybit=False)
-        source_ids = {int(item.source_id) for item in products if getattr(item, "source_id", None) is not None}
+        product_ids = {int(item.id) for item in products if getattr(item, "id", None) is not None}
+        origin_rows = (
+            self.db.query(
+                ParserProductOriginVariant.product_id.label("product_id"),
+                func.min(ParserProductOriginVariant.source_id).label("source_id"),
+            )
+            .filter(ParserProductOriginVariant.product_id.in_(list(product_ids)))
+            .group_by(ParserProductOriginVariant.product_id)
+            .all()
+        )
+        source_id_by_product = {
+            int(row.product_id): int(row.source_id)
+            for row in origin_rows
+            if row.product_id is not None and row.source_id is not None
+        }
+        source_ids = set(source_id_by_product.values())
+        source_ids.update(int(item.source_id) for item in products if getattr(item, "source_id", None) is not None)
         source_profile_map = {
             int(source.id): source
             for source in self.source_repo.get_active_by_ids(source_ids)
@@ -66,7 +84,10 @@ class DedupService:
 
         effective_prices: dict[int, float | None] = {}
         for product in products:
-            source_profile = source_profile_map.get(int(product.source_id))
+            source_id = source_id_by_product.get(int(product.id))
+            if source_id is None and getattr(product, "source_id", None) is not None:
+                source_id = int(product.source_id)
+            source_profile = source_profile_map.get(int(source_id)) if source_id is not None else None
             source_price = self._normalize_source_price(product.price, product.currency)
             source_currency = str(product.currency or "").upper() or None
             pricing = settings_service.calculate_for_product(
@@ -201,6 +222,9 @@ class DedupService:
 
         def variant_key(variant: dict[str, Any]) -> str:
             values = [
+                normalize_text(str(variant.get("source_key") or "")),
+                normalize_text(str(variant.get("source_product_url") or "")),
+                normalize_text(str(variant.get("source_variant_id") or "")),
                 normalize_text(str(variant.get("id") or "")),
                 normalize_text(str(variant.get("sku") or "")),
                 normalize_text(str(variant.get("title") or "")),

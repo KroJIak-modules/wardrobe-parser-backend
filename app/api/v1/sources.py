@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.models import ParserProduct, ParserSource
+from app.models import ParserProduct, ParserProductOriginVariant, ParserSource
 
 router = APIRouter(tags=["sources"])
 
@@ -81,8 +81,10 @@ def _find_profile(db: Session, source_key: str, source_url: str) -> ParserSource
 def _products_count(db: Session, source_id: int) -> int:
     return int(
         db.query(ParserProduct)
+        .join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
         .filter(ParserProduct.deleted_at.is_(None))
-        .filter(ParserProduct.source_id == int(source_id))
+        .filter(ParserProductOriginVariant.source_id == int(source_id))
+        .distinct(ParserProduct.id)
         .count()
     )
 
@@ -122,6 +124,14 @@ def _map_source(db: Session, item: dict) -> dict:
     source_url = str(item.get("url") or "").strip()
     profile = _find_profile(db, source_key, source_url)
     profile_id = int(profile.id) if profile is not None else 0
+    last_sync_status = str(getattr(profile, "last_sync_status", "") or "").strip().lower() if profile is not None else ""
+    is_password_protected = last_sync_status == "password_protected"
+    cfg = item.get("config") if isinstance(item.get("config"), dict) else {}
+    seq = cfg.get("strategy_sequence") if isinstance(cfg.get("strategy_sequence"), list) else []
+    normalized_seq = [str(x).strip().lower() for x in seq if str(x).strip()]
+    is_auto_ingest = bool(normalized_seq)
+    if normalized_seq and all(step in {"manual_link", "manual_link_import", "manual"} for step in normalized_seq):
+        is_auto_ingest = False
     return {
         "key": source_key,
         # Must match ParserProduct.source_id from backend DB, otherwise UI source mapping is corrupted.
@@ -143,6 +153,8 @@ def _map_source(db: Session, item: dict) -> dict:
         "last_sync_at": getattr(profile, "last_sync_at", None) if profile is not None else None,
         "last_sync_duration_sec": int(getattr(profile, "last_sync_duration_sec", 0) or 0) if profile is not None else 0,
         "last_sync_status": str(getattr(profile, "last_sync_status", "") or "").strip() or None if profile is not None else None,
+        "is_password_protected": is_password_protected,
+        "is_auto_ingest": is_auto_ingest,
     }
 
 
@@ -210,8 +222,10 @@ def patch_hide_auto(source_key: str, payload: HideAutoPayload, db: Session = Dep
     profile.hide_auto_added_products = bool(payload.hide_auto_added_products)
     rows = (
         db.query(ParserProduct)
+        .join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
         .filter(ParserProduct.deleted_at.is_(None))
-        .filter(ParserProduct.source_id == int(profile.id))
+        .filter(ParserProductOriginVariant.source_id == int(profile.id))
+        .distinct(ParserProduct.id)
         .all()
     )
     if bool(payload.hide_auto_added_products):

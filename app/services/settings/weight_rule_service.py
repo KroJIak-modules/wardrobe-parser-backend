@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings as app_settings
-from app.models import ParserProduct, ParserSource, ParserWeightRule
+from app.models import ParserProduct, ParserProductOriginVariant, ParserSource, ParserWeightRule
 from app.repositories import ParserWeightKeywordRepository, ParserWeightRuleRepository
 from app.schemas.parser import (
     WeightMissingProductResponse,
@@ -589,9 +589,19 @@ class WeightRuleService:
         safe_limit = max(1, min(limit, 5000))
         rules = self.get_matching_rules()
         probe_limit = min(safe_limit * 5, 20000)
+        origin_source_subq = (
+            self.db.query(
+                ParserProductOriginVariant.product_id.label("product_id"),
+                ParserProductOriginVariant.source_id.label("source_id"),
+            )
+            .distinct(ParserProductOriginVariant.product_id)
+            .order_by(ParserProductOriginVariant.product_id.asc(), ParserProductOriginVariant.id.asc())
+            .subquery()
+        )
         rows = (
             self.db.query(ParserProduct, ParserSource)
-            .join(ParserSource, ParserSource.id == ParserProduct.source_id)
+            .join(origin_source_subq, origin_source_subq.c.product_id == ParserProduct.id)
+            .join(ParserSource, ParserSource.id == origin_source_subq.c.source_id)
             .filter(ParserProduct.deleted_at.is_(None))
             .filter((ParserProduct.weight_grams.is_(None)) | (ParserProduct.weight_source == "missing"))
             .order_by(ParserProduct.updated_at.desc())
@@ -614,7 +624,7 @@ class WeightRuleService:
                     id=product.id,
                     title=product.title,
                     url=product.url,
-                    source_id=product.source_id,
+                    source_id=source.id,
                     source_name=source.name,
                 )
             )

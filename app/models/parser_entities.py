@@ -90,6 +90,11 @@ class ParserProduct(Base):
     deleted_at = Column(DateTime(timezone=True), nullable=True)
 
     source = relationship("ParserSource", back_populates="products")
+    origin_variants = relationship(
+        "ParserProductOriginVariant",
+        back_populates="product",
+        cascade="all, delete-orphan",
+    )
 
     __table_args__ = (
         Index("idx_parser_product_source_external_id", "source_id", "source_external_id"),
@@ -149,4 +154,33 @@ class ParserBrandMapping(Base):
 
     __table_args__ = (
         Index("idx_parser_brand_mapping_source_brand", "source_brand"),
+    )
+
+
+class ParserProductOriginVariant(Base):
+    """Variant-level source lineage for multi-source product aggregation."""
+
+    __tablename__ = "parser_product_origin_variant"
+
+    id = Column(Integer, primary_key=True)
+    origin_key = Column(String(512), nullable=False, unique=True)
+    product_id = Column(Integer, ForeignKey("parser_product.id", ondelete="CASCADE"), nullable=False)
+    source_id = Column(Integer, ForeignKey("parser_source.id", ondelete="RESTRICT"), nullable=False)
+    source_product_url = Column(String(2048), nullable=False)
+    source_variant_id = Column(String(255), nullable=True)
+    source_variant_title = Column(String(1024), nullable=True)
+    sku = Column(String(255), nullable=True)
+    price = Column(Float, nullable=True)
+    currency = Column(String(3), nullable=True)
+    available = Column(Boolean, nullable=False, default=True)
+    payload = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    product = relationship("ParserProduct", back_populates="origin_variants")
+    source = relationship("ParserSource")
+
+    __table_args__ = (
+        Index("idx_parser_origin_variant_product_id", "product_id"),
+        Index("idx_parser_origin_variant_source_id", "source_id"),
     )

@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from threading import Lock, Thread
 from time import sleep
 from typing import Any
+from urllib.parse import urlparse
 
+import hashlib
 import logging
 import requests
 from fastapi import APIRouter, HTTPException, status
@@ -15,7 +17,7 @@ from pydantic import BaseModel
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.models import ParserProduct, ParserSource, SyncAppliedBatch, SyncJobRuntime
+from app.models import ParserProduct, ParserProductOriginVariant, ParserSource, SyncAppliedBatch, SyncJobRuntime
 from app.services.catalog.category_index_service import CategoryIndexService
 
 
@@ -53,6 +55,219 @@ def _service_sync_base() -> str:
     return f"{settings.service_base_url.rstrip('/')}/api/v1/sync"
 
 
+def _load_source_strategy_sequence(source_key: str | None) -> list[str]:
+    key = str(source_key or "").strip().lower()
+    if not key:
+        return []
+    try:
+        res = requests.get(f"{_service_sync_base()}/sources", timeout=(3, 10))
+        res.raise_for_status()
+        payload = res.json()
+        if not isinstance(payload, list):
+            return []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            cur_key = str(item.get("key") or "").strip().lower()
+            if cur_key != key:
+                continue
+            cfg = item.get("config") if isinstance(item.get("config"), dict) else {}
+            seq = cfg.get("strategy_sequence") if isinstance(cfg.get("strategy_sequence"), list) else []
+            return [str(x).strip() for x in seq if str(x).strip()]
+    except Exception:
+        return []
+    return []
+
+
+_JADED_STRATEGY_RU: dict[str, str] = {
+    "shopify_json": "Shopify JSON",
+    "shopify_js": "Shopify JS",
+    "shopify_browser_extension": "Браузерный сценарий",
+}
+
+_STRATEGY_RU: dict[str, str] = {
+    "shopify_json": "Shopify JSON",
+    "shopify_js": "Shopify JS",
+    "shopify_browser_extension": "Браузерный сценарий",
+    "store_backlash_colorme": "ColorMe сценарий",
+    "vinted_jsonld": "Vinted JSON-LD",
+    "grailed_algolia_jsonld": "Grailed Algolia",
+    "goat_browser_extension": "GOAT браузерный сценарий",
+    "intl_protocol_index_cafe24": "Cafe24 сценарий",
+}
+
+_JADED_STAGE_RU: dict[str, str] = {
+    "discover_start": "Поиск товаров",
+    "discover_done": "Ссылки найдены",
+    "fetch_start": "Загрузка карточек",
+    "fetch_progress": "Обработка карточек",
+    "fetch_skip": "Пропуск карточки",
+    "run_done": "Этап завершен",
+    "start": "Старт стратегии",
+    "progress": "Выполнение стратегии",
+    "done": "Стратегия завершена",
+    "second_pass_done": "Повторная попытка завершена",
+    "pages_fetched": "Загрузка страниц каталога",
+    "page_loop_detected": "Обнаружено зацикливание страниц",
+}
+
+
+def _parse_processed_percent(raw_processed: Any) -> int | None:
+    text = str(raw_processed or "").strip()
+    if "/" not in text:
+        return None
+    try:
+        left, right = text.split("/", 1)
+        done = float(left.strip())
+        total = float(right.strip())
+        if total <= 0:
+            return None
+        return int(max(0, min(100, round((done / total) * 100))))
+    except Exception:
+        return None
+
+
+def _extract_percent_from_stage_text(stage_text: str | None) -> float | None:
+    text = str(stage_text or "").strip()
+    if not text:
+        return None
+    try:
+        tail = text.rsplit("|", 1)[1].strip()
+        if tail.endswith("%"):
+            val = float(tail[:-1].strip())
+            if 0.0 <= val <= 100.0:
+                return val
+    except Exception:
+        return None
+    return None
+
+
+def _stage_is_generic(raw: str | None) -> bool:
+    value = str(raw or "").strip().lower()
+    return value in {"", "progress", "in_progress", "source_started"}
+
+
+def _format_stage_for_source(
+    *,
+    source_key: str | None,
+    strategy_value: str,
+    evt_type: str,
+    evt_payload: dict[str, Any],
+) -> str:
+    source_norm = str(source_key or "").strip().lower()
+    stage_raw = str(evt_payload.get("stage") or "").strip()
+    stage_label = str(evt_payload.get("stage_label") or "").strip()
+    percent_value = _safe_float(evt_payload.get("percent"))
+    if percent_value is None:
+        percent_value = _safe_float(evt_payload.get("pct"))
+    if percent_value is None:
+        percent_value = _safe_float(evt_payload.get("progress_percent"))
+    if percent_value is None:
+        parsed_pct = _parse_processed_percent(evt_payload.get("processed"))
+        percent_value = float(parsed_pct) if parsed_pct is not None else None
+    percent_tail = f" | {int(round(percent_value))}%" if percent_value is not None else ""
+    fields = evt_payload.get("fields") if isinstance(evt_payload.get("fields"), dict) else {}
+    if percent_value is None and fields:
+        percent_value = _safe_float(fields.get("percent"))
+        if percent_value is None:
+            percent_value = _safe_float(fields.get("pct"))
+        if percent_value is None:
+            parsed_pct = _parse_processed_percent(fields.get("processed"))
+            percent_value = float(parsed_pct) if parsed_pct is not None else None
+        percent_tail = f" | {int(round(percent_value))}%" if percent_value is not None else ""
+
+    if evt_type == "source_started":
+        return "Источник: подготовка к запуску"
+    if evt_type == "source_finished":
+        return "Источник: обработка завершена"
+    if evt_type == "job_finished":
+        return "Синхронизация завершена"
+    if evt_type == "job_failed":
+        return "Синхронизация завершилась с ошибкой"
+    if evt_type == "job_cancelled":
+        return "Синхронизация отменена"
+
+    if source_norm == "jadedldn.com":
+        stage_ru = _JADED_STAGE_RU.get(stage_raw, stage_label or evt_type or "Выполнение")
+        if strategy_value == "shopify_json":
+            pages_fetched = fields.get("pages_fetched")
+            dedup_items = fields.get("dedup_items")
+            if pages_fetched is not None and dedup_items is not None:
+                stage_ru = f"Сбор товаров: страниц {pages_fetched}, товаров {dedup_items}"
+            # Shopify JSON often has unknown final denominator at this point.
+            # Keep progress visibly moving instead of a flat 0%.
+            if percent_value is not None and percent_value < 1.0:
+                try:
+                    pf = int(fields.get("pages_fetched") or 0)
+                except Exception:
+                    pf = 0
+                if pf > 0:
+                    percent_value = min(25.0, max(2.0, float(pf * 5)))
+                    percent_tail = f" | {int(round(percent_value))}%"
+            elif fields.get("max_products") is not None and stage_raw == "start":
+                stage_ru = f"Старт обхода sitemap (лимит {fields.get('max_products')})"
+        if strategy_value == "shopify_js":
+            processed = str(fields.get("processed") or "").strip()
+            if processed:
+                stage_ru = f"Обработка карточек {processed}"
+        return f"{stage_ru}{percent_tail}".strip()
+
+    # Default plain-language stage for non-jaded sources.
+    if strategy_value == "shopify_browser_extension":
+        stage_norm = stage_raw.lower()
+        if stage_norm.startswith("start "):
+            return f"Подготовка браузерного сценария{percent_tail}".strip()
+        if "navigated to homepage" in stage_norm:
+            return f"Открытие сайта{percent_tail}".strip()
+        if "fetching sitemap.xml" in stage_norm:
+            return f"Запрос sitemap.xml{percent_tail}".strip()
+        if "sitemap.xml ok" in stage_norm:
+            return f"sitemap.xml получен{percent_tail}".strip()
+        if "product sitemaps discovered=" in stage_norm:
+            return f"Найдены карты товаров{percent_tail}".strip()
+        if stage_norm.startswith("sitemap ") and "->" in stage_norm:
+            # Example: sitemap 4/24 -> ...
+            part = stage_raw.split("->", 1)[0].strip()
+            return f"Чтение карты товаров: {part}{percent_tail}".strip()
+        if stage_norm.startswith("sitemap ok "):
+            return f"Ссылки товаров добавлены{percent_tail}".strip()
+        if stage_norm.startswith("sitemap failed "):
+            return f"Ошибка чтения карты товаров{percent_tail}".strip()
+        if "scenario_start" in str(fields.get("phase") or "").lower():
+            return f"Запуск сценария{percent_tail}".strip()
+        if "browser_started" in str(fields.get("phase") or "").lower():
+            return f"Браузер запущен{percent_tail}".strip()
+        if "extension_connected" in str(fields.get("phase") or "").lower():
+            return f"Расширение подключено{percent_tail}".strip()
+        if "waiting_extension" in str(fields.get("phase") or "").lower():
+            return f"Ожидание расширения{percent_tail}".strip()
+        if "extension_ping_ok" in str(fields.get("phase") or "").lower():
+            return f"Проверка расширения{percent_tail}".strip()
+
+    if strategy_value == "shopify_js" and stage_raw == "progress":
+        processed = str(fields.get("processed") or "").strip()
+        if processed:
+            return f"Обработка карточек {processed}{percent_tail}".strip()
+        return f"Обработка карточек{percent_tail}".strip()
+    if stage_raw == "progress":
+        return f"Выполнение{percent_tail}".strip()
+    if stage_raw == "discover_start":
+        return f"Поиск ссылок на товары{percent_tail}".strip()
+    if stage_raw == "discover_done":
+        return f"Поиск ссылок завершен{percent_tail}".strip()
+    if stage_raw == "fetch_start":
+        return f"Начата загрузка карточек{percent_tail}".strip()
+    if stage_raw == "fetch_progress":
+        return f"Обработка карточек{percent_tail}".strip()
+    if stage_raw == "fetch_skip":
+        return f"Пропуск проблемной карточки{percent_tail}".strip()
+    if stage_raw in {"run_done", "done", "source_done"}:
+        return f"Этап обработки завершен{percent_tail}".strip()
+    if stage_label:
+        return f"{stage_label}{percent_tail}".strip()
+    return f"{evt_type}{percent_tail}".strip()
+
+
 @dataclass
 class AggregateJob:
     job_id: str
@@ -74,6 +289,7 @@ class AggregateJob:
     products_error: int = 0
     event_cursor: int = 0
     applied_batch_ids: set[str] | None = None
+    current_source_progress_percent: float | None = None
 
 
 class JobsState:
@@ -190,10 +406,68 @@ def _map_latest_response(job: AggregateJob | None) -> dict[str, Any] | None:
         return None
     total = max(1, job.total_sources)
     progress = (job.processed_sources / total) * 100.0
+    if job.status in {"in_progress", "queued"}:
+        in_source_index = max(0, int(job.current_source_index or 0) - 1)
+        progress = (in_source_index / total) * 100.0
+    stage_text = str(job.current_stage or "").strip()
+    if job.status in {"in_progress", "queued"} and stage_text:
+        # Use detailed stage percent when available.
+        stage_pct = _extract_percent_from_stage_text(stage_text)
+        if stage_pct is None:
+            stage_pct = _safe_float(getattr(job, "current_source_progress_percent", None))
+        if stage_pct is not None:
+            in_source_index = max(0, int(job.current_source_index or 0) - 1)
+            per_source_weight = 100.0 / total
+            progress = (in_source_index * per_source_weight) + ((stage_pct / 100.0) * per_source_weight)
+        if progress >= 99.99:
+            # Fallback: parse detailed stage text like "Карточки 100/200"
+            # to avoid fake 100% while source is still running.
+            try:
+                import re
+                m = re.search(r"(\d+)\s*/\s*(\d+)", stage_text)
+                if m:
+                    done = float(m.group(1))
+                    total_items = float(m.group(2))
+                    if total_items > 0:
+                        progress = max(0.0, min(100.0, (done / total_items) * 100.0))
+            except Exception:
+                pass
+        # In-progress job must never report 100%, otherwise UI looks frozen.
+        # Keep headroom until terminal status is received.
+        if progress >= 100.0:
+            progress = 99.0
     products_progress = (job.db_upserts_done / max(1, job.expected_db_upserts)) * 100.0 if job.expected_db_upserts > 0 else progress
+    if job.status in {"in_progress", "queued"} and products_progress >= 100.0:
+        products_progress = 99.0
+    strategy_sequence = _load_source_strategy_sequence(job.current_source_name)
+    current_strategy = str(getattr(job, "current_strategy", "") or "").strip() or None
+    strategy_total = len(strategy_sequence) if strategy_sequence else (1 if current_strategy else 0)
+    strategy_index = 0
+    if current_strategy and strategy_sequence:
+        try:
+            strategy_index = strategy_sequence.index(current_strategy) + 1
+        except ValueError:
+            strategy_index = 1
+    elif current_strategy:
+        strategy_index = 1
+
+    # `db_upserts_done` can be zero on a fully successful re-sync when all items
+    # were unchanged in DB. For admin progress we need "successfully processed",
+    # not only "written to DB".
+    processed_products = int(job.db_upserts_done or 0)
+    if processed_products <= 0:
+        processed_products = int(job.products_success or 0)
+    expected_products = int(job.expected_db_upserts or 0)
+    if expected_products <= 0:
+        expected_products = max(int(job.products_success or 0) + int(job.products_error or 0), 0)
+
+    response_status = job.status
+    if response_status == "failed" and _source_has_password_gate_status(job.current_source_name):
+        response_status = "password_protected"
+
     return {
         "job_id": job.job_id,
-        "status": job.status,
+        "status": response_status,
         "created_at": _iso(job.created_at),
         "started_at": _iso(job.started_at),
         "completed_at": _iso(job.completed_at),
@@ -205,12 +479,14 @@ def _map_latest_response(job: AggregateJob | None) -> dict[str, Any] | None:
         "total_sources": job.total_sources,
         "processed_sources": job.processed_sources,
         "progress_percent": round(progress, 2),
-        "processed_products": job.db_upserts_done,
-        "expected_products": job.expected_db_upserts,
+        "processed_products": processed_products,
+        "expected_products": expected_products,
         "failed_products": job.failed_products,
         "products_progress_percent": round(products_progress, 2),
         "current_source_name": job.current_source_name,
-        "current_source_parser_type": "service_rework",
+        "current_source_parser_type": _STRATEGY_RU.get(str(current_strategy or "").strip(), current_strategy),
+        "current_strategy_index": strategy_index,
+        "current_strategy_total": strategy_total,
         "current_source_index": job.current_source_index,
         "current_stage": job.current_stage,
         "current_source_processed_products": job.products_success,
@@ -231,6 +507,78 @@ def _find_backend_source(db, source_key: str) -> ParserSource | None:
         if norm and (norm in url or norm == name):
             return row
     return None
+
+
+def _source_has_password_gate_status(source_key: str | None) -> bool:
+    key = str(source_key or "").strip()
+    if not key:
+        return False
+    db = SessionLocal()
+    try:
+        source = _find_backend_source(db, key)
+        if source is None:
+            return False
+        return str(getattr(source, "last_sync_status", "") or "").strip().lower() == "password_protected"
+    except Exception:
+        return False
+    finally:
+        db.close()
+
+
+def _is_password_related_error(error_text: str | None) -> bool:
+    raw = str(error_text or "").strip().lower()
+    if not raw:
+        return False
+    patterns = (
+        "storefront_password_gate",
+        "/password",
+        "password",
+        "http 401",
+        "status code 401",
+        " 401 ",
+        "unauthorized",
+        "forbidden",
+    )
+    return any(p in raw for p in patterns)
+
+
+def _probe_source_password_gate(source_key: str | None) -> bool:
+    key = str(source_key or "").strip()
+    if not key:
+        return False
+    db = SessionLocal()
+    source_url = ""
+    try:
+        source = _find_backend_source(db, key)
+        if source is None:
+            return False
+        source_url = str(getattr(source, "url", "") or "").strip()
+    finally:
+        db.close()
+    if not source_url:
+        return False
+    try:
+        res = requests.get(source_url, timeout=(5, 10), allow_redirects=True)
+        final_url = str(res.url or "").lower()
+        body = str(res.text or "").lower()
+        if res.status_code in {401, 403}:
+            return True
+        if "/password" in final_url:
+            return True
+        markers = (
+            'action="/password"',
+            "action='/password'",
+            'name="password"',
+            "name='password'",
+            'id="password"',
+            "id='password'",
+            "shopify-section-password",
+            "enter using password",
+            "storefront password",
+        )
+        return any(m in body for m in markers)
+    except Exception:
+        return False
 
 
 def _default_supplier_id(db) -> int | None:
@@ -288,6 +636,7 @@ def _update_source_sync_telemetry(
     source_key: str,
     *,
     status: str | None = None,
+    error_code: str | None = None,
     finished_at: datetime | None = None,
     duration_sec: int | None = None,
 ) -> None:
@@ -301,7 +650,12 @@ def _update_source_sync_telemetry(
         if duration_sec is not None:
             source.last_sync_duration_sec = max(0, int(duration_sec))
         if status is not None:
-            source.last_sync_status = str(status).strip().lower()[:32] or None
+            normalized_status = str(status).strip().lower()
+            normalized_error = str(error_code or "").strip().lower()
+            if normalized_error == "storefront_blocked:storefront_password_gate" or _is_password_related_error(normalized_error):
+                # Explicit status for UI badges/labels.
+                normalized_status = "password_protected"
+            source.last_sync_status = normalized_status[:32] or None
         db.commit()
     except Exception:
         db.rollback()
@@ -317,6 +671,187 @@ def _derive_status(variants: Any) -> str:
         if isinstance(variant, dict) and bool(variant.get("available")):
             return "available"
     return "out_of_stock"
+
+
+def _normalize_variants_with_source_lineage(
+    *,
+    source_key: str,
+    source_product_url: str,
+    variants: Any,
+) -> list[dict[str, Any]]:
+    parsed = variants if isinstance(variants, list) else []
+    out: list[dict[str, Any]] = []
+    for raw in parsed:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        item["source_key"] = str(item.get("source_key") or source_key).strip() or source_key
+        item["source_product_url"] = str(item.get("source_product_url") or source_product_url).strip() or source_product_url
+        source_variant_id = str(item.get("source_variant_id") or item.get("id") or "").strip()
+        item["source_variant_id"] = source_variant_id or None
+        source_variant_title = str(item.get("source_variant_title") or item.get("title") or "").strip()
+        item["source_variant_title"] = source_variant_title or None
+        out.append(item)
+    return out
+
+
+def _normalize_source_key_from_source(source: ParserSource) -> str:
+    return str(urlparse(str(source.url or "")).netloc or source.name or "").strip().lower()
+
+
+def _variant_fingerprint_payload(variant: dict[str, Any]) -> str:
+    parts = [
+        str(variant.get("sku") or "").strip().lower(),
+        str(variant.get("title") or "").strip().lower(),
+        str(variant.get("option1") or "").strip().lower(),
+        str(variant.get("option2") or "").strip().lower(),
+        str(variant.get("option3") or "").strip().lower(),
+        str(variant.get("price") or "").strip().lower(),
+        str(variant.get("currency") or "").strip().upper(),
+    ]
+    return "|".join(parts)
+
+
+def _fallback_source_variant_id(variant: dict[str, Any]) -> str:
+    sku = str(variant.get("sku") or "").strip()
+    if sku:
+        return sku
+    raw = _variant_fingerprint_payload(variant)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return f"auto-{digest}"
+
+
+def _fallback_source_variant_title(variant: dict[str, Any], source_variant_id: str) -> str:
+    title = str(variant.get("title") or "").strip()
+    if title:
+        return title
+    options = [
+        str(variant.get("option1") or "").strip(),
+        str(variant.get("option2") or "").strip(),
+        str(variant.get("option3") or "").strip(),
+    ]
+    option_title = " / ".join([x for x in options if x])
+    if option_title:
+        return option_title
+    return source_variant_id
+
+
+def _origin_key(
+    *,
+    source_id: int,
+    source_product_url: str,
+    source_variant_id: str | None,
+    source_variant_title: str | None,
+) -> str:
+    return "|".join(
+        [
+            str(int(source_id)),
+            str(source_product_url or "").strip(),
+            str(source_variant_id or "").strip(),
+            str(source_variant_title or "").strip().lower(),
+        ]
+    )
+
+
+def _materialize_product_variants_from_origins(db, *, product_id: int) -> list[dict[str, Any]]:
+    rows = (
+        db.query(ParserProductOriginVariant)
+        .filter(ParserProductOriginVariant.product_id == int(product_id))
+        .order_by(ParserProductOriginVariant.id.asc())
+        .all()
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row.payload) if isinstance(row.payload, dict) else {}
+        source_row = row.source
+        source_key = str(payload.get("source_key") or "").strip()
+        if not source_key and source_row is not None:
+            source_key = _normalize_source_key_from_source(source_row)
+        source_variant_id = (
+            str(row.source_variant_id or payload.get("source_variant_id") or payload.get("id") or payload.get("sku") or "").strip()
+            or _fallback_source_variant_id(payload)
+        )
+        source_variant_title = (
+            str(row.source_variant_title or payload.get("source_variant_title") or payload.get("title") or "").strip()
+            or _fallback_source_variant_title(payload, source_variant_id)
+        )
+        item = {
+            "id": source_variant_id,
+            "title": source_variant_title,
+            "sku": str(row.sku or "").strip() or None,
+            "price": _safe_float(row.price),
+            "currency": str(row.currency or "").strip().upper() or None,
+            "available": bool(row.available),
+            "source_key": source_key or None,
+            "source_product_url": str(row.source_product_url or "").strip() or None,
+            "source_variant_id": source_variant_id,
+            "source_variant_title": source_variant_title,
+        }
+        for k, v in payload.items():
+            if k not in item:
+                item[k] = v
+        out.append(item)
+    return out
+
+
+def _upsert_origin_variants(
+    db,
+    *,
+    product: ParserProduct,
+    source: ParserSource,
+    source_product_url: str,
+    variants: list[dict[str, Any]],
+) -> None:
+    source_id = int(source.id)
+    source_key = _normalize_source_key_from_source(source)
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        source_variant_id = (
+            str(variant.get("source_variant_id") or variant.get("id") or "").strip()
+            or _fallback_source_variant_id(variant)
+        )
+        source_variant_title = (
+            str(variant.get("source_variant_title") or variant.get("title") or "").strip()
+            or _fallback_source_variant_title(variant, source_variant_id)
+        )
+        candidate_source_url = str(variant.get("source_product_url") or source_product_url or "").strip() or source_product_url
+        key = _origin_key(
+            source_id=source_id,
+            source_product_url=candidate_source_url,
+            source_variant_id=source_variant_id,
+            source_variant_title=source_variant_title,
+        )
+        row = (
+            db.query(ParserProductOriginVariant)
+            .filter(ParserProductOriginVariant.origin_key == key)
+            .first()
+        )
+        if row is None:
+            row = ParserProductOriginVariant(
+                origin_key=key,
+                product_id=int(product.id),
+                source_id=source_id,
+                source_product_url=candidate_source_url,
+                source_variant_id=source_variant_id,
+                source_variant_title=source_variant_title,
+            )
+            db.add(row)
+        row.product_id = int(product.id)
+        row.source_id = source_id
+        row.source_product_url = candidate_source_url
+        row.source_variant_id = source_variant_id
+        row.source_variant_title = source_variant_title
+        row.sku = str(variant.get("sku") or "").strip() or None
+        row.price = _safe_float(variant.get("price"))
+        row.currency = str(variant.get("currency") or "").strip().upper()[:3] or None
+        row.available = bool(variant.get("available", True))
+        payload = dict(variant)
+        payload["source_key"] = str(variant.get("source_key") or source_key).strip() or source_key
+        payload["source_product_url"] = candidate_source_url
+        payload["source_variant_id"] = source_variant_id
+        payload["source_variant_title"] = source_variant_title
+        row.payload = payload
 
 
 def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) -> tuple[int, int]:
@@ -342,18 +877,22 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
                     handle = source_product_url.rsplit("/", 1)[-1][:200]
             if not handle:
                 continue
-            query = (
-                db.query(ParserProduct)
-                .filter(ParserProduct.deleted_at.is_(None))
-                .filter(ParserProduct.source_id == int(source.id))
-            )
+            query = db.query(ParserProduct).filter(ParserProduct.deleted_at.is_(None))
             row = None
+            # Multi-source aggregation: match product globally first.
             if external_id:
                 row = query.filter(ParserProduct.source_external_id == external_id).first()
             if row is None and canonical_url:
                 row = query.filter(ParserProduct.canonical_url == canonical_url).first()
+            if row is None and source_product_url:
+                row = query.filter(ParserProduct.url == source_product_url).first()
             if row is None:
-                row = query.filter(ParserProduct.handle == handle).first()
+                row = (
+                    query.join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
+                    .filter(ParserProductOriginVariant.source_id == int(source.id))
+                    .filter(ParserProductOriginVariant.source_product_url == source_product_url)
+                    .first()
+                )
             if row is None:
                 row = ParserProduct(
                     source_id=int(source.id),
@@ -378,7 +917,22 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
             row.currency = str(item.get("currency") or row.currency or "USD").strip().upper()[:3] or "USD"
             images = item.get("images") if isinstance(item.get("images"), list) else []
             incoming_image_urls = [str(url).strip() for url in images if str(url).strip()]
-            row.variants = item.get("variants") if isinstance(item.get("variants"), list) else []
+            row.variants = _normalize_variants_with_source_lineage(
+                source_key=source_key,
+                source_product_url=source_product_url,
+                variants=item.get("variants"),
+            )
+            if row.id is None:
+                db.flush()
+            _upsert_origin_variants(
+                db,
+                product=row,
+                source=source,
+                source_product_url=source_product_url,
+                variants=row.variants,
+            )
+            # Keep legacy JSON field in sync from normalized origin rows for existing UI/API consumers.
+            row.variants = _materialize_product_variants_from_origins(db, product_id=int(row.id))
             parsed_weight = _safe_float(item.get("weight_grams"))
             row.weight_grams = parsed_weight if parsed_weight is not None else row.weight_grams
             validation = item.get("validation") if isinstance(item.get("validation"), dict) else {}
@@ -471,6 +1025,8 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
     if agg_job.applied_batch_ids is None:
         agg_job.applied_batch_ids = set()
     source_started_at: dict[str, datetime] = {}
+    real_failed_sources: dict[str, str] = {}
+    password_blocked_sources: set[str] = set()
     while True:
         latest = STATE.get_latest()
         if latest is None or latest.job_id != agg_job.job_id:
@@ -486,7 +1042,15 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
         agg_job.current_source_name = str(payload.get("current_source_name") or "").strip() or agg_job.current_source_name
         agg_job.current_source_index = int(payload.get("current_source_index") or agg_job.current_source_index or 0)
         agg_job.total_sources = int(payload.get("total_sources") or agg_job.total_sources or 0)
-        agg_job.current_stage = str(payload.get("current_stage") or "").strip() or agg_job.current_stage
+        payload_stage = str(payload.get("current_stage") or "").strip()
+        if payload_stage and not _stage_is_generic(payload_stage):
+            payload_has_pct = _extract_percent_from_stage_text(payload_stage) is not None
+            current_has_pct = _extract_percent_from_stage_text(agg_job.current_stage) is not None
+            if payload_has_pct or not current_has_pct:
+                agg_job.current_stage = payload_stage
+        payload_progress = _safe_float(payload.get("progress_percent"))
+        if payload_progress is not None and 0.0 <= payload_progress <= 100.0:
+            agg_job.current_source_progress_percent = payload_progress
         agg_job.products_success = int(payload.get("products_success") or agg_job.products_success or 0)
         agg_job.products_error = int(payload.get("products_error") or agg_job.products_error or 0)
         agg_job.status = str(payload.get("status") or agg_job.status).strip().lower()
@@ -513,14 +1077,26 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
             evt_payload = evt.get("payload") if isinstance(evt.get("payload"), dict) else {}
             if evt_type in {"source_progress", "source_started", "source_finished", "job_finished", "job_failed", "job_cancelled"}:
                 strategy_value = str(evt_payload.get("strategy") or "").strip()
-                stage_label = str(evt_payload.get("stage_label") or "").strip()
+                source_key = str(evt_payload.get("source_key") or agg_job.current_source_name or "").strip() or agg_job.current_source_name
                 if strategy_value:
-                    agg_job.current_stage = f"{strategy_value}: {stage_label or evt_type}"
-                elif stage_label:
-                    agg_job.current_stage = stage_label
-                else:
-                    agg_job.current_stage = evt_type
-                agg_job.current_source_name = str(evt_payload.get("source_key") or agg_job.current_source_name or "").strip() or agg_job.current_source_name
+                    agg_job.current_strategy = strategy_value
+                event_progress = _safe_float(evt_payload.get("progress_percent"))
+                if event_progress is None:
+                    event_progress = _safe_float(evt_payload.get("percent"))
+                if event_progress is None:
+                    event_progress = _safe_float(evt_payload.get("pct"))
+                if event_progress is not None and 0.0 <= event_progress <= 100.0:
+                    agg_job.current_source_progress_percent = event_progress
+                agg_job.current_stage = _format_stage_for_source(
+                    source_key=source_key,
+                    strategy_value=strategy_value,
+                    evt_type=evt_type,
+                    evt_payload=evt_payload,
+                )
+                stage_pct = _extract_percent_from_stage_text(agg_job.current_stage)
+                if stage_pct is not None:
+                    agg_job.current_source_progress_percent = stage_pct
+                agg_job.current_source_name = source_key
                 agg_job.current_source_index = int(evt_payload.get("source_index") or agg_job.current_source_index or 0)
             if evt_type == "source_started":
                 source_key = str(evt_payload.get("source_key") or "").strip()
@@ -529,6 +1105,23 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
             if evt_type == "source_finished":
                 source_key = str(evt_payload.get("source_key") or "").strip()
                 source_status = str(evt_payload.get("status") or "").strip().lower() or "completed"
+                source_error = str(evt_payload.get("error") or "").strip() or None
+                if source_status == "failed":
+                    password_like = _is_password_related_error(source_error) or _source_has_password_gate_status(source_key)
+                    if not password_like and source_error and "read timed out" in source_error.lower():
+                        password_like = _probe_source_password_gate(source_key)
+                    if password_like:
+                        source_status = "password_protected"
+                        source_error = "storefront_blocked:storefront_password_gate"
+                        password_blocked_sources.add(source_key)
+                        real_failed_sources.pop(source_key, None)
+                    else:
+                        real_failed_sources[source_key] = source_error or "failed"
+                        password_blocked_sources.discard(source_key)
+                else:
+                    real_failed_sources.pop(source_key, None)
+                    if source_status != "password_protected":
+                        password_blocked_sources.discard(source_key)
                 finished_at = _utcnow()
                 started_at = source_started_at.get(source_key)
                 duration_sec = None
@@ -538,6 +1131,7 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
                     _update_source_sync_telemetry(
                         source_key,
                         status=source_status,
+                        error_code=source_error,
                         finished_at=finished_at,
                         duration_sec=duration_sec,
                     )
@@ -593,6 +1187,17 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
             _rebuild_category_index_after_sync()
             agg_job.completed_at = _utcnow()
             agg_job.can_cancel = False
+            if agg_job.status == "failed":
+                if not real_failed_sources:
+                    agg_job.status = "completed"
+                    if password_blocked_sources:
+                        names = ", ".join(sorted([x for x in password_blocked_sources if x])) or "источник"
+                        agg_job.current_stage = f"Завершено (запароленные: {names})"
+                    else:
+                        agg_job.current_stage = "Синхронизация завершена"
+                else:
+                    failed_names = ", ".join(sorted(real_failed_sources.keys()))
+                    agg_job.current_stage = f"Ошибка у {failed_names}"
             if not agg_job.current_stage:
                 agg_job.current_stage = agg_job.status
             _persist_runtime(agg_job)
@@ -642,12 +1247,14 @@ def _backfill_source_sync_telemetry_from_events(service_job_id: str) -> None:
                 started[source_key] = ts
             elif evt_type == "source_finished":
                 status = str(evt_payload.get("status") or "").strip().lower() or "completed"
+                source_error = str(evt_payload.get("error") or "").strip() or None
                 duration_sec = None
                 if source_key in started:
                     duration_sec = int(max(0.0, (ts - started[source_key]).total_seconds()))
                 _update_source_sync_telemetry(
                     source_key,
                     status=status,
+                    error_code=source_error,
                     finished_at=ts,
                     duration_sec=duration_sec,
                 )
