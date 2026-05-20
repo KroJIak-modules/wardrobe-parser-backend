@@ -11,8 +11,12 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.models import ParserProduct, ParserProductOriginVariant, ParserSource
+from app.models.pricing import ParserSupplier
 
 router = APIRouter(tags=["sources"])
+_MANUAL_SOURCE_KEY = "__manual_admin_source__"
+_MANUAL_SOURCE_NAME = "__manual_admin_source__"
+_MANUAL_SOURCE_URL = "manual://admin/products"
 
 
 def _service_sources_base() -> str:
@@ -63,6 +67,20 @@ def _currency_priority_from_config(config: dict | None) -> list[str]:
     return out or ["USD", "EUR", "GBP"]
 
 
+def _currency_method_from_config(config: dict | None) -> tuple[str, str]:
+    cfg = config if isinstance(config, dict) else {}
+    currency_cfg = cfg.get("shopify_currency") if isinstance(cfg.get("shopify_currency"), dict) else {}
+    method = str(currency_cfg.get("method") or "priority_list").strip().lower()
+    if method not in {"priority_list", "locked_param_currency", "locked_no_currency"}:
+        method = "priority_list"
+    locked_currency = str(currency_cfg.get("locked_currency") or "").strip().upper()
+    if locked_currency == "GBR":
+        locked_currency = "GBP"
+    if locked_currency not in {"USD", "EUR", "GBP", "JPY"}:
+        locked_currency = ""
+    return method, locked_currency
+
+
 def _find_profile(db: Session, source_key: str, source_url: str) -> ParserSource | None:
     key_host = _norm_host(source_key)
     url_host = _norm_host(source_url)
@@ -79,14 +97,26 @@ def _find_profile(db: Session, source_key: str, source_url: str) -> ParserSource
 
 
 def _products_count(db: Session, source_id: int) -> int:
-    return int(
-        db.query(ParserProduct)
-        .join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
-        .filter(ParserProduct.deleted_at.is_(None))
-        .filter(ParserProductOriginVariant.source_id == int(source_id))
-        .distinct(ParserProduct.id)
-        .count()
-    )
+    direct_ids = {
+        int(row[0])
+        for row in (
+            db.query(ParserProduct.id)
+            .filter(ParserProduct.deleted_at.is_(None))
+            .filter(ParserProduct.source_id == int(source_id))
+            .all()
+        )
+    }
+    origin_ids = {
+        int(row[0])
+        for row in (
+            db.query(ParserProductOriginVariant.product_id)
+            .join(ParserProduct, ParserProduct.id == ParserProductOriginVariant.product_id)
+            .filter(ParserProduct.deleted_at.is_(None))
+            .filter(ParserProductOriginVariant.source_id == int(source_id))
+            .all()
+        )
+    }
+    return len(direct_ids | origin_ids)
 
 
 def _as_bool(value: object, default: bool) -> bool:
@@ -127,6 +157,7 @@ def _map_source(db: Session, item: dict) -> dict:
     last_sync_status = str(getattr(profile, "last_sync_status", "") or "").strip().lower() if profile is not None else ""
     is_password_protected = last_sync_status == "password_protected"
     cfg = item.get("config") if isinstance(item.get("config"), dict) else {}
+    currency_method, locked_currency = _currency_method_from_config(cfg)
     seq = cfg.get("strategy_sequence") if isinstance(cfg.get("strategy_sequence"), list) else []
     normalized_seq = [str(x).strip().lower() for x in seq if str(x).strip()]
     is_auto_ingest = bool(normalized_seq)
@@ -146,6 +177,9 @@ def _map_source(db: Session, item: dict) -> dict:
         "show_description": _as_bool(getattr(profile, "show_description", None), True) if profile is not None else True,
         "show_images": _as_bool(getattr(profile, "show_images", None), True) if profile is not None else True,
         "currency_priority": _currency_priority_from_config(item.get("config")),
+        "currency_method": currency_method,
+        "locked_currency": locked_currency,
+        "currency_priority_editable": currency_method == "priority_list",
         "notes": None,
         "status_label": None,
         "products_count": _products_count(db, profile_id) if profile is not None else 0,
@@ -155,6 +189,64 @@ def _map_source(db: Session, item: dict) -> dict:
         "last_sync_status": str(getattr(profile, "last_sync_status", "") or "").strip() or None if profile is not None else None,
         "is_password_protected": is_password_protected,
         "is_auto_ingest": is_auto_ingest,
+        "is_personal": False,
+    }
+
+
+def _get_or_create_manual_source(db: Session) -> ParserSource:
+    existing = (
+        db.query(ParserSource)
+        .filter(ParserSource.deleted_at.is_(None))
+        .filter(ParserSource.name == _MANUAL_SOURCE_NAME)
+        .first()
+    )
+    if existing is not None:
+        return existing
+    supplier = db.query(ParserSupplier).order_by(ParserSupplier.id.asc()).first()
+    if supplier is None:
+        raise HTTPException(status_code=500, detail="Нет доступного supplier для личного источника")
+    source = ParserSource(
+        name=_MANUAL_SOURCE_NAME,
+        url=_MANUAL_SOURCE_URL,
+        enabled=True,
+        supplier_id=int(supplier.id),
+        show_description=True,
+        show_images=True,
+        hide_auto_added_products=False,
+    )
+    db.add(source)
+    db.commit()
+    db.refresh(source)
+    return source
+
+
+def _map_manual_source(db: Session, source: ParserSource) -> dict:
+    return {
+        "key": _MANUAL_SOURCE_KEY,
+        "source_id": int(source.id),
+        "service_source_id": 0,
+        "name": "Личный каталог",
+        "base_url": "",
+        "parser_type": "backend_manual",
+        "enabled": bool(source.enabled),
+        "sync_enabled": True,
+        "hide_auto_added_products": bool(getattr(source, "hide_auto_added_products", False)),
+        "show_description": bool(getattr(source, "show_description", True)),
+        "show_images": bool(getattr(source, "show_images", True)),
+        "currency_priority": [],
+        "currency_method": "priority_list",
+        "locked_currency": "",
+        "currency_priority_editable": False,
+        "notes": None,
+        "status_label": None,
+        "products_count": _products_count(db, int(source.id)),
+        "categories_count": 0,
+        "last_sync_at": getattr(source, "last_sync_at", None),
+        "last_sync_duration_sec": None,
+        "last_sync_status": None,
+        "is_password_protected": None,
+        "is_auto_ingest": None,
+        "is_personal": True,
     }
 
 
@@ -176,17 +268,27 @@ class AttrVisibilityPayload(BaseModel):
 
 
 class CurrencyPriorityPayload(BaseModel):
-    currency_priority: list[str]
+    currency_priority: list[str] | None = None
+    currency_method: str | None = None
+    locked_currency: str | None = None
 
 
 @router.get("/sources")
 def list_sources(db: Session = Depends(get_db)) -> list[dict]:
+    manual_source = _get_or_create_manual_source(db)
     items = _service_list()
-    return [_map_source(db, item) for item in items]
+    mapped = [_map_source(db, item) for item in items]
+    return [_map_manual_source(db, manual_source), *mapped]
 
 
 @router.patch("/sources/{source_key}/enabled")
 def patch_enabled(source_key: str, payload: EnabledPayload, db: Session = Depends(get_db)) -> dict:
+    if source_key == _MANUAL_SOURCE_KEY:
+        profile = _get_or_create_manual_source(db)
+        profile.enabled = bool(payload.enabled)
+        db.commit()
+        db.refresh(profile)
+        return _map_manual_source(db, profile)
     items = _service_list()
     src = next((it for it in items if str(it.get("key") or "").strip() == source_key), None)
     if src is None:
@@ -202,6 +304,11 @@ def patch_enabled(source_key: str, payload: EnabledPayload, db: Session = Depend
 
 @router.patch("/sources/{source_key}/sync-enabled")
 def patch_sync_enabled(source_key: str, payload: SyncEnabledPayload, db: Session = Depends(get_db)) -> dict:
+    if source_key == _MANUAL_SOURCE_KEY:
+        # Personal source sync toggle is UI-visible and accepted, but currently
+        # manual source always participates as backend-only source.
+        profile = _get_or_create_manual_source(db)
+        return _map_manual_source(db, profile)
     _service_patch(source_key, {"sync_enabled": bool(payload.sync_enabled)})
     items = _service_list()
     src = next((it for it in items if str(it.get("key") or "").strip() == source_key), None)
@@ -212,6 +319,33 @@ def patch_sync_enabled(source_key: str, payload: SyncEnabledPayload, db: Session
 
 @router.patch("/sources/{source_key}/hide-auto-added-products")
 def patch_hide_auto(source_key: str, payload: HideAutoPayload, db: Session = Depends(get_db)) -> dict:
+    if source_key == _MANUAL_SOURCE_KEY:
+        profile = _get_or_create_manual_source(db)
+        profile.hide_auto_added_products = bool(payload.hide_auto_added_products)
+        rows = (
+            db.query(ParserProduct)
+            .join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
+            .filter(ParserProduct.deleted_at.is_(None))
+            .filter(ParserProductOriginVariant.source_id == int(profile.id))
+            .distinct(ParserProduct.id)
+            .all()
+        )
+        if bool(payload.hide_auto_added_products):
+            for product in rows:
+                if bool(getattr(product, "is_auto_added", True)):
+                    product.status = "hidden"
+                    product.auto_hide_force_visible = False
+        else:
+            for product in rows:
+                if str(getattr(product, "status", "")).strip().lower() != "hidden":
+                    continue
+                if not bool(getattr(product, "is_auto_added", True)):
+                    continue
+                product.status = _derive_status_from_variants(str(product.status or ""), product.variants)
+                product.auto_hide_force_visible = False
+        db.commit()
+        db.refresh(profile)
+        return _map_manual_source(db, profile)
     items = _service_list()
     src = next((it for it in items if str(it.get("key") or "").strip() == source_key), None)
     if src is None:
@@ -248,6 +382,15 @@ def patch_hide_auto(source_key: str, payload: HideAutoPayload, db: Session = Dep
 
 @router.patch("/sources/{source_key}/attribute-visibility")
 def patch_attr_visibility(source_key: str, payload: AttrVisibilityPayload, db: Session = Depends(get_db)) -> dict:
+    if source_key == _MANUAL_SOURCE_KEY:
+        profile = _get_or_create_manual_source(db)
+        if payload.show_description is not None:
+            setattr(profile, "show_description", bool(payload.show_description))
+        if payload.show_images is not None:
+            setattr(profile, "show_images", bool(payload.show_images))
+        db.commit()
+        db.refresh(profile)
+        return _map_manual_source(db, profile)
     items = _service_list()
     src = next((it for it in items if str(it.get("key") or "").strip() == source_key), None)
     if src is None:
@@ -266,10 +409,29 @@ def patch_attr_visibility(source_key: str, payload: AttrVisibilityPayload, db: S
 
 @router.patch("/sources/{source_key}/currency-priority")
 def patch_currency_priority(source_key: str, payload: CurrencyPriorityPayload, db: Session = Depends(get_db)) -> dict:
-    normalized = [str(x).strip().upper() for x in payload.currency_priority if str(x).strip()]
-    if not normalized:
-        raise HTTPException(status_code=400, detail="currency_priority is empty")
-    _service_patch(source_key, {"requested_currency_priority": normalized})
+    if source_key == _MANUAL_SOURCE_KEY:
+        raise HTTPException(status_code=400, detail="Для личного источника приоритет валют не используется")
+    service_payload: dict = {}
+    if payload.currency_priority is not None:
+        normalized = [str(x).strip().upper() for x in payload.currency_priority if str(x).strip()]
+        if not normalized:
+            raise HTTPException(status_code=400, detail="currency_priority is empty")
+        service_payload["requested_currency_priority"] = normalized
+    if payload.currency_method is not None:
+        method = str(payload.currency_method).strip().lower()
+        if method not in {"priority_list", "locked_param_currency", "locked_no_currency"}:
+            raise HTTPException(status_code=400, detail="invalid currency_method")
+        service_payload["currency_method"] = method
+    if payload.locked_currency is not None:
+        locked = str(payload.locked_currency).strip().upper()
+        if locked == "GBR":
+            locked = "GBP"
+        if locked and locked not in {"USD", "EUR", "GBP", "JPY"}:
+            raise HTTPException(status_code=400, detail="invalid locked_currency")
+        service_payload["locked_currency"] = locked
+    if not service_payload:
+        raise HTTPException(status_code=400, detail="empty currency payload")
+    _service_patch(source_key, service_payload)
     items = _service_list()
     src = next((it for it in items if str(it.get("key") or "").strip() == source_key), None)
     if src is None:

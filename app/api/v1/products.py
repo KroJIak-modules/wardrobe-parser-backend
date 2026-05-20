@@ -7,11 +7,14 @@ import binascii
 import json
 import logging
 import random
+import re
 import unicodedata
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import JSONResponse
@@ -26,6 +29,9 @@ from app.models import (
     ImageAsset,
     ParserBrandMapping,
     ParserCategory,
+    ParserCategoryManualProduct,
+    ParserDedupDecision,
+    ParserFavoriteProduct,
     ParserProduct,
     ParserProductCategoryMatch,
     ParserProductOriginVariant,
@@ -120,6 +126,34 @@ class CreateManualProductRequest(BaseModel):
     currency: str = "USD"
     variants: list[ProductVariantIn] = []
     manual_image_asset_ids: list[int] = []
+    weight_grams: float | None = None
+    status: str | None = None
+    bind_sync: bool = False
+    bind_source_id: int | None = None
+    bind_source_product_url: str | None = None
+
+
+class UpdateManualProductRequest(BaseModel):
+    title: str
+    description: str | None = None
+    vendor: str | None = None
+    product_type: str | None = None
+    currency: str = "USD"
+    variants: list[ProductVariantIn] = []
+    manual_image_asset_ids: list[int] = []
+    weight_grams: float | None = None
+    status: str | None = None
+    bind_sync: bool = False
+    bind_source_id: int | None = None
+    bind_source_product_url: str | None = None
+
+
+class ProductUrlPayload(BaseModel):
+    url: str
+
+
+class ProductImageUrlPayload(BaseModel):
+    url: str
 
 
 def _normalize_manual_variants(raw_variants: list[ProductVariantIn]) -> list[dict[str, Any]]:
@@ -142,14 +176,54 @@ def _normalize_manual_variants(raw_variants: list[ProductVariantIn]) -> list[dic
     return [{"title": "Default", "price": None, "available": True, "inventory_quantity": 1}]
 
 
+def _normalize_url_loose(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"https://{value}"
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return value.rstrip("/")
+    scheme = str(parsed.scheme or "https").lower()
+    netloc = str(parsed.netloc or "").lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    path = str(parsed.path or "").rstrip("/")
+    # Normalize locale-prefixed shop paths:
+    # /en/products/x, /en-ae/products/x => /products/x
+    parts = [p for p in path.split("/") if p]
+    if len(parts) >= 2 and re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", parts[0].lower()) and parts[1].lower() == "products":
+        path = "/" + "/".join(parts[1:])
+    return f"{scheme}://{netloc}{path}"
+
+
+def _norm_host(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"https://{value}"
+    parsed = urlparse(value)
+    return str(parsed.netloc or "").strip().lower().removeprefix("www.")
+
+
 def _with_active_sources(query):
     return query.filter(
-        select(ParserProductOriginVariant.id)
-        .join(ParserSource, ParserSource.id == ParserProductOriginVariant.source_id)
-        .where(ParserProductOriginVariant.product_id == ParserProduct.id)
-        .where(ParserSource.deleted_at.is_(None))
-        .where(ParserSource.enabled.is_(True))
-        .exists()
+        or_(
+            select(ParserSource.id)
+            .where(ParserSource.id == ParserProduct.source_id)
+            .where(ParserSource.deleted_at.is_(None))
+            .where(ParserSource.enabled.is_(True))
+            .exists(),
+            select(ParserProductOriginVariant.id)
+            .join(ParserSource, ParserSource.id == ParserProductOriginVariant.source_id)
+            .where(ParserProductOriginVariant.product_id == ParserProduct.id)
+            .where(ParserSource.deleted_at.is_(None))
+            .where(ParserSource.enabled.is_(True))
+            .exists(),
+        )
     )
 
 
@@ -218,6 +292,11 @@ def _inject_effective_source_id(
     primary_source_by_product: dict[int, int],
 ) -> None:
     if product_id is None:
+        return
+    current_source_id = _safe_int(item.get("source_id"))
+    # Keep native source for product records (especially manual/personal source products).
+    # Origin variants are used as linkage metadata and should not overwrite base ownership.
+    if current_source_id is not None and current_source_id > 0:
         return
     source_id = primary_source_by_product.get(int(product_id))
     if source_id is None:
@@ -386,6 +465,10 @@ def _apply_product_overrides_to_item(
     manual_image_order = _normalize_image_order_tokens(getattr(product, "manual_image_order", None))
 
     source_image_urls = _normalize_image_urls(item.get("image_urls"))
+    # Manual products store all images as manual assets. Do not treat them as source images.
+    product_url = str(getattr(product, "url", "") or "").strip().lower()
+    if product_url.startswith("manual://product/") and manual_image_urls:
+        source_image_urls = []
     effective_image_urls = _compose_effective_image_urls(
         source_image_urls=source_image_urls,
         images_sync_locked=images_sync_locked,
@@ -468,6 +551,29 @@ def _save_manual_product_image(file: UploadFile, db: Session) -> int:
     return int(asset.id)
 
 
+def _save_manual_product_image_bytes(*, file_name: str, content: bytes, db: Session) -> int:
+    extension = Path(file_name).suffix.lower()
+    if extension not in _ALLOWED_IMAGE_EXTENSIONS:
+        extension = ".jpg"
+    if not content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Пустой файл")
+    try:
+        with Image.open(BytesIO(content)) as img:
+            img.verify()
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Файл не является корректным изображением")
+    _PRODUCT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    safe_stem = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in Path(file_name).stem.lower()).strip("-") or "product"
+    final_name = f"{safe_stem}-{int(datetime.now().timestamp() * 1000)}-{random.randint(1000, 9999)}{extension}"
+    target = _PRODUCT_UPLOAD_DIR / final_name
+    target.write_bytes(content)
+    asset = ImageAsset(source_url=f"stored://product/{final_name}", storage_mode="stored_file", stored_path=str(target))
+    db.add(asset)
+    db.commit()
+    db.refresh(asset)
+    return int(asset.id)
+
+
 def _extract_product_description(item: dict[str, Any]) -> str | None:
     for key in ("description", "body_html", "body"):
         value = item.get(key)
@@ -519,6 +625,7 @@ def _project_catalog_item(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": int(item.get("id") or 0),
         "source_id": int(item.get("source_id") or 0),
+        "source_name": str(item.get("source_name") or ""),
         "title": str(item.get("title") or ""),
         "vendor": item.get("vendor"),
         "vendor_original": item.get("vendor_original"),
@@ -982,11 +1089,15 @@ def _apply_admin_product_filters(
     mapped_vendor_expr = _mapped_vendor_label_expr()
     normalized_type_expr = func.lower(func.trim(func.coalesce(ParserProduct.product_type, "")))
     if source_id is not None:
+        sid = int(source_id)
         query = query.filter(
-            select(ParserProductOriginVariant.id)
-            .where(ParserProductOriginVariant.product_id == ParserProduct.id)
-            .where(ParserProductOriginVariant.source_id == int(source_id))
-            .exists()
+            or_(
+                ParserProduct.source_id == sid,
+                select(ParserProductOriginVariant.id)
+                .where(ParserProductOriginVariant.product_id == ParserProduct.id)
+                .where(ParserProductOriginVariant.source_id == sid)
+                .exists(),
+            )
         )
     if vendor:
         if vendor == _NO_BRAND_FILTER_TOKEN:
@@ -1186,6 +1297,11 @@ def get_admin_products_table(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
             ) from exc
+        if not str(enriched.get("source_name") or "").strip():
+            sid = _safe_int(enriched.get("source_id"))
+            profile = source_profile_map.get(int(sid)) if sid is not None else None
+            if profile is not None:
+                enriched["source_name"] = str(getattr(profile, "name", "") or "")
         items.append(_project_admin_table_item(enriched))
     _sort_products_for_display(items)
 
@@ -1641,11 +1757,15 @@ def get_catalog_products(
             .filter(ParserProduct.status.in_(tuple(_PUBLIC_PRODUCT_STATUSES)))
         )
         if source_id is not None:
+            sid = int(source_id)
             query = query.filter(
-                select(ParserProductOriginVariant.id)
-                .where(ParserProductOriginVariant.product_id == ParserProduct.id)
-                .where(ParserProductOriginVariant.source_id == int(source_id))
-                .exists()
+                or_(
+                    ParserProduct.source_id == sid,
+                    select(ParserProductOriginVariant.id)
+                    .where(ParserProductOriginVariant.product_id == ParserProduct.id)
+                    .where(ParserProductOriginVariant.source_id == sid)
+                    .exists(),
+                )
             )
         if normalized_search:
             pattern = f"%{normalized_search}%"
@@ -2359,6 +2479,122 @@ async def upload_product_image(
     return {"ok": True, "image_asset_id": image_asset_id}
 
 
+@router.post("/products/upload-image-by-url")
+def upload_product_image_by_url(
+    payload: ProductImageUrlPayload,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+):
+    raw_url = str(payload.url or "").strip()
+    if not raw_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="URL изображения не передан")
+    try:
+        req = UrlRequest(raw_url, headers={"User-Agent": "WardrobeImageFetcher/1.0", "Accept": "image/*"})
+        with urlopen(req, timeout=20) as resp:  # noqa: S310
+            content_type = str(resp.headers.get("Content-Type") or "").lower()
+            content = resp.read()
+        if not content_type.startswith("image/"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="URL не указывает на изображение")
+        parsed = urlparse(raw_url)
+        name = Path(parsed.path or "").name or "remote-image.jpg"
+        image_asset_id = _save_manual_product_image_bytes(file_name=name, content=content, db=db)
+        return {"ok": True, "image_asset_id": image_asset_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Не удалось загрузить изображение: {exc}") from exc
+
+
+@router.post("/products/preview-by-url")
+def preview_product_by_url(
+    payload: ProductUrlPayload,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+) -> dict[str, Any]:
+    normalized_input = _normalize_url_loose(payload.url)
+    if not normalized_input:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректная ссылка")
+
+    matched = (
+        db.query(ParserProduct)
+        .filter(ParserProduct.deleted_at.is_(None))
+        .filter(ParserProduct.url == str(payload.url).strip())
+        .first()
+    )
+    if matched is None:
+        input_parts = [p for p in urlparse(normalized_input).path.split("/") if p]
+        handle = ""
+        if len(input_parts) >= 2 and input_parts[0].lower() == "products":
+            handle = input_parts[1]
+        if handle:
+            candidates = (
+                db.query(ParserProduct)
+                .filter(ParserProduct.deleted_at.is_(None))
+                .filter(ParserProduct.handle == handle)
+                .order_by(ParserProduct.id.desc())
+                .limit(25)
+                .all()
+            )
+            target_host = _norm_host(payload.url)
+            matched = next(
+                (
+                    item
+                    for item in candidates
+                    if _norm_host(getattr(getattr(item, "source", None), "url", "") or getattr(item, "url", "")) == target_host
+                    or _norm_host(str(item.url or "")) == target_host
+                    or _normalize_url_loose(str(item.url or "")) == normalized_input
+                ),
+                None,
+            )
+        if matched is None:
+            product = (
+                db.query(ParserProduct)
+                .filter(ParserProduct.deleted_at.is_(None))
+                .filter(ParserProduct.url.isnot(None))
+                .all()
+            )
+            for item in product:
+                if _normalize_url_loose(str(item.url or "")) == normalized_input:
+                    matched = item
+                    break
+    if matched is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
+    source = db.query(ParserSource).filter(ParserSource.id == int(getattr(matched, "source_id"))).first()
+
+    return {
+        "id": int(getattr(matched, "id")),
+        "source_id": int(getattr(matched, "source_id")),
+        "source_name": str(getattr(source, "name", "") or ""),
+        "status": str(getattr(matched, "status", "") or "available"),
+        "handle": str(getattr(matched, "handle", "") or ""),
+        "title": str(getattr(matched, "title", "") or ""),
+        "description": str(getattr(matched, "description", "") or ""),
+        "weight_grams": _safe_float(getattr(matched, "weight_grams", None)),
+        "vendor": getattr(matched, "vendor", None),
+        "product_type": getattr(matched, "product_type", None),
+        "product_url": str(getattr(matched, "url", "") or ""),
+        "price": _safe_float(getattr(matched, "price", None)),
+        "currency": str(getattr(matched, "currency", "") or "USD"),
+        "image_urls": list(getattr(matched, "image_urls", []) or []),
+        "variants": list(getattr(matched, "variants", []) or []),
+    }
+
+
+@router.get("/products/starred-categories/options")
+def get_starred_categories_options(
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+) -> dict[str, Any]:
+    category_repo = ParserCategoryRepository(db)
+    starred_categories = category_repo.get_favorites()
+    return {
+        "items": [
+            {"id": int(category.id), "name": str(category.name), "slug": str(category.slug)}
+            for category in starred_categories
+        ]
+    }
+
+
 @router.post("/products/manual")
 def create_manual_product(
     payload: CreateManualProductRequest,
@@ -2382,7 +2618,14 @@ def create_manual_product(
         if _safe_float(item.get("price")) is not None and _safe_float(item.get("price")) >= 0
     ]
     price = min(variant_prices) if variant_prices else None
-    status_value = "available" if any(bool(item.get("available")) for item in variants) else "out_of_stock"
+    requested_status = str(payload.status or "").strip().lower()
+    if requested_status in {"available", "out_of_stock", "hidden"}:
+        status_value = requested_status
+    else:
+        status_value = "available" if any(bool(item.get("available")) for item in variants) else "out_of_stock"
+    weight_grams = _safe_float(payload.weight_grams)
+    if weight_grams is not None and weight_grams <= 0:
+        weight_grams = None
 
     image_ids = _normalize_int_list(payload.manual_image_asset_ids)
     manual_image_urls: list[str] = []
@@ -2400,15 +2643,17 @@ def create_manual_product(
                 continue
             manual_image_urls.append(f"/api/v1/products/images/{int(asset.id)}")
 
+    bound_source_url = str(payload.bind_source_product_url or "").strip() if payload.bind_source_product_url is not None else ""
+    product_url_value = bound_source_url or f"manual://product/{int(datetime.now().timestamp() * 1000)}"
+
     product = ParserProduct(
         source_id=int(manual_source.id),
-        external_id=None,
         handle=f"manual-{int(datetime.now().timestamp() * 1000)}-{random.randint(1000, 9999)}",
         title=title,
         description=description,
         vendor=vendor,
         product_type=product_type,
-        url=f"manual://product/{int(datetime.now().timestamp() * 1000)}",
+        url=product_url_value,
         price=price,
         currency=currency,
         status=status_value,
@@ -2420,12 +2665,194 @@ def create_manual_product(
         manual_image_asset_ids=list(manual_image_urls),
         manual_image_order=[f"m:{url}" for url in manual_image_urls],
         hidden_source_image_asset_ids=[],
-        source_price=price,
-        source_currency=currency,
+        weight_grams=weight_grams,
     )
     db.add(product)
     db.commit()
     db.refresh(product)
+
+    if bool(payload.bind_sync) and payload.bind_source_id is not None and str(payload.bind_source_product_url or "").strip():
+        source_id = int(payload.bind_source_id)
+        source_product_url = str(payload.bind_source_product_url).strip()
+        normalized_currency = currency
+        for idx, variant in enumerate(variants, start=1):
+            variant_title = str(variant.get("title") or "").strip() or f"Variant {idx}"
+            variant_price = _safe_float(variant.get("price"))
+            variant_available = bool(variant.get("available"))
+            source_variant_id = f"manual-bound-{int(product.id)}-{idx}"
+            origin_key = f"{source_id}:{source_product_url}:{source_variant_id}"
+            existing = (
+                db.query(ParserProductOriginVariant)
+                .filter(ParserProductOriginVariant.origin_key == origin_key)
+                .one_or_none()
+            )
+            if existing is not None:
+                continue
+            db.add(
+                ParserProductOriginVariant(
+                    origin_key=origin_key,
+                    product_id=int(product.id),
+                    source_id=source_id,
+                    source_product_url=source_product_url,
+                    source_variant_id=source_variant_id,
+                    source_variant_title=variant_title,
+                    price=variant_price,
+                    currency=normalized_currency,
+                    available=variant_available,
+                    payload={"bound_from_manual_create": True},
+                )
+            )
+        db.commit()
+
+    return {"ok": True, "id": int(product.id)}
+
+
+@router.patch("/products/manual/{product_id}")
+def update_manual_product(
+    product_id: int,
+    payload: UpdateManualProductRequest,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+) -> dict[str, Any]:
+    title = str(payload.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Название товара обязательно")
+
+    product = (
+        db.query(ParserProduct)
+        .filter(ParserProduct.id == int(product_id))
+        .filter(ParserProduct.deleted_at.is_(None))
+        .one_or_none()
+    )
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
+
+    manual_source = _get_or_create_manual_source(db)
+    if int(product.source_id) != int(manual_source.id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Можно редактировать только товары личного каталога")
+
+    currency = str(payload.currency or "USD").strip().upper() or "USD"
+    description = str(payload.description or "").strip() or None
+    vendor = str(payload.vendor or "").strip() or None
+    product_type = str(payload.product_type or "").strip() or None
+    variants = _normalize_manual_variants(payload.variants)
+    variant_prices = [
+        _safe_float(item.get("price"))
+        for item in variants
+        if _safe_float(item.get("price")) is not None and _safe_float(item.get("price")) >= 0
+    ]
+    price = min(variant_prices) if variant_prices else None
+    requested_status = str(payload.status or "").strip().lower()
+    if requested_status in {"available", "out_of_stock", "hidden"}:
+        status_value = requested_status
+    else:
+        status_value = "available" if any(bool(item.get("available")) for item in variants) else "out_of_stock"
+    weight_grams = _safe_float(payload.weight_grams)
+    if weight_grams is not None and weight_grams <= 0:
+        weight_grams = None
+
+    image_ids = _normalize_int_list(payload.manual_image_asset_ids)
+    manual_image_urls: list[str] = []
+    if image_ids:
+        assets = (
+            db.query(ImageAsset)
+            .filter(ImageAsset.deleted_at.is_(None))
+            .filter(ImageAsset.id.in_(image_ids))
+            .all()
+        )
+        by_id = {int(asset.id): asset for asset in assets}
+        for image_id in image_ids:
+            asset = by_id.get(int(image_id))
+            if asset is None:
+                continue
+            manual_image_urls.append(f"/api/v1/products/images/{int(asset.id)}")
+
+    bound_source_url = str(payload.bind_source_product_url or "").strip() if payload.bind_source_product_url is not None else ""
+    if bool(payload.bind_sync) and payload.bind_source_id is not None and bound_source_url:
+        product.url = bound_source_url
+    elif str(product.url or "").strip().lower().startswith("manual://product/") or not str(product.url or "").strip():
+        product.url = f"manual://product/{int(datetime.now().timestamp() * 1000)}"
+
+    product.title = title
+    product.description = description
+    product.vendor = vendor
+    product.product_type = product_type
+    product.price = price
+    product.currency = currency
+    product.status = status_value
+    product.weight_grams = weight_grams
+    product.weight_source = "manual" if weight_grams is not None else None
+    product.weight_match_keyword = None
+    product.weight_value = None
+    product.weight_unit = None
+    product.image_count = len(manual_image_urls)
+    product.image_urls = list(manual_image_urls)
+    product.variants = variants
+    product.images_sync_locked = True
+    product.manual_image_asset_ids = list(manual_image_urls)
+    product.manual_image_order = [f"m:{url}" for url in manual_image_urls]
+    product.hidden_source_image_asset_ids = []
+
+    db.query(ParserProductOriginVariant).filter(ParserProductOriginVariant.product_id == int(product.id)).delete(synchronize_session=False)
+    if bool(payload.bind_sync) and payload.bind_source_id is not None and bound_source_url:
+        source_id = int(payload.bind_source_id)
+        for idx, variant in enumerate(variants, start=1):
+            variant_title = str(variant.get("title") or "").strip() or f"Variant {idx}"
+            variant_price = _safe_float(variant.get("price"))
+            variant_available = bool(variant.get("available"))
+            source_variant_id = f"manual-bound-{int(product.id)}-{idx}"
+            origin_key = f"{source_id}:{bound_source_url}:{source_variant_id}"
+            db.add(
+                ParserProductOriginVariant(
+                    origin_key=origin_key,
+                    product_id=int(product.id),
+                    source_id=source_id,
+                    source_product_url=bound_source_url,
+                    source_variant_id=source_variant_id,
+                    source_variant_title=variant_title,
+                    price=variant_price,
+                    currency=currency,
+                    available=variant_available,
+                    payload={"bound_from_manual_edit": True},
+                )
+            )
+
+    db.commit()
+    return {"ok": True, "id": int(product.id)}
+
+
+@router.delete("/products/manual/{product_id}")
+def delete_manual_product(
+    product_id: int,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+) -> dict[str, Any]:
+    product = (
+        db.query(ParserProduct)
+        .filter(ParserProduct.id == int(product_id))
+        .filter(ParserProduct.deleted_at.is_(None))
+        .one_or_none()
+    )
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
+
+    manual_source = _get_or_create_manual_source(db)
+    if int(product.source_id) != int(manual_source.id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Удалять можно только товары личного каталога")
+
+    db.query(ParserProductOriginVariant).filter(ParserProductOriginVariant.product_id == int(product.id)).delete(synchronize_session=False)
+    db.query(ParserProductCategoryMatch).filter(ParserProductCategoryMatch.product_id == int(product.id)).delete(synchronize_session=False)
+    db.query(ParserCategoryManualProduct).filter(ParserCategoryManualProduct.product_id == int(product.id)).delete(synchronize_session=False)
+    db.query(ParserFavoriteProduct).filter(ParserFavoriteProduct.product_id == int(product.id)).delete(synchronize_session=False)
+    db.query(ParserDedupDecision).filter(
+        or_(
+            ParserDedupDecision.left_product_id == int(product.id),
+            ParserDedupDecision.right_product_id == int(product.id),
+            ParserDedupDecision.merged_into_product_id == int(product.id),
+        )
+    ).delete(synchronize_session=False)
+    product.deleted_at = datetime.now()
+    db.commit()
     return {"ok": True, "id": int(product.id)}
 
 

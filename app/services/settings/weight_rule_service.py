@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import re
 
 from fastapi import HTTPException, status
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -528,12 +529,102 @@ class WeightRuleService:
     def list_rules(self) -> list[WeightRuleResponse]:
         return self._build_responses(self.ensure_default_rules())
 
+    @staticmethod
+    def _derive_status_from_variants(variants: list[dict] | None) -> str:
+        values = variants if isinstance(variants, list) else []
+        if not values:
+            return "available"
+        any_available = any(bool(item.get("available")) for item in values if isinstance(item, dict))
+        return "available" if any_available else "out_of_stock"
+
+    def _recalculate_products_for_weight_rules(self, *, only_product_ids: set[int] | None = None) -> None:
+        rules = self.get_matching_rules()
+        managed_sources = {"missing", "keyword_rule", "fallback_rule", ""}
+        managed_statuses = {"available", "out_of_stock", "unavailable"}
+        query = (
+            self.db.query(ParserProduct)
+            .filter(ParserProduct.deleted_at.is_(None))
+            .filter(
+                (ParserProduct.weight_source.is_(None))
+                | (ParserProduct.weight_source.in_(("missing", "keyword_rule", "fallback_rule")))
+                | (ParserProduct.status == "unavailable")
+            )
+        )
+        if only_product_ids:
+            query = query.filter(ParserProduct.id.in_(tuple(sorted(only_product_ids))))
+        rows = query.all()
+        changed = False
+        for product in rows:
+            source_raw = str(getattr(product, "weight_source", "") or "").strip().lower()
+            status_raw = str(getattr(product, "status", "") or "").strip().lower()
+            if status_raw not in managed_statuses:
+                continue
+            if source_raw not in managed_sources:
+                # Keep parser/source-provided weights untouched.
+                continue
+            match = self.match_weight_from_rules(
+                rules=rules,
+                title=getattr(product, "title", None),
+                vendor=getattr(product, "vendor", None),
+                product_type=getattr(product, "product_type", None),
+                handle=getattr(product, "handle", None),
+                allow_fallback=False,
+            )
+            if match.weight_grams is None or match.weight_grams <= 0:
+                if product.weight_grams is not None or source_raw != "missing" or product.weight_match_keyword is not None:
+                    product.weight_grams = None
+                    product.weight_source = "missing"
+                    product.weight_match_keyword = None
+                    changed = True
+                if status_raw != "hidden" and status_raw != "unavailable":
+                    product.status = "unavailable"
+                    changed = True
+                continue
+
+            next_source = "fallback_rule" if match.matched_keyword == DEFAULT_FALLBACK_MATCH_KEYWORD else "keyword_rule"
+            if product.weight_grams != float(match.weight_grams):
+                product.weight_grams = float(match.weight_grams)
+                changed = True
+            if str(product.weight_source or "") != next_source:
+                product.weight_source = next_source
+                changed = True
+            next_keyword = None if match.matched_keyword == DEFAULT_FALLBACK_MATCH_KEYWORD else match.matched_keyword
+            if str(product.weight_match_keyword or "") != str(next_keyword or ""):
+                product.weight_match_keyword = next_keyword
+                changed = True
+            if status_raw == "unavailable":
+                product.status = self._derive_status_from_variants(getattr(product, "variants", None))
+                changed = True
+
+        if changed:
+            self.db.commit()
+
+    def _find_product_ids_by_keywords(self, keywords: list[str]) -> set[int]:
+        normalized = [k.strip().lower() for k in keywords if k and k.strip()]
+        if not normalized:
+            return set()
+        q = self.db.query(ParserProduct.id).filter(ParserProduct.deleted_at.is_(None))
+        conditions = []
+        for kw in normalized:
+            token = f"%{kw}%"
+            conditions.extend(
+                [
+                    func.lower(func.coalesce(ParserProduct.title, "")).like(token),
+                    func.lower(func.coalesce(ParserProduct.vendor, "")).like(token),
+                    func.lower(func.coalesce(ParserProduct.product_type, "")).like(token),
+                    func.lower(func.coalesce(ParserProduct.handle, "")).like(token),
+                ]
+            )
+        q = q.filter(or_(*conditions))
+        return {int(row[0]) for row in q.all()}
+
     def create_rule(self, payload: WeightRuleCreateRequest) -> WeightRuleResponse:
         self.ensure_default_rules()
         current = self.rule_repo.get_all_active()
         created = self.rule_repo.create(weight_grams=payload.weight_grams, sort_order=max((item.sort_order for item in current), default=0) + 1)
         self.rule_repo.flush()
         self.db.commit()
+        self._recalculate_products_for_weight_rules()
         return WeightRuleResponse(id=created.id, weight_grams=created.weight_grams, keywords=[])
 
     def update_rule(self, rule_id: int, payload: WeightRuleUpdateRequest) -> WeightRuleResponse:
@@ -543,16 +634,21 @@ class WeightRuleService:
         rule.weight_grams = payload.weight_grams
         self.db.commit()
         keywords = [item.keyword for item in self.keyword_repo.get_by_rule(rule.id)]
+        affected_ids = self._find_product_ids_by_keywords(keywords)
+        self._recalculate_products_for_weight_rules(only_product_ids=affected_ids)
         return WeightRuleResponse(id=rule.id, weight_grams=rule.weight_grams, keywords=keywords)
 
     def delete_rule(self, rule_id: int) -> dict:
         rule = self.rule_repo.get_by_id(rule_id)
         if not rule or rule.deleted_at is not None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Правило веса не найдено")
+        existing_keywords = [item.keyword for item in self.keyword_repo.get_by_rule(rule_id)]
+        affected_ids = self._find_product_ids_by_keywords(existing_keywords)
         for keyword in self.keyword_repo.get_by_rule(rule_id):
             self.db.delete(keyword)
         rule.deleted_at = datetime.now(timezone.utc)
         self.db.commit()
+        self._recalculate_products_for_weight_rules(only_product_ids=affected_ids)
         return {"ok": True}
 
     def add_keyword(self, rule_id: int, payload: WeightRuleKeywordRequest) -> dict:
@@ -564,6 +660,8 @@ class WeightRuleService:
             return {"ok": True, "keyword": keyword, "duplicated": True}
         self.keyword_repo.create(rule_id=rule_id, keyword=keyword)
         self.db.commit()
+        affected_ids = self._find_product_ids_by_keywords([keyword])
+        self._recalculate_products_for_weight_rules(only_product_ids=affected_ids)
         return {"ok": True, "keyword": keyword}
 
     def remove_keyword(self, rule_id: int, keyword: str) -> dict:
@@ -574,8 +672,19 @@ class WeightRuleService:
         entity = self.keyword_repo.get_exact(rule_id, normalized)
         if not entity:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ключевое слово не найдено")
+        affected_ids = self._find_product_ids_by_keywords([normalized])
+        # Also include products that were explicitly matched by this keyword.
+        matched_ids = {
+            int(row[0])
+            for row in self.db.query(ParserProduct.id)
+            .filter(ParserProduct.deleted_at.is_(None))
+            .filter(func.lower(func.coalesce(ParserProduct.weight_match_keyword, "")) == normalized)
+            .all()
+        }
+        affected_ids.update(matched_ids)
         self.db.delete(entity)
         self.db.commit()
+        self._recalculate_products_for_weight_rules(only_product_ids=affected_ids)
         return {"ok": True}
 
     def get_matching_rules(self) -> list[WeightRuleResponse]:
@@ -585,10 +694,9 @@ class WeightRuleService:
             self.db.rollback()
             return self.list_rules()
 
-    def list_missing_weight_products(self, limit: int = 500) -> list[WeightMissingProductResponse]:
+    def list_missing_weight_products(self, limit: int = 500, offset: int = 0) -> list[WeightMissingProductResponse]:
         safe_limit = max(1, min(limit, 5000))
-        rules = self.get_matching_rules()
-        probe_limit = min(safe_limit * 5, 20000)
+        safe_offset = max(0, int(offset))
         origin_source_subq = (
             self.db.query(
                 ParserProductOriginVariant.product_id.label("product_id"),
@@ -605,20 +713,12 @@ class WeightRuleService:
             .filter(ParserProduct.deleted_at.is_(None))
             .filter((ParserProduct.weight_grams.is_(None)) | (ParserProduct.weight_source == "missing"))
             .order_by(ParserProduct.updated_at.desc())
-            .limit(probe_limit)
+            .offset(safe_offset)
+            .limit(safe_limit)
             .all()
         )
         unresolved: list[WeightMissingProductResponse] = []
         for product, source in rows:
-            match = self.match_weight_from_rules(
-                rules=rules,
-                title=product.title,
-                vendor=product.vendor,
-                product_type=product.product_type,
-                handle=product.handle,
-            )
-            if match.weight_grams is not None:
-                continue
             unresolved.append(
                 WeightMissingProductResponse(
                     id=product.id,
@@ -628,8 +728,6 @@ class WeightRuleService:
                     source_name=source.name,
                 )
             )
-            if len(unresolved) >= safe_limit:
-                break
         return unresolved
 
     @staticmethod
@@ -651,11 +749,14 @@ class WeightRuleService:
         vendor: str | None,
         product_type: str | None,
         handle: str | None,
+        allow_fallback: bool = True,
     ) -> WeightMatchResult:
         if not rules:
             return WeightMatchResult(weight_grams=None, matched_keyword=None)
         haystack = _normalize_match_haystack(title, vendor, product_type, handle)
         if not haystack:
+            if not allow_fallback:
+                return WeightMatchResult(weight_grams=None, matched_keyword=None)
             fallback_weight = WeightRuleService._resolve_fallback_weight(rules)
             if fallback_weight is None:
                 return WeightMatchResult(weight_grams=None, matched_keyword=None)
@@ -677,6 +778,8 @@ class WeightRuleService:
                         best_keyword = normalized_keyword
 
         if best_rule_weight is None:
+            if not allow_fallback:
+                return WeightMatchResult(weight_grams=None, matched_keyword=None)
             fallback_weight = WeightRuleService._resolve_fallback_weight(rules)
             if fallback_weight is None:
                 return WeightMatchResult(weight_grams=None, matched_keyword=None)

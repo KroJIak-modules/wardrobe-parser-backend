@@ -950,9 +950,23 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
                 row.image_urls = incoming_image_urls
                 row.image_count = len(incoming_image_urls)
 
+            incoming_status = str(item.get("status") or "").strip().lower()
+            unavailable_reason = str(item.get("unavailable_reason") or "").strip().lower()
+            weight_missing_in_payload = parsed_weight is None or (isinstance(parsed_weight, float) and parsed_weight <= 0.0)
+            unavailable_due_weight = (
+                incoming_status == "unavailable"
+                and (
+                    weight_missing_in_payload
+                    or "weight" in unavailable_reason
+                    or "missing_weight" in unavailable_reason
+                )
+            )
+
             # Manual moderation states must survive sync.
             if current_status in {"hidden", "unavailable"}:
                 pass
+            elif unavailable_due_weight:
+                row.status = "unavailable"
             elif validation_errors:
                 row.status = "unavailable"
             else:

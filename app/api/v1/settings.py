@@ -101,9 +101,9 @@ def parser_weight_rules_contract(db: Session = Depends(get_db)):
 
 
 @router.get("/weight-rules/missing-products", response_model=list[WeightMissingProductResponse])
-def list_missing_weight_products(limit: int = 500, db: Session = Depends(get_db)):
+def list_missing_weight_products(limit: int = 500, offset: int = 0, db: Session = Depends(get_db)):
     try:
-        return WeightRuleService(db).list_missing_weight_products(limit=limit)
+        return WeightRuleService(db).list_missing_weight_products(limit=limit, offset=offset)
     except Exception:
         LOGGER.exception("Failed to load missing weight products, returning empty list")
         return []
