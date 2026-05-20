@@ -55,19 +55,24 @@ def _service_sync_base() -> str:
     return f"{settings.service_base_url.rstrip('/')}/api/v1/sync"
 
 
-def _load_source_strategy_sequence(source_key: str | None) -> list[str]:
-    key = str(source_key or "").strip().lower()
-    if not key:
-        return []
+def _service_sources_list() -> list[dict[str, Any]]:
     try:
         res = requests.get(f"{_service_sync_base()}/sources", timeout=(3, 10))
         res.raise_for_status()
         payload = res.json()
         if not isinstance(payload, list):
             return []
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
+        return [item for item in payload if isinstance(item, dict)]
+    except Exception:
+        return []
+
+
+def _load_source_strategy_sequence(source_key: str | None) -> list[str]:
+    key = str(source_key or "").strip().lower()
+    if not key:
+        return []
+    try:
+        for item in _service_sources_list():
             cur_key = str(item.get("key") or "").strip().lower()
             if cur_key != key:
                 continue
@@ -77,6 +82,86 @@ def _load_source_strategy_sequence(source_key: str | None) -> list[str]:
     except Exception:
         return []
     return []
+
+
+def _normalized_host(raw: str) -> str:
+    try:
+        host = str(urlparse(str(raw or "").strip()).netloc or "").strip().lower()
+    except Exception:
+        host = ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _build_manual_candidate_urls_by_source(*, source_keys: list[str]) -> dict[str, list[str]]:
+    normalized_selected = {str(key or "").strip().lower() for key in source_keys if str(key or "").strip()}
+    if not normalized_selected:
+        return {}
+    service_sources = _service_sources_list()
+    manual_keys: set[str] = set()
+    for item in service_sources:
+        key = str(item.get("key") or "").strip().lower()
+        if not key or key not in normalized_selected:
+            continue
+        cfg = item.get("config") if isinstance(item.get("config"), dict) else {}
+        mode = str(cfg.get("mode") or "auto").strip().lower()
+        if mode == "manual":
+            manual_keys.add(key)
+    if not manual_keys:
+        return {}
+
+    db = SessionLocal()
+    try:
+        sources = (
+            db.query(ParserSource)
+            .filter(ParserSource.deleted_at.is_(None))
+            .all()
+        )
+        source_id_to_key: dict[int, str] = {}
+        for source in sources:
+            host = _normalized_host(getattr(source, "url", "") or "")
+            name = str(getattr(source, "name", "") or "").strip().lower()
+            for candidate in (host, name):
+                if candidate and candidate in manual_keys:
+                    source_id_to_key[int(source.id)] = candidate
+                    break
+        if not source_id_to_key:
+            return {}
+
+        rows = (
+            db.query(
+                ParserProductOriginVariant.source_id,
+                ParserProductOriginVariant.source_product_url,
+            )
+            .join(ParserProduct, ParserProduct.id == ParserProductOriginVariant.product_id)
+            .filter(ParserProduct.deleted_at.is_(None))
+            .filter(ParserProductOriginVariant.source_id.in_(list(source_id_to_key.keys())))
+            .all()
+        )
+        urls_by_key: dict[str, list[str]] = {key: [] for key in manual_keys}
+        seen_by_key: dict[str, set[str]] = {key: set() for key in manual_keys}
+        for row in rows:
+            source_id = int(row.source_id) if row.source_id is not None else None
+            if source_id is None:
+                continue
+            source_key = source_id_to_key.get(source_id)
+            if not source_key:
+                continue
+            product_url = str(row.source_product_url or "").strip()
+            if not product_url:
+                continue
+            if product_url in seen_by_key[source_key]:
+                continue
+            seen_by_key[source_key].add(product_url)
+            urls_by_key[source_key].append(product_url)
+        return {
+            key: values
+            for key, values in urls_by_key.items()
+            if values
+        }
+    finally:
+        db.close()
 
 
 _JADED_STRATEGY_RU: dict[str, str] = {
@@ -673,6 +758,24 @@ def _derive_status(variants: Any) -> str:
     return "out_of_stock"
 
 
+def _variant_currency(value: Any) -> str | None:
+    normalized = str(value or "").strip().upper()[:3]
+    if len(normalized) == 3:
+        return normalized
+    return None
+
+
+def _derive_product_currency_from_variants(variants: Any) -> str | None:
+    parsed = variants if isinstance(variants, list) else []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        normalized = _variant_currency(item.get("currency"))
+        if normalized:
+            return normalized
+    return None
+
+
 def _normalize_variants_with_source_lineage(
     *,
     source_key: str,
@@ -691,6 +794,7 @@ def _normalize_variants_with_source_lineage(
         item["source_variant_id"] = source_variant_id or None
         source_variant_title = str(item.get("source_variant_title") or item.get("title") or "").strip()
         item["source_variant_title"] = source_variant_title or None
+        item["currency"] = _variant_currency(item.get("currency"))
         out.append(item)
     return out
 
@@ -844,7 +948,7 @@ def _upsert_origin_variants(
         row.source_variant_title = source_variant_title
         row.sku = str(variant.get("sku") or "").strip() or None
         row.price = _safe_float(variant.get("price"))
-        row.currency = str(variant.get("currency") or "").strip().upper()[:3] or None
+        row.currency = _variant_currency(variant.get("currency"))
         row.available = bool(variant.get("available", True))
         payload = dict(variant)
         payload["source_key"] = str(variant.get("source_key") or source_key).strip() or source_key
@@ -914,7 +1018,6 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
             row.product_type = str(item.get("product_type") or item.get("category") or "").strip() or None
             row.url = source_product_url or str(row.url or "").strip()
             row.price = _safe_float(item.get("price"))
-            row.currency = str(item.get("currency") or row.currency or "USD").strip().upper()[:3] or "USD"
             images = item.get("images") if isinstance(item.get("images"), list) else []
             incoming_image_urls = [str(url).strip() for url in images if str(url).strip()]
             row.variants = _normalize_variants_with_source_lineage(
@@ -922,6 +1025,10 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
                 source_product_url=source_product_url,
                 variants=item.get("variants"),
             )
+            incoming_currency = _derive_product_currency_from_variants(row.variants)
+            if not incoming_currency and row.id is None:
+                # Missing currency on all variants is ingest error.
+                continue
             if row.id is None:
                 db.flush()
             _upsert_origin_variants(
@@ -1211,7 +1318,7 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
                         agg_job.current_stage = "Синхронизация завершена"
                 else:
                     failed_names = ", ".join(sorted(real_failed_sources.keys()))
-                    agg_job.current_stage = f"Ошибка у {failed_names}"
+                    agg_job.current_stage = f"Ошибки на источниках: {failed_names}"
             if not agg_job.current_stage:
                 agg_job.current_stage = agg_job.status
             _persist_runtime(agg_job)
@@ -1302,6 +1409,16 @@ def run_sync_all_enabled_sources(payload: StartSyncRequest | None = None) -> dic
     source_keys = [str(s).strip() for s in ((payload.sources if payload else None) or []) if str(s).strip()]
     if source_keys:
         request_payload["sources"] = source_keys
+    selected_for_manual_mode = list(source_keys)
+    if not selected_for_manual_mode:
+        selected_for_manual_mode = [
+            str(item.get("key") or "").strip()
+            for item in _service_sources_list()
+            if bool(item.get("enabled", True)) and bool(item.get("sync_enabled", True)) and str(item.get("key") or "").strip()
+        ]
+    manual_candidate_urls = _build_manual_candidate_urls_by_source(source_keys=selected_for_manual_mode)
+    if manual_candidate_urls:
+        request_payload["candidate_urls_by_source"] = manual_candidate_urls
     try:
         response = requests.post(f"{base}/jobs", json=request_payload, timeout=(10, 30))
         response.raise_for_status()

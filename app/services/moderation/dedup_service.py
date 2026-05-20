@@ -54,6 +54,17 @@ class DedupService:
             return None
         return float(price)
 
+    @staticmethod
+    def _derive_currency_from_variants(variants: Any) -> str | None:
+        parsed = variants if isinstance(variants, list) else []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            normalized = str(item.get("currency") or "").strip().upper()[:3]
+            if len(normalized) == 3:
+                return normalized
+        return None
+
     def _build_effective_prices(self, products: list[Any]) -> dict[int, float | None]:
         if not products:
             return {}
@@ -88,8 +99,9 @@ class DedupService:
             if source_id is None and getattr(product, "source_id", None) is not None:
                 source_id = int(product.source_id)
             source_profile = source_profile_map.get(int(source_id)) if source_id is not None else None
-            source_price = self._normalize_source_price(product.price, product.currency)
-            source_currency = str(product.currency or "").upper() or None
+            variants = product.variants if isinstance(product.variants, list) else []
+            source_currency = self._derive_currency_from_variants(variants)
+            source_price = self._normalize_source_price(product.price, source_currency)
             pricing = settings_service.calculate_for_product(
                 source_price=source_price,
                 source_currency=source_currency,
@@ -119,7 +131,7 @@ class DedupService:
                     if source_profile is not None and getattr(source_profile, "buyout_surcharge_currency", None) is not None
                     else None
                 ),
-                variants=product.variants if isinstance(product.variants, list) else [],
+                variants=variants,
                 settings=pricing_settings,
             )
             if pricing.final_price_rub is not None:
@@ -130,11 +142,39 @@ class DedupService:
 
     @staticmethod
     def _product_response_with_effective_price(product: Any, effective_price_rub: float | None) -> ProductResponse:
-        payload = ProductResponse.model_validate(product)
+        payload = DedupService._to_product_response(product)
         if effective_price_rub is not None:
             payload.price = float(round(effective_price_rub, 2))
             payload.currency = "RUB"
         return payload
+
+    @classmethod
+    def _to_product_response(cls, product: Any) -> ProductResponse:
+        variants = list(getattr(product, "variants", []) or [])
+        currency = cls._derive_currency_from_variants(variants) or "USD"
+        return ProductResponse(
+            id=int(getattr(product, "id")),
+            source_id=int(getattr(product, "source_id")),
+            handle=str(getattr(product, "handle", "") or ""),
+            title=str(getattr(product, "title", "") or ""),
+            vendor=getattr(product, "vendor", None),
+            product_type=getattr(product, "product_type", None),
+            url=str(getattr(product, "url", "") or ""),
+            price=cls._safe_float(getattr(product, "price", None)),
+            currency=currency,
+            status=str(getattr(product, "status", "available") or "available"),
+            image_count=int(getattr(product, "image_count", 0) or 0),
+            image_urls=list(getattr(product, "image_urls", []) or []),
+            weight_grams=cls._safe_float(getattr(product, "weight_grams", None)),
+            weight_source=getattr(product, "weight_source", None),
+            weight_match_keyword=getattr(product, "weight_match_keyword", None),
+            weight_value=cls._safe_float(getattr(product, "weight_value", None)),
+            weight_unit=getattr(product, "weight_unit", None),
+            variants=variants,
+            description=getattr(product, "description", None),
+            created_at=getattr(product, "created_at", None),
+            updated_at=getattr(product, "updated_at", None),
+        )
 
     @staticmethod
     def _unique_list(values: Iterable[Any]) -> list[Any]:
@@ -471,8 +511,8 @@ class DedupService:
                     decided_at=decision.decided_at,
                     can_undo=undo_block_reason is None,
                     undo_block_reason=undo_block_reason,
-                    left=ProductResponse.model_validate(left),
-                    right=ProductResponse.model_validate(right),
+                    left=self._to_product_response(left),
+                    right=self._to_product_response(right),
                 )
             )
         return DedupDecisionListResponse(items=items, total=len(items), limit=max(1, min(int(limit), 1000)))

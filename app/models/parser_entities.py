@@ -52,7 +52,6 @@ class ParserProduct(Base):
     product_type = Column(String(255), nullable=True)
     url = Column(String(2048), nullable=False)
     price = Column(Float, nullable=True)
-    currency = Column(String(3), nullable=False, default="USD")
     status = Column(
         PGEnum(
             "available",

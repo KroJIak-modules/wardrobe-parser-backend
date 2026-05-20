@@ -119,6 +119,26 @@ def _products_count(db: Session, source_id: int) -> int:
     return len(direct_ids | origin_ids)
 
 
+def _manual_products_breakdown(db: Session, manual_source_id: int) -> tuple[int, int, int]:
+    total_manual = int(
+        db.query(ParserProduct.id)
+        .filter(ParserProduct.deleted_at.is_(None))
+        .filter(ParserProduct.source_id == int(manual_source_id))
+        .count()
+    )
+    bound_sync = int(
+        db.query(ParserProduct.id)
+        .join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
+        .filter(ParserProduct.deleted_at.is_(None))
+        .filter(ParserProduct.source_id == int(manual_source_id))
+        .filter(ParserProductOriginVariant.source_id != int(manual_source_id))
+        .distinct(ParserProduct.id)
+        .count()
+    )
+    manual_only = max(0, total_manual - bound_sync)
+    return total_manual, manual_only, bound_sync
+
+
 def _as_bool(value: object, default: bool) -> bool:
     if value is None:
         return default
@@ -158,11 +178,12 @@ def _map_source(db: Session, item: dict) -> dict:
     is_password_protected = last_sync_status == "password_protected"
     cfg = item.get("config") if isinstance(item.get("config"), dict) else {}
     currency_method, locked_currency = _currency_method_from_config(cfg)
+    source_mode = str(cfg.get("mode") or "auto").strip().lower()
+    if source_mode not in {"auto", "manual"}:
+        source_mode = "auto"
     seq = cfg.get("strategy_sequence") if isinstance(cfg.get("strategy_sequence"), list) else []
     normalized_seq = [str(x).strip().lower() for x in seq if str(x).strip()]
-    is_auto_ingest = bool(normalized_seq)
-    if normalized_seq and all(step in {"manual_link", "manual_link_import", "manual"} for step in normalized_seq):
-        is_auto_ingest = False
+    is_auto_ingest = source_mode == "auto"
     return {
         "key": source_key,
         # Must match ParserProduct.source_id from backend DB, otherwise UI source mapping is corrupted.
@@ -180,6 +201,7 @@ def _map_source(db: Session, item: dict) -> dict:
         "currency_method": currency_method,
         "locked_currency": locked_currency,
         "currency_priority_editable": currency_method == "priority_list",
+        "mode": source_mode,
         "notes": None,
         "status_label": None,
         "products_count": _products_count(db, profile_id) if profile is not None else 0,
@@ -221,6 +243,7 @@ def _get_or_create_manual_source(db: Session) -> ParserSource:
 
 
 def _map_manual_source(db: Session, source: ParserSource) -> dict:
+    total_manual, manual_only, bound_sync = _manual_products_breakdown(db, int(source.id))
     return {
         "key": _MANUAL_SOURCE_KEY,
         "source_id": int(source.id),
@@ -239,7 +262,9 @@ def _map_manual_source(db: Session, source: ParserSource) -> dict:
         "currency_priority_editable": False,
         "notes": None,
         "status_label": None,
-        "products_count": _products_count(db, int(source.id)),
+        "products_count": total_manual,
+        "manual_products_count": manual_only,
+        "bound_sync_products_count": bound_sync,
         "categories_count": 0,
         "last_sync_at": getattr(source, "last_sync_at", None),
         "last_sync_duration_sec": None,

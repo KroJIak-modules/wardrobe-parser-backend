@@ -8,6 +8,7 @@ import json
 import logging
 import random
 import re
+import time
 import unicodedata
 from datetime import datetime
 from io import BytesIO
@@ -16,14 +17,16 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request as UrlRequest, urlopen
 
+import requests
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models import (
     ImageAsset,
@@ -115,6 +118,7 @@ def _assert_allowed_product_status(value: Any) -> str:
 class ProductVariantIn(BaseModel):
     title: str
     price: float | None = None
+    currency: str
     available: bool = True
 
 
@@ -123,7 +127,6 @@ class CreateManualProductRequest(BaseModel):
     description: str | None = None
     vendor: str | None = None
     product_type: str | None = None
-    currency: str = "USD"
     variants: list[ProductVariantIn] = []
     manual_image_asset_ids: list[int] = []
     weight_grams: float | None = None
@@ -138,7 +141,6 @@ class UpdateManualProductRequest(BaseModel):
     description: str | None = None
     vendor: str | None = None
     product_type: str | None = None
-    currency: str = "USD"
     variants: list[ProductVariantIn] = []
     manual_image_asset_ids: list[int] = []
     weight_grams: float | None = None
@@ -156,24 +158,114 @@ class ProductImageUrlPayload(BaseModel):
     url: str
 
 
+def _service_v1_url(path: str) -> str:
+    base = settings.service_base_url.rstrip("/")
+    clean = path.lstrip("/")
+    return f"{base}/api/v1/{clean}" if clean else f"{base}/api/v1"
+
+
+def _service_probe_product_by_url(product_url: str) -> dict[str, Any]:
+    payload = {"product_url": str(product_url or "").strip(), "dry_run": False}
+    try:
+        create_res = requests.post(
+            _service_v1_url("sync/probe/jobs"),
+            json=payload,
+            timeout=(5, 30),
+        )
+        create_res.raise_for_status()
+        created = create_res.json()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Service probe unavailable: {exc}") from exc
+    job_id = str((created or {}).get("job_id") or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Service probe returned empty job_id")
+
+    terminal = {"completed", "failed", "cancelled"}
+    status_payload: dict[str, Any] | None = None
+    for _ in range(60):
+        try:
+            status_res = requests.get(_service_v1_url(f"sync/probe/jobs/{job_id}"), timeout=(5, 15))
+            status_res.raise_for_status()
+            status_payload = status_res.json()
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Service probe status failed: {exc}") from exc
+        state = str((status_payload or {}).get("status") or "").strip().lower()
+        if state in terminal:
+            break
+        # short poll
+        time.sleep(0.25)
+
+    state = str((status_payload or {}).get("status") or "").strip().lower()
+    if state != "completed":
+        detail = str((status_payload or {}).get("error") or "Service probe failed").strip()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail or "Товар не найден")
+
+    try:
+        events_res = requests.get(
+            _service_v1_url(f"sync/probe/jobs/{job_id}/events"),
+            params={"cursor": 0, "limit": 500},
+            timeout=(5, 30),
+        )
+        events_res.raise_for_status()
+        events_payload = events_res.json()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Service probe events failed: {exc}") from exc
+    items = events_payload.get("items") if isinstance(events_payload, dict) else []
+    batches = [
+        event for event in (items or [])
+        if isinstance(event, dict)
+        and str(event.get("type") or "") == "product_batch"
+        and isinstance(event.get("payload"), dict)
+        and isinstance(event["payload"].get("items"), list)
+        and event["payload"]["items"]
+    ]
+    if not batches:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
+    last_batch_items = batches[-1]["payload"]["items"]
+    probe_item = last_batch_items[0] if isinstance(last_batch_items[0], dict) else None
+    if not probe_item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
+    return probe_item
+
+
 def _normalize_manual_variants(raw_variants: list[ProductVariantIn]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for item in raw_variants:
         title = str(item.title or "").strip()
         if not title:
             continue
+        currency = str(item.currency or "").strip().upper()[:3]
+        if len(currency) != 3:
+            continue
         price = _safe_float(item.price)
         out.append(
             {
                 "title": title,
                 "price": f"{price:.2f}" if price is not None and price >= 0 else None,
+                "currency": currency,
                 "available": bool(item.available),
                 "inventory_quantity": 1 if bool(item.available) else 0,
             }
         )
-    if out:
-        return out
-    return [{"title": "Default", "price": None, "available": True, "inventory_quantity": 1}]
+    return out
+
+
+def _variant_currency(value: Any) -> str | None:
+    normalized = str(value or "").strip().upper()[:3]
+    if len(normalized) == 3:
+        return normalized
+    return None
+
+
+def _derive_product_currency_from_variants(variants: Any) -> str | None:
+    parsed = variants if isinstance(variants, list) else []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        normalized = _variant_currency(item.get("currency"))
+        if normalized:
+            return normalized
+    return None
 
 
 def _normalize_url_loose(raw: str) -> str:
@@ -679,7 +771,15 @@ def _project_showcase_product_detail(item: dict[str, Any]) -> dict[str, Any]:
 
 def _status_sort_rank(raw_status: Any) -> int:
     normalized = str(raw_status or "").strip().lower()
-    return 0 if normalized == "available" else 1
+    if normalized == "available":
+        return 0
+    if normalized == "hidden":
+        return 1
+    if normalized == "out_of_stock":
+        return 2
+    if normalized == "unavailable":
+        return 3
+    return 4
 
 
 def _vendor_sort_value(item: dict[str, Any]) -> str:
@@ -762,14 +862,31 @@ def _normalize_source_price(raw_price: Any, currency: str | None) -> float | Non
     return _safe_float(raw_price)
 
 
+def _first_variant_price_and_currency(item: dict[str, Any]) -> tuple[float | None, str | None]:
+    variants = item.get("variants") if isinstance(item.get("variants"), list) else []
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        variant_price = _safe_float(variant.get("price"))
+        variant_currency = _variant_currency(variant.get("currency"))
+        if variant_price is None or variant_currency is None:
+            continue
+        return variant_price, variant_currency
+    return None, None
+
+
 def _price_input_from_item(item: dict[str, Any]) -> tuple[float | None, str | None]:
     source_currency_raw = item.get("source_currency")
     if source_currency_raw is None:
-        source_currency_raw = item.get("currency")
+        _, variant_currency = _first_variant_price_and_currency(item)
+        source_currency_raw = variant_currency
     source_currency = str(source_currency_raw).upper() if source_currency_raw is not None else None
     raw_source_price = item.get("source_price")
     if raw_source_price is None:
         raw_source_price = item.get("price")
+    if raw_source_price is None:
+        variant_price, _ = _first_variant_price_and_currency(item)
+        raw_source_price = variant_price
     source_price = _normalize_source_price(raw_source_price, source_currency)
     return source_price, source_currency
 
@@ -1044,6 +1161,8 @@ def _apply_internal_categories_from_ids(
 
 
 def _product_row_to_item(product: ParserProduct, *, default_show_description: bool = True) -> dict[str, Any]:
+    variants = list(product.variants or [])
+    derived_currency = _derive_product_currency_from_variants(variants) or "USD"
     item: dict[str, Any] = {
         "id": int(product.id),
         "source_id": int(product.source_id),
@@ -1057,13 +1176,13 @@ def _product_row_to_item(product: ParserProduct, *, default_show_description: bo
         "product_type": product.product_type,
         "url": str(product.url),
         "price": product.price,
-        "currency": str(product.currency),
+        "currency": derived_currency,
         "status": str(product.status),
         "is_auto_added": bool(getattr(product, "is_auto_added", True)),
         "auto_hide_force_visible": bool(getattr(product, "auto_hide_force_visible", False)),
         "image_count": int(product.image_count or 0),
         "image_urls": list(product.image_urls or []),
-        "variants": list(product.variants or []),
+        "variants": variants,
         "weight_grams": product.weight_grams,
         "weight_source": product.weight_source,
         "weight_match_keyword": product.weight_match_keyword,
@@ -1143,6 +1262,7 @@ def _project_admin_table_item(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": int(item.get("id") or 0),
         "source_id": int(item.get("source_id") or 0),
+        "source_name": str(item.get("source_name") or "").strip() or None,
         "title": str(item.get("title") or ""),
         "vendor": item.get("vendor"),
         "vendor_original": item.get("vendor_original"),
@@ -1171,7 +1291,7 @@ def get_admin_products_table(
     product_type: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=_CATALOG_MAX_LIMIT),
-    cursor: str | None = Query(default=None),
+    offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     selected_status = None
     if status_filter:
@@ -1185,7 +1305,6 @@ def get_admin_products_table(
     normalized_search = (search or "").strip()
     normalized_vendor = (vendor or "").strip() or None
     normalized_type = (product_type or "").strip() or None
-    decoded_cursor: tuple[datetime, int] | None = _decode_cursor(cursor) if cursor else None
 
     base_query = (
         _with_active_sources(db.query(ParserProduct))
@@ -1215,18 +1334,21 @@ def get_admin_products_table(
         or 0
     )
 
-    page_query = base_query
-    if decoded_cursor is not None:
-        page_query = page_query.filter(
-            or_(
-                ParserProduct.updated_at < decoded_cursor[0],
-                (ParserProduct.updated_at == decoded_cursor[0]) & (ParserProduct.id < decoded_cursor[1]),
-            )
-        )
+    status_rank_expr = case(
+        (ParserProduct.status == "available", 0),
+        (ParserProduct.status == "hidden", 1),
+        (ParserProduct.status == "out_of_stock", 2),
+        (ParserProduct.status == "unavailable", 3),
+        else_=4,
+    )
+    mapped_vendor_expr = _mapped_vendor_label_expr()
+    vendor_sort_expr = func.lower(func.trim(func.coalesce(mapped_vendor_expr, "")))
+    title_sort_expr = func.lower(func.trim(func.coalesce(ParserProduct.title, "")))
 
     rows = (
-        page_query
-        .order_by(ParserProduct.updated_at.desc(), ParserProduct.id.desc())
+        base_query
+        .order_by(status_rank_expr.asc(), vendor_sort_expr.asc(), title_sort_expr.asc(), ParserProduct.id.asc())
+        .offset(int(offset))
         .limit(int(limit))
         .all()
     )
@@ -1305,18 +1427,15 @@ def get_admin_products_table(
         items.append(_project_admin_table_item(enriched))
     _sort_products_for_display(items)
 
-    next_cursor = None
-    has_more = False
-    if len(rows) == int(limit):
-        last_ts, last_id = _cursor_parts_for_product(rows[-1])
-        next_cursor = _encode_cursor(last_ts, last_id)
-        has_more = True
+    has_more = int(offset) + len(rows) < int(filtered_total)
+    next_offset = int(offset) + len(rows) if has_more else None
 
     return {
         "items": items,
-        "next_cursor": next_cursor,
+        "next_offset": next_offset,
         "has_more": has_more,
         "limit": int(limit),
+        "offset": int(offset),
         "total": int(filtered_total),
         "overall_total": int(overall_total),
     }
@@ -2408,6 +2527,8 @@ async def update_product(
         auto_hide_force_visible=bool(getattr(product, "auto_hide_force_visible", False)),
     )
 
+    variants = list(product.variants or [])
+    derived_currency = _derive_product_currency_from_variants(variants) or "USD"
     patched_payload = {
         "id": int(product.id),
         "source_id": int(effective_source_id) if effective_source_id is not None else int(product.source_id),
@@ -2421,13 +2542,13 @@ async def update_product(
         "product_type": product.product_type,
         "url": str(product.url),
         "price": product.price,
-        "currency": str(product.currency),
+        "currency": derived_currency,
         "source_price": getattr(product, "source_price", None) if getattr(product, "source_price", None) is not None else product.price,
-        "source_currency": str(getattr(product, "source_currency", None) or product.currency),
+        "source_currency": str(getattr(product, "source_currency", None) or derived_currency),
         "status": effective_status,
         "image_count": int(product.image_count or 0),
         "image_urls": list(product.image_urls or []),
-        "variants": list(product.variants or []),
+        "variants": variants,
         "weight_grams": product.weight_grams,
         "weight_source": product.weight_source,
         "weight_match_keyword": product.weight_match_keyword,
@@ -2560,6 +2681,8 @@ def preview_product_by_url(
     if matched is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
     source = db.query(ParserSource).filter(ParserSource.id == int(getattr(matched, "source_id"))).first()
+    matched_variants = list(getattr(matched, "variants", []) or [])
+    matched_currency = _derive_product_currency_from_variants(matched_variants) or "USD"
 
     return {
         "id": int(getattr(matched, "id")),
@@ -2574,9 +2697,106 @@ def preview_product_by_url(
         "product_type": getattr(matched, "product_type", None),
         "product_url": str(getattr(matched, "url", "") or ""),
         "price": _safe_float(getattr(matched, "price", None)),
-        "currency": str(getattr(matched, "currency", "") or "USD"),
+        "currency": matched_currency,
         "image_urls": list(getattr(matched, "image_urls", []) or []),
-        "variants": list(getattr(matched, "variants", []) or []),
+        "variants": matched_variants,
+    }
+
+
+@router.post("/products/probe-by-url")
+def probe_product_by_url(
+    payload: ProductUrlPayload,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin_access),
+) -> dict[str, Any]:
+    normalized_input = _normalize_url_loose(payload.url)
+    if not normalized_input:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректная ссылка")
+
+    probe_item = _service_probe_product_by_url(normalized_input)
+    source_product_url = _normalize_url_loose(str(probe_item.get("source_product_url") or probe_item.get("url") or normalized_input))
+    source_host = _norm_host(source_product_url)
+
+    source = None
+    if source_host:
+        candidates = db.query(ParserSource).filter(ParserSource.deleted_at.is_(None)).all()
+        source = next((row for row in candidates if _norm_host(str(row.url or "")) == source_host), None)
+
+    variants_raw = probe_item.get("variants") if isinstance(probe_item.get("variants"), list) else []
+    base_price = _safe_float(probe_item.get("price"))
+    buyer_total_price = _safe_float(probe_item.get("buyer_total_price"))
+    buyer_service_fee = _safe_float(probe_item.get("buyer_service_fee"))
+    effective_price = buyer_total_price if buyer_total_price is not None and buyer_total_price > 0 else base_price
+    variants: list[dict[str, Any]] = []
+    for raw in variants_raw:
+        if not isinstance(raw, dict):
+            continue
+        variant_price = _safe_float(raw.get("price"))
+        if (
+            effective_price is not None
+            and base_price is not None
+            and variant_price is not None
+            and abs(variant_price - base_price) < 1e-9
+        ):
+            variant_price = effective_price
+        variants.append(
+            {
+                "title": str(raw.get("title") or "Default").strip() or "Default",
+                "price": variant_price,
+                "currency": _variant_currency(raw.get("currency")) or "USD",
+                "available": bool(raw.get("available", True)),
+                "inventory_quantity": 1 if bool(raw.get("available", True)) else 0,
+                "option1": None,
+                "option2": None,
+                "option3": None,
+                "sku": str(raw.get("sku") or "").strip() or None,
+            }
+        )
+    if not variants:
+        variants = [
+            {
+                "title": "Default",
+                "price": effective_price,
+                "currency": "USD",
+                "available": str(probe_item.get("status") or "").strip().lower() != "out_of_stock",
+                "inventory_quantity": 1,
+                "option1": None,
+                "option2": None,
+                "option3": None,
+                "sku": None,
+            }
+        ]
+
+    images = probe_item.get("images") if isinstance(probe_item.get("images"), list) else probe_item.get("image_urls")
+    image_urls = [str(x).strip() for x in (images or []) if str(x).strip()]
+    handle = str(probe_item.get("handle") or "").strip()
+    if not handle:
+        parts = [p for p in urlparse(source_product_url).path.split("/") if p]
+        if len(parts) >= 2 and parts[0].lower() == "products":
+            handle = parts[1]
+        else:
+            handle = parts[-1] if parts else ""
+
+    price = effective_price
+    variant_currency = _variant_currency(variants[0].get("currency")) if variants else None
+    return {
+        "id": 0,
+        "source_id": int(source.id) if source is not None else None,
+        "source_name": str(source.name or "") if source is not None else source_host,
+        "status": str(probe_item.get("status") or "available"),
+        "handle": handle,
+        "title": str(probe_item.get("title") or "").strip(),
+        "description": str(probe_item.get("description") or "").strip() or None,
+        "weight_grams": _safe_float(probe_item.get("weight_grams")),
+        "vendor": str(probe_item.get("vendor") or "").strip() or None,
+        "product_type": str(probe_item.get("product_type") or "").strip() or None,
+        "product_url": source_product_url,
+        "price": price,
+        "currency": variant_currency or "USD",
+        "buyer_total_price": buyer_total_price,
+        "buyer_service_fee": buyer_service_fee,
+        "image_urls": image_urls,
+        "variants": variants,
     }
 
 
@@ -2606,11 +2826,12 @@ def create_manual_product(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Название товара обязательно")
 
     manual_source = _get_or_create_manual_source(db)
-    currency = str(payload.currency or "USD").strip().upper() or "USD"
     description = str(payload.description or "").strip() or None
     vendor = str(payload.vendor or "").strip() or None
     product_type = str(payload.product_type or "").strip() or None
     variants = _normalize_manual_variants(payload.variants)
+    if not variants:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нужен хотя бы один вариант с валютой")
 
     variant_prices = [
         _safe_float(item.get("price"))
@@ -2643,7 +2864,8 @@ def create_manual_product(
                 continue
             manual_image_urls.append(f"/api/v1/products/images/{int(asset.id)}")
 
-    bound_source_url = str(payload.bind_source_product_url or "").strip() if payload.bind_source_product_url is not None else ""
+    raw_bound_source_url = str(payload.bind_source_product_url or "").strip() if payload.bind_source_product_url is not None else ""
+    bound_source_url = _normalize_url_loose(raw_bound_source_url) if raw_bound_source_url else ""
     product_url_value = bound_source_url or f"manual://product/{int(datetime.now().timestamp() * 1000)}"
 
     product = ParserProduct(
@@ -2655,7 +2877,6 @@ def create_manual_product(
         product_type=product_type,
         url=product_url_value,
         price=price,
-        currency=currency,
         status=status_value,
         image_count=len(manual_image_urls),
         image_urls=list(manual_image_urls),
@@ -2671,10 +2892,9 @@ def create_manual_product(
     db.commit()
     db.refresh(product)
 
-    if bool(payload.bind_sync) and payload.bind_source_id is not None and str(payload.bind_source_product_url or "").strip():
+    if bool(payload.bind_sync) and payload.bind_source_id is not None and bound_source_url:
         source_id = int(payload.bind_source_id)
-        source_product_url = str(payload.bind_source_product_url).strip()
-        normalized_currency = currency
+        source_product_url = bound_source_url
         for idx, variant in enumerate(variants, start=1):
             variant_title = str(variant.get("title") or "").strip() or f"Variant {idx}"
             variant_price = _safe_float(variant.get("price"))
@@ -2697,7 +2917,7 @@ def create_manual_product(
                     source_variant_id=source_variant_id,
                     source_variant_title=variant_title,
                     price=variant_price,
-                    currency=normalized_currency,
+                    currency=_variant_currency(variant.get("currency")),
                     available=variant_available,
                     payload={"bound_from_manual_create": True},
                 )
@@ -2731,11 +2951,12 @@ def update_manual_product(
     if int(product.source_id) != int(manual_source.id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Можно редактировать только товары личного каталога")
 
-    currency = str(payload.currency or "USD").strip().upper() or "USD"
     description = str(payload.description or "").strip() or None
     vendor = str(payload.vendor or "").strip() or None
     product_type = str(payload.product_type or "").strip() or None
     variants = _normalize_manual_variants(payload.variants)
+    if not variants:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нужен хотя бы один вариант с валютой")
     variant_prices = [
         _safe_float(item.get("price"))
         for item in variants
@@ -2767,7 +2988,8 @@ def update_manual_product(
                 continue
             manual_image_urls.append(f"/api/v1/products/images/{int(asset.id)}")
 
-    bound_source_url = str(payload.bind_source_product_url or "").strip() if payload.bind_source_product_url is not None else ""
+    raw_bound_source_url = str(payload.bind_source_product_url or "").strip() if payload.bind_source_product_url is not None else ""
+    bound_source_url = _normalize_url_loose(raw_bound_source_url) if raw_bound_source_url else ""
     if bool(payload.bind_sync) and payload.bind_source_id is not None and bound_source_url:
         product.url = bound_source_url
     elif str(product.url or "").strip().lower().startswith("manual://product/") or not str(product.url or "").strip():
@@ -2778,7 +3000,6 @@ def update_manual_product(
     product.vendor = vendor
     product.product_type = product_type
     product.price = price
-    product.currency = currency
     product.status = status_value
     product.weight_grams = weight_grams
     product.weight_source = "manual" if weight_grams is not None else None
@@ -2811,7 +3032,7 @@ def update_manual_product(
                     source_variant_id=source_variant_id,
                     source_variant_title=variant_title,
                     price=variant_price,
-                    currency=currency,
+                    currency=_variant_currency(variant.get("currency")),
                     available=variant_available,
                     payload={"bound_from_manual_edit": True},
                 )
