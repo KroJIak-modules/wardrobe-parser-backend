@@ -8,6 +8,7 @@ from threading import Lock, Thread
 from time import sleep
 from typing import Any
 from urllib.parse import urlparse
+from collections import defaultdict
 
 import hashlib
 import logging
@@ -17,7 +18,7 @@ from pydantic import BaseModel
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.models import ParserProduct, ParserProductOriginVariant, ParserSource, SyncAppliedBatch, SyncJobRuntime
+from app.models import ParserDedupDecision, ParserProduct, ParserProductOriginVariant, ParserSource, SyncAppliedBatch, SyncJobRuntime
 from app.services.catalog.category_index_service import CategoryIndexService
 
 
@@ -776,6 +777,90 @@ def _derive_product_currency_from_variants(variants: Any) -> str | None:
     return None
 
 
+def _is_product_unavailable_locked_by_dedup(db, *, product_id: int, cache: dict[int, bool]) -> bool:
+    cached = cache.get(product_id)
+    if cached is not None:
+        return cached
+    row = (
+        db.query(ParserDedupDecision.id)
+        .filter(ParserDedupDecision.action.in_(("merge", "combine")))
+        .filter(
+            ((ParserDedupDecision.left_product_id == int(product_id)) | (ParserDedupDecision.right_product_id == int(product_id)))
+            & (ParserDedupDecision.merged_into_product_id != int(product_id))
+        )
+        .first()
+    )
+    locked = row is not None
+    cache[product_id] = locked
+    return locked
+
+
+def _mark_missing_source_products_unavailable(source_key: str, seen_source_urls: set[str]) -> tuple[int, int]:
+    seen = {str(url or "").strip() for url in seen_source_urls if str(url or "").strip()}
+    if not seen:
+        return (0, 0)
+    db = SessionLocal()
+    scanned = 0
+    changed = 0
+    try:
+        source = _find_backend_source(db, source_key)
+        if source is None:
+            return (0, 0)
+        rows = (
+            db.query(
+                ParserProduct.id.label("product_id"),
+                ParserProduct.status.label("status"),
+                ParserProductOriginVariant.source_product_url.label("source_product_url"),
+            )
+            .join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
+            .filter(ParserProduct.deleted_at.is_(None))
+            .filter(ParserProductOriginVariant.source_id == int(source.id))
+            .all()
+        )
+        by_product: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            product_id = int(row.product_id)
+            entry = by_product.setdefault(
+                product_id,
+                {
+                    "status": str(row.status or "").strip().lower(),
+                    "urls": set(),
+                },
+            )
+            source_url = str(row.source_product_url or "").strip()
+            if source_url:
+                entry["urls"].add(source_url)
+
+        for product_id, payload in by_product.items():
+            scanned += 1
+            status_raw = str(payload.get("status") or "").strip().lower()
+            urls = payload.get("urls") if isinstance(payload.get("urls"), set) else set()
+            if urls.intersection(seen):
+                continue
+            # Preserve manual moderation locks.
+            if status_raw in {"hidden", "unavailable"}:
+                continue
+            if status_raw not in {"available", "out_of_stock"}:
+                continue
+            product = db.query(ParserProduct).filter(ParserProduct.id == product_id).first()
+            if product is None:
+                continue
+            product.status = "unavailable"
+            changed += 1
+
+        if changed > 0:
+            db.commit()
+        else:
+            db.rollback()
+        return (scanned, changed)
+    except Exception:
+        db.rollback()
+        LOGGER.exception("jobs_ingest: failed to mark missing source products unavailable source_key=%s", source_key)
+        return (scanned, 0)
+    finally:
+        db.close()
+
+
 def _normalize_variants_with_source_lineage(
     *,
     source_key: str,
@@ -969,6 +1054,7 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
         if source is None:
             LOGGER.warning("jobs_ingest: source not found for key=%s", source_key)
             return (expected, 0)
+        unavailable_lock_cache: dict[int, bool] = {}
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -1042,6 +1128,12 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
             row.variants = _materialize_product_variants_from_origins(db, product_id=int(row.id))
             parsed_weight = _safe_float(item.get("weight_grams"))
             row.weight_grams = parsed_weight if parsed_weight is not None else row.weight_grams
+            incoming_weight_source = str(item.get("weight_source") or "").strip().lower()
+            if parsed_weight is not None and parsed_weight > 0:
+                if incoming_weight_source and incoming_weight_source != "missing":
+                    row.weight_source = incoming_weight_source
+                elif str(getattr(row, "weight_source", "") or "").strip().lower() in {"", "missing"}:
+                    row.weight_source = "source"
             validation = item.get("validation") if isinstance(item.get("validation"), dict) else {}
             validation_errors = validation.get("errors") if isinstance(validation.get("errors"), list) else []
             current_status = str(getattr(row, "status", "") or "").strip().lower()
@@ -1070,11 +1162,22 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
             )
 
             # Manual moderation states must survive sync.
-            if current_status in {"hidden", "unavailable"}:
+            unavailable_locked = False
+            if row.id is not None and current_status == "unavailable":
+                unavailable_locked = _is_product_unavailable_locked_by_dedup(
+                    db,
+                    product_id=int(row.id),
+                    cache=unavailable_lock_cache,
+                )
+            if current_status == "hidden":
+                pass
+            elif current_status == "unavailable" and unavailable_locked:
                 pass
             elif unavailable_due_weight:
                 row.status = "unavailable"
             elif validation_errors:
+                row.status = "unavailable"
+            elif incoming_status == "unavailable":
                 row.status = "unavailable"
             else:
                 raw_availability = str(item.get("raw_availability") or "").strip().lower()
@@ -1084,6 +1187,10 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
                     row.status = "unavailable"
                 else:
                     row.status = _derive_status(row.variants)
+            # Invariant: product with positive weight can not keep missing marker.
+            current_weight = _safe_float(getattr(row, "weight_grams", None))
+            if current_weight is not None and current_weight > 0 and str(getattr(row, "weight_source", "") or "").strip().lower() == "missing":
+                row.weight_source = "source"
             upserts += 1
         db.commit()
     except Exception:
@@ -1148,6 +1255,7 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
     source_started_at: dict[str, datetime] = {}
     real_failed_sources: dict[str, str] = {}
     password_blocked_sources: set[str] = set()
+    source_seen_urls: dict[str, set[str]] = defaultdict(set)
     while True:
         latest = STATE.get_latest()
         if latest is None or latest.job_id != agg_job.job_id:
@@ -1227,6 +1335,9 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
                 source_key = str(evt_payload.get("source_key") or "").strip()
                 source_status = str(evt_payload.get("status") or "").strip().lower() or "completed"
                 source_error = str(evt_payload.get("error") or "").strip() or None
+                finished_valid = int(evt_payload.get("valid_products") or 0)
+                finished_unavailable = int(evt_payload.get("unavailable_products") or 0)
+                finished_total = max(0, finished_valid + finished_unavailable)
                 if source_status == "failed":
                     password_like = _is_password_related_error(source_error) or _source_has_password_gate_status(source_key)
                     if not password_like and source_error and "read timed out" in source_error.lower():
@@ -1256,6 +1367,28 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
                         finished_at=finished_at,
                         duration_sec=duration_sec,
                     )
+                    if source_status == "success":
+                        seen_urls = source_seen_urls.get(source_key, set())
+                        seen_count = len(seen_urls)
+                        # Safety guard: run tombstone reconciliation only when
+                        # we observed the complete source batch payload.
+                        if finished_total > 0 and seen_count == finished_total:
+                            scanned, changed = _mark_missing_source_products_unavailable(source_key, seen_urls)
+                            if changed > 0:
+                                LOGGER.info(
+                                    "jobs_ingest: source=%s missing_products_unavailable=%s scanned=%s",
+                                    source_key,
+                                    changed,
+                                    scanned,
+                                )
+                        else:
+                            LOGGER.warning(
+                                "jobs_ingest: skip missing-reconcile source=%s seen=%s finished_total=%s status=%s",
+                                source_key,
+                                seen_count,
+                                finished_total,
+                                source_status,
+                            )
             if str(evt.get("type") or "") != "product_batch":
                 continue
             event_payload = evt_payload
@@ -1268,6 +1401,11 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
             source_key = str(event_payload.get("source_key") or "").strip()
             items = event_payload.get("items") if isinstance(event_payload.get("items"), list) else []
             cast_items = [item for item in items if isinstance(item, dict)]
+            if source_key:
+                for raw_item in cast_items:
+                    source_url = str(raw_item.get("source_product_url") or raw_item.get("url") or "").strip()
+                    if source_url:
+                        source_seen_urls[source_key].add(source_url)
             expected, applied = _upsert_products_from_items(source_key=source_key, items=cast_items)
             if source_key:
                 finished_at = _utcnow()

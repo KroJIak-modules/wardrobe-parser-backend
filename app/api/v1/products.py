@@ -14,7 +14,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 
 import requests
@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
 from sqlalchemy import case, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -166,12 +167,26 @@ def _service_v1_url(path: str) -> str:
 
 def _service_probe_product_by_url(product_url: str) -> dict[str, Any]:
     payload = {"product_url": str(product_url or "").strip(), "dry_run": False}
+    create_url = _service_v1_url("sync/probe/jobs")
     try:
         create_res = requests.post(
-            _service_v1_url("sync/probe/jobs"),
+            create_url,
             json=payload,
             timeout=(5, 30),
         )
+        if create_res.status_code == status.HTTP_409_CONFLICT:
+            # Probe should be preemptive: cancel stale/active probe and retry once.
+            try:
+                latest_res = requests.get(_service_v1_url("sync/probe/jobs/latest"), timeout=(5, 15))
+                if latest_res.ok and isinstance(latest_res.json(), dict):
+                    latest_payload = latest_res.json()
+                    latest_job_id = str(latest_payload.get("job_id") or "").strip()
+                    can_cancel = bool(latest_payload.get("can_cancel"))
+                    if latest_job_id and can_cancel:
+                        requests.post(_service_v1_url(f"sync/probe/jobs/{latest_job_id}/cancel"), timeout=(5, 15))
+            except requests.RequestException:
+                pass
+            create_res = requests.post(create_url, json=payload, timeout=(5, 30))
         create_res.raise_for_status()
         created = create_res.json()
     except requests.RequestException as exc:
@@ -182,7 +197,9 @@ def _service_probe_product_by_url(product_url: str) -> dict[str, Any]:
 
     terminal = {"completed", "failed", "cancelled"}
     status_payload: dict[str, Any] | None = None
-    for _ in range(60):
+    # Probe of a single URL may still need long time on heavy sources where
+    # strategy cannot short-circuit discovery immediately.
+    for _ in range(1200):
         try:
             status_res = requests.get(_service_v1_url(f"sync/probe/jobs/{job_id}"), timeout=(5, 15))
             status_res.raise_for_status()
@@ -196,9 +213,38 @@ def _service_probe_product_by_url(product_url: str) -> dict[str, Any]:
         time.sleep(0.25)
 
     state = str((status_payload or {}).get("status") or "").strip().lower()
+    if state not in terminal:
+        # Ensure stale probe job does not block all next probes with HTTP 409.
+        try:
+            requests.post(_service_v1_url(f"sync/probe/jobs/{job_id}/cancel"), timeout=(5, 15))
+        except requests.RequestException:
+            pass
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Service probe timed out")
     if state != "completed":
-        detail = str((status_payload or {}).get("error") or "Service probe failed").strip()
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail or "Товар не найден")
+        detail = str((status_payload or {}).get("error") or "").strip()
+        if not detail:
+            try:
+                events_res = requests.get(
+                    _service_v1_url(f"sync/probe/jobs/{job_id}/events"),
+                    params={"cursor": 0, "limit": 200},
+                    timeout=(5, 30),
+                )
+                if events_res.ok and isinstance(events_res.json(), dict):
+                    events_items = events_res.json().get("items") or []
+                    for event in reversed(events_items):
+                        if not isinstance(event, dict):
+                            continue
+                        if str(event.get("type") or "") != "source_finished":
+                            continue
+                        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                        detail = str(payload.get("error") or "").strip()
+                        if detail:
+                            break
+            except requests.RequestException:
+                pass
+        if not detail:
+            detail = "Товар не найден"
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
 
     try:
         events_res = requests.get(
@@ -283,11 +329,30 @@ def _normalize_url_loose(raw: str) -> str:
     if netloc.startswith("www."):
         netloc = netloc[4:]
     path = str(parsed.path or "").rstrip("/")
+    query_pairs = parse_qsl(str(parsed.query or ""), keep_blank_values=True)
+    # Drop tracking-only params but preserve business-identifying params
+    # (for example `pid` on store-backlash).
+    filtered_pairs: list[tuple[str, str]] = []
+    for key, value in query_pairs:
+        lk = str(key or "").strip().lower()
+        if not lk:
+            continue
+        if lk.startswith("utm_"):
+            continue
+        if lk in {"gclid", "fbclid", "yclid", "_ga", "_gid", "_pos", "_sid", "_ss", "homepage_session_id"}:
+            continue
+        filtered_pairs.append((key, value))
     # Normalize locale-prefixed shop paths:
     # /en/products/x, /en-ae/products/x => /products/x
     parts = [p for p in path.split("/") if p]
     if len(parts) >= 2 and re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", parts[0].lower()) and parts[1].lower() == "products":
         path = "/" + "/".join(parts[1:])
+    # Canonical product pages should ignore query-string noise.
+    if len([p for p in path.split("/") if p]) >= 2 and [p for p in path.split("/") if p][0].lower() == "products":
+        return f"{scheme}://{netloc}{path}"
+    query = urlencode(filtered_pairs, doseq=True)
+    if query:
+        return f"{scheme}://{netloc}{path}?{query}"
     return f"{scheme}://{netloc}{path}"
 
 
@@ -2607,6 +2672,8 @@ def upload_product_image_by_url(
     _: object = Depends(require_admin_access),
 ):
     raw_url = str(payload.url or "").strip()
+    if raw_url.startswith("//"):
+        raw_url = f"https:{raw_url}"
     if not raw_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="URL изображения не передан")
     try:
@@ -2866,7 +2933,8 @@ def create_manual_product(
 
     raw_bound_source_url = str(payload.bind_source_product_url or "").strip() if payload.bind_source_product_url is not None else ""
     bound_source_url = _normalize_url_loose(raw_bound_source_url) if raw_bound_source_url else ""
-    product_url_value = bound_source_url or f"manual://product/{int(datetime.now().timestamp() * 1000)}"
+    bind_sync_enabled = bool(payload.bind_sync) and payload.bind_source_id is not None and bool(bound_source_url)
+    product_url_value = bound_source_url if bind_sync_enabled else f"manual://product/{int(datetime.now().timestamp() * 1000)}"
 
     product = ParserProduct(
         source_id=int(manual_source.id),
@@ -2889,10 +2957,19 @@ def create_manual_product(
         weight_grams=weight_grams,
     )
     db.add(product)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if "parser_product_url_key" in str(getattr(exc, "orig", exc)):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Товар с таким URL уже существует в базе",
+            ) from exc
+        raise
     db.refresh(product)
 
-    if bool(payload.bind_sync) and payload.bind_source_id is not None and bound_source_url:
+    if bind_sync_enabled:
         source_id = int(payload.bind_source_id)
         source_product_url = bound_source_url
         for idx, variant in enumerate(variants, start=1):
@@ -3038,7 +3115,16 @@ def update_manual_product(
                 )
             )
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if "parser_product_url_key" in str(getattr(exc, "orig", exc)):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Товар с таким URL уже существует в базе",
+            ) from exc
+        raise
     return {"ok": True, "id": int(product.id)}
 
 

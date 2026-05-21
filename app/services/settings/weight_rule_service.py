@@ -30,7 +30,7 @@ class WeightMatchResult:
 
 
 def _normalize_keyword(keyword: str) -> str:
-    normalized = re.sub(r"[^a-z0-9\s]+", " ", keyword.strip().lower())
+    normalized = re.sub(r"[^a-z0-9\s*?]+", " ", keyword.strip().lower())
     normalized = " ".join(normalized.split())
     if not normalized:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ключевое слово не может быть пустым")
@@ -43,6 +43,27 @@ def _normalize_match_haystack(*parts: str | None) -> str:
     text = " ".join(item.strip().lower() for item in parts if item and item.strip())
     normalized = re.sub(r"[^a-z0-9\s]+", " ", text)
     return " ".join(normalized.split())
+
+
+def _keyword_has_wildcards(keyword: str) -> bool:
+    return "*" in keyword or "?" in keyword
+
+
+def _keyword_wildcard_to_regex(keyword: str) -> re.Pattern[str]:
+    escaped = re.escape(keyword)
+    pattern = escaped.replace(r"\*", ".*").replace(r"\?", ".")
+    return re.compile(pattern, flags=re.IGNORECASE)
+
+
+def _keyword_specificity(keyword: str) -> int:
+    return len(keyword.replace("*", "").replace("?", "").strip())
+
+
+def _keyword_to_sql_like_pattern(keyword: str) -> str:
+    escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    if _keyword_has_wildcards(escaped):
+        return escaped.replace("*", "%").replace("?", "_")
+    return f"%{escaped}%"
 
 
 def _unique_normalized_keywords(keywords: list[str]) -> list[str]:
@@ -606,13 +627,13 @@ class WeightRuleService:
         q = self.db.query(ParserProduct.id).filter(ParserProduct.deleted_at.is_(None))
         conditions = []
         for kw in normalized:
-            token = f"%{kw}%"
+            token = _keyword_to_sql_like_pattern(kw)
             conditions.extend(
                 [
-                    func.lower(func.coalesce(ParserProduct.title, "")).like(token),
-                    func.lower(func.coalesce(ParserProduct.vendor, "")).like(token),
-                    func.lower(func.coalesce(ParserProduct.product_type, "")).like(token),
-                    func.lower(func.coalesce(ParserProduct.handle, "")).like(token),
+                    func.lower(func.coalesce(ParserProduct.title, "")).like(token, escape="\\"),
+                    func.lower(func.coalesce(ParserProduct.vendor, "")).like(token, escape="\\"),
+                    func.lower(func.coalesce(ParserProduct.product_type, "")).like(token, escape="\\"),
+                    func.lower(func.coalesce(ParserProduct.handle, "")).like(token, escape="\\"),
                 ]
             )
         q = q.filter(or_(*conditions))
@@ -711,7 +732,7 @@ class WeightRuleService:
             .join(origin_source_subq, origin_source_subq.c.product_id == ParserProduct.id)
             .join(ParserSource, ParserSource.id == origin_source_subq.c.source_id)
             .filter(ParserProduct.deleted_at.is_(None))
-            .filter((ParserProduct.weight_grams.is_(None)) | (ParserProduct.weight_source == "missing"))
+            .filter((ParserProduct.weight_grams.is_(None)) | (ParserProduct.weight_grams <= 0))
             .order_by(ParserProduct.updated_at.desc())
             .offset(safe_offset)
             .limit(safe_limit)
@@ -768,14 +789,20 @@ class WeightRuleService:
         for rule in rules:
             for keyword in rule.keywords:
                 normalized_keyword = _normalize_keyword(keyword)
-                if normalized_keyword in haystack:
-                    keyword_len = len(normalized_keyword)
-                    if keyword_len > best_keyword_len or (
-                        keyword_len == best_keyword_len and (best_rule_weight is None or rule.weight_grams > best_rule_weight)
-                    ):
-                        best_keyword_len = keyword_len
-                        best_rule_weight = rule.weight_grams
-                        best_keyword = normalized_keyword
+                matched = False
+                if _keyword_has_wildcards(normalized_keyword):
+                    matched = bool(_keyword_wildcard_to_regex(normalized_keyword).search(haystack))
+                else:
+                    matched = normalized_keyword in haystack
+                if not matched:
+                    continue
+                keyword_len = _keyword_specificity(normalized_keyword)
+                if keyword_len > best_keyword_len or (
+                    keyword_len == best_keyword_len and (best_rule_weight is None or rule.weight_grams > best_rule_weight)
+                ):
+                    best_keyword_len = keyword_len
+                    best_rule_weight = rule.weight_grams
+                    best_keyword = normalized_keyword
 
         if best_rule_weight is None:
             if not allow_fallback:
