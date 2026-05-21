@@ -3171,7 +3171,25 @@ def delete_manual_product(
     return {"ok": True, "id": int(product.id)}
 
 
-@router.get("/products/images/{image_id}")
+@router.get(
+    "/products/images/{image_id}",
+    summary="Получить внутреннее изображение товара",
+    description=(
+        "Возвращает бинарный файл изображения, загруженного и сохранённого во внутреннем хранилище backend "
+        "(используется для ручно добавленных/внутренних фото товара)."
+    ),
+    responses={
+        200: {
+            "description": "Файл изображения товара.",
+            "content": {
+                "image/jpeg": {},
+                "image/png": {},
+                "image/webp": {},
+            },
+        },
+        404: {"description": "Изображение не найдено."},
+    },
+)
 def get_product_manual_image(image_id: int, db: Session = Depends(get_db)):
     asset = db.query(ImageAsset).filter(ImageAsset.id == image_id, ImageAsset.deleted_at.is_(None)).one_or_none()
     if asset is None or asset.storage_mode != "stored_file" or not asset.stored_path:

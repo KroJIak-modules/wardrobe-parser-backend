@@ -70,7 +70,26 @@ def _file_response_for_asset(asset_id: int, db: Session) -> FileResponse:
     return response
 
 
-@router.get("/state", response_model=ShowcaseMediaSettingsResponse)
+@router.get(
+    "/state",
+    response_model=ShowcaseMediaSettingsResponse,
+    summary="Состояние медиа витрины",
+    description="Текущее состояние заставки и карусели для публичной витрины.",
+    responses={
+        200: {
+            "description": "Состояние медиа витрины.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "showcase_hero_image_asset_id": 1024,
+                        "showcase_carousel_image_asset_ids": [1025, 1026, 1027],
+                        "carousel_limit": 20,
+                    }
+                }
+            },
+        }
+    },
+)
 def showcase_state(db: Session = Depends(get_db)):
     ui = PricingSettingsService(db).get_admin_ui_settings()
     hero_id = int(ui.showcase_hero_image_asset_id or 0)
@@ -82,7 +101,22 @@ def showcase_state(db: Session = Depends(get_db)):
     )
 
 
-@router.get("/hero/image")
+@router.get(
+    "/hero/image",
+    summary="Получить изображение заставки",
+    description="Возвращает бинарное изображение текущей заставки витрины.",
+    responses={
+        200: {
+            "description": "Файл изображения заставки.",
+            "content": {
+                "image/jpeg": {},
+                "image/png": {},
+                "image/webp": {},
+            },
+        },
+        404: {"description": "Заставка не установлена."},
+    },
+)
 def hero_image(db: Session = Depends(get_db)):
     ui = PricingSettingsService(db).get_admin_ui_settings()
     hero_id = int(ui.showcase_hero_image_asset_id or 0)
@@ -131,7 +165,24 @@ def set_hero(payload: ShowcaseHeroSetRequest, db: Session = Depends(get_db)):
     return {"ok": True, "image_asset_id": image_id}
 
 
-@router.get("/carousel")
+@router.get(
+    "/carousel",
+    summary="Список изображений карусели",
+    description="Возвращает идентификаторы изображений карусели и лимит количества слайдов.",
+    responses={
+        200: {
+            "description": "Состояние карусели.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "items": [1025, 1026, 1027],
+                        "limit": 20,
+                    }
+                }
+            },
+        }
+    },
+)
 def carousel_state(db: Session = Depends(get_db)):
     ui = PricingSettingsService(db).get_admin_ui_settings()
     hero_id = int(ui.showcase_hero_image_asset_id or 0)
@@ -188,6 +239,21 @@ def remove_carousel_item(image_id: int, db: Session = Depends(get_db)):
     return {"ok": True, "items": items}
 
 
-@router.get("/carousel/{image_id}/image")
+@router.get(
+    "/carousel/{image_id}/image",
+    summary="Получить изображение слайда карусели",
+    description="Возвращает бинарное изображение конкретного слайда карусели по image_id.",
+    responses={
+        200: {
+            "description": "Файл изображения слайда.",
+            "content": {
+                "image/jpeg": {},
+                "image/png": {},
+                "image/webp": {},
+            },
+        },
+        404: {"description": "Изображение не найдено."},
+    },
+)
 def carousel_image(image_id: int, db: Session = Depends(get_db)):
     return _file_response_for_asset(image_id, db)
