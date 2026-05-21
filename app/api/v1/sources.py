@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models import ParserProduct, ParserProductOriginVariant, ParserSource
 from app.models.pricing import ParserSupplier
+from app.services.auth.admin_auth_service import require_permission
 
 router = APIRouter(tags=["sources"])
 _MANUAL_SOURCE_KEY = "__manual_admin_source__"
@@ -298,7 +299,7 @@ class CurrencyPriorityPayload(BaseModel):
     locked_currency: str | None = None
 
 
-@router.get("/sources")
+@router.get("/sources", dependencies=[Depends(require_permission("control.sources.read"))])
 def list_sources(db: Session = Depends(get_db)) -> list[dict]:
     manual_source = _get_or_create_manual_source(db)
     items = _service_list()
@@ -306,7 +307,7 @@ def list_sources(db: Session = Depends(get_db)) -> list[dict]:
     return [_map_manual_source(db, manual_source), *mapped]
 
 
-@router.patch("/sources/{source_key}/enabled")
+@router.patch("/sources/{source_key}/enabled", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_enabled(source_key: str, payload: EnabledPayload, db: Session = Depends(get_db)) -> dict:
     if source_key == _MANUAL_SOURCE_KEY:
         profile = _get_or_create_manual_source(db)
@@ -327,7 +328,7 @@ def patch_enabled(source_key: str, payload: EnabledPayload, db: Session = Depend
     return _map_source(db, src)
 
 
-@router.patch("/sources/{source_key}/sync-enabled")
+@router.patch("/sources/{source_key}/sync-enabled", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_sync_enabled(source_key: str, payload: SyncEnabledPayload, db: Session = Depends(get_db)) -> dict:
     if source_key == _MANUAL_SOURCE_KEY:
         # Personal source sync toggle is UI-visible and accepted, but currently
@@ -342,7 +343,7 @@ def patch_sync_enabled(source_key: str, payload: SyncEnabledPayload, db: Session
     return _map_source(db, src)
 
 
-@router.patch("/sources/{source_key}/hide-auto-added-products")
+@router.patch("/sources/{source_key}/hide-auto-added-products", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_hide_auto(source_key: str, payload: HideAutoPayload, db: Session = Depends(get_db)) -> dict:
     if source_key == _MANUAL_SOURCE_KEY:
         profile = _get_or_create_manual_source(db)
@@ -405,7 +406,7 @@ def patch_hide_auto(source_key: str, payload: HideAutoPayload, db: Session = Dep
     return _map_source(db, src)
 
 
-@router.patch("/sources/{source_key}/attribute-visibility")
+@router.patch("/sources/{source_key}/attribute-visibility", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_attr_visibility(source_key: str, payload: AttrVisibilityPayload, db: Session = Depends(get_db)) -> dict:
     if source_key == _MANUAL_SOURCE_KEY:
         profile = _get_or_create_manual_source(db)
@@ -432,7 +433,7 @@ def patch_attr_visibility(source_key: str, payload: AttrVisibilityPayload, db: S
     return _map_source(db, src)
 
 
-@router.patch("/sources/{source_key}/currency-priority")
+@router.patch("/sources/{source_key}/currency-priority", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_currency_priority(source_key: str, payload: CurrencyPriorityPayload, db: Session = Depends(get_db)) -> dict:
     if source_key == _MANUAL_SOURCE_KEY:
         raise HTTPException(status_code=400, detail="Для личного источника приоритет валют не используется")

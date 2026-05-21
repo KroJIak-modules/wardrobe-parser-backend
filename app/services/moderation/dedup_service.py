@@ -358,9 +358,15 @@ class DedupService:
         # Product decision: dedup candidates are always built only from available products.
         return True
 
-    def get_candidates(self, limit: int = settings.dedup_candidates_default_limit) -> DedupCandidateListResponse:
+    def get_candidates(
+        self,
+        limit: int = settings.dedup_candidates_default_limit,
+        offset: int = 0,
+    ) -> DedupCandidateListResponse:
         only_available = self._dedup_only_available_enabled()
         allowed_statuses = {"available"} if only_available else {"available", "out_of_stock"}
+        safe_limit = max(1, min(int(limit), int(settings.dedup_candidates_max_limit)))
+        safe_offset = max(0, int(offset))
         products = [
             item
             for item in self.product_repo.filter_products(limit=settings.dedup_scan_limit)
@@ -368,7 +374,7 @@ class DedupService:
         ]
         product_by_id = {int(item.id): item for item in products}
         if len(product_by_id) < 2:
-            return DedupCandidateListResponse(items=[], total=0, limit=limit)
+            return DedupCandidateListResponse(items=[], total=0, limit=safe_limit, offset=safe_offset)
 
         effective_prices = self._build_effective_prices(products)
         blocked_pair_keys = self.decision_repo.list_pair_keys()
@@ -422,12 +428,10 @@ class DedupService:
                     ),
                 )
             )
-            if len(candidates) >= limit:
-                break
-
         candidates.sort(key=lambda item: item.score, reverse=True)
-        sliced = candidates[:limit]
-        return DedupCandidateListResponse(items=sliced, total=len(sliced), limit=limit)
+        total = len(candidates)
+        sliced = candidates[safe_offset : safe_offset + safe_limit]
+        return DedupCandidateListResponse(items=sliced, total=total, limit=safe_limit, offset=safe_offset)
 
     def merge_duplicate(self, payload: DedupMergeRequest) -> dict:
         if payload.primary_product_id == payload.duplicate_product_id:
@@ -481,8 +485,11 @@ class DedupService:
         self.db.commit()
         return {"ok": True, "pair_key": key}
 
-    def get_decisions(self, limit: int = 200) -> DedupDecisionListResponse:
-        decisions = self.decision_repo.list_recent(limit=limit)
+    def get_decisions(self, limit: int = 200, offset: int = 0) -> DedupDecisionListResponse:
+        safe_limit = max(1, min(int(limit), 1000))
+        safe_offset = max(0, int(offset))
+        decisions = self.decision_repo.list_recent(limit=safe_limit, offset=safe_offset)
+        total = int(self.decision_repo.query().count())
         product_ids: set[int] = set()
         for item in decisions:
             product_ids.add(int(item.left_product_id))
@@ -515,7 +522,7 @@ class DedupService:
                     right=self._to_product_response(right),
                 )
             )
-        return DedupDecisionListResponse(items=items, total=len(items), limit=max(1, min(int(limit), 1000)))
+        return DedupDecisionListResponse(items=items, total=total, limit=safe_limit, offset=safe_offset)
 
     def undo_decision(self, payload: DedupUndoRequest) -> dict:
         pair_key_value = str(payload.pair_key or "").strip()

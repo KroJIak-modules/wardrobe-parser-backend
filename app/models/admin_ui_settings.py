@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, DateTime, Index, Integer, JSON
+from sqlalchemy import JSON, Boolean, Column, DateTime, Index, Integer, String, Text
 from sqlalchemy.sql import func
 
 from app.core.database import Base
@@ -13,6 +13,11 @@ class AdminUiSettings(Base):
     showcase_hero_image_asset_id = Column(Integer, nullable=True)
     showcase_carousel_image_asset_ids = Column(JSON, nullable=False, default=list)
     auto_sync_period_minutes = Column(Integer, nullable=False, default=60)
+    auto_sync_next_run_at = Column(DateTime(timezone=True), nullable=True)
+    auto_sync_last_started_at = Column(DateTime(timezone=True), nullable=True)
+    auto_sync_last_finished_at = Column(DateTime(timezone=True), nullable=True)
+    auto_sync_last_status = Column(String(32), nullable=True)
+    auto_sync_last_error = Column(Text, nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 import re
 from typing import Any
@@ -926,6 +926,23 @@ class PricingSettingsService:
             designers_min_products=max(1, int(getattr(entity, "designers_min_products", 1) or 1)),
             designers_exclude_store_vendors=bool(getattr(entity, "designers_exclude_store_vendors", False)),
             auto_sync_period_minutes=max(60, int(getattr(entity, "auto_sync_period_minutes", 60) or 60)),
+            auto_sync_next_run_at=(
+                getattr(entity, "auto_sync_next_run_at", None).isoformat()
+                if getattr(entity, "auto_sync_next_run_at", None) is not None
+                else None
+            ),
+            auto_sync_last_started_at=(
+                getattr(entity, "auto_sync_last_started_at", None).isoformat()
+                if getattr(entity, "auto_sync_last_started_at", None) is not None
+                else None
+            ),
+            auto_sync_last_finished_at=(
+                getattr(entity, "auto_sync_last_finished_at", None).isoformat()
+                if getattr(entity, "auto_sync_last_finished_at", None) is not None
+                else None
+            ),
+            auto_sync_last_status=(str(getattr(entity, "auto_sync_last_status", "") or "").strip() or None),
+            auto_sync_last_error=(str(getattr(entity, "auto_sync_last_error", "") or "").strip() or None),
             showcase_hero_image_asset_id=(
                 int(getattr(entity, "showcase_hero_image_asset_id"))
                 if isinstance(getattr(entity, "showcase_hero_image_asset_id", None), int)
@@ -940,6 +957,7 @@ class PricingSettingsService:
 
     def update_admin_ui_settings(self, payload: AdminUiSettingsUpdateRequest) -> AdminUiSettingsResponse:
         patch = payload.model_dump(exclude_unset=True)
+        reset_sync_timer = "auto_sync_period_minutes" in patch
         if "designers_min_products" in patch:
             patch["designers_min_products"] = max(1, int(patch.get("designers_min_products") or 1))
         if "designers_exclude_store_vendors" in patch:
@@ -959,6 +977,12 @@ class PricingSettingsService:
             entity = AdminUiSettings(id=1)
         for key, value in patch.items():
             setattr(entity, key, value)
+        if reset_sync_timer:
+            period_minutes = max(60, int(getattr(entity, "auto_sync_period_minutes", 60) or 60))
+            now_utc = datetime.now(timezone.utc)
+            entity.auto_sync_next_run_at = now_utc + timedelta(minutes=period_minutes)
+            entity.auto_sync_last_status = "scheduled"
+            entity.auto_sync_last_error = None
         self.db.add(entity)
         self.db.commit()
         self.db.refresh(entity)

@@ -13,12 +13,13 @@ from collections import defaultdict
 import hashlib
 import logging
 import requests
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models import ParserDedupDecision, ParserProduct, ParserProductOriginVariant, ParserSource, SyncAppliedBatch, SyncJobRuntime
+from app.services.auth.admin_auth_service import require_permission
 from app.services.catalog.category_index_service import CategoryIndexService
 
 
@@ -66,6 +67,62 @@ def _service_sources_list() -> list[dict[str, Any]]:
         return [item for item in payload if isinstance(item, dict)]
     except Exception:
         return []
+
+
+def _sort_source_keys_by_last_duration(
+    source_keys: list[str],
+    *,
+    service_sources: list[dict[str, Any]],
+) -> list[str]:
+    cleaned = [str(key or "").strip() for key in source_keys if str(key or "").strip()]
+    if len(cleaned) <= 1:
+        return cleaned
+
+    # Keep first occurrence only (stable dedupe).
+    seen: set[str] = set()
+    unique: list[str] = []
+    for key in cleaned:
+        norm = key.lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        unique.append(key)
+
+    service_by_key: dict[str, dict[str, Any]] = {
+        str(item.get("key") or "").strip().lower(): item
+        for item in service_sources
+        if str(item.get("key") or "").strip()
+    }
+
+    db = SessionLocal()
+    try:
+        duration_by_key: dict[str, int | None] = {}
+        for key in unique:
+            norm = key.lower()
+            src = _find_backend_source(db, key)
+            duration: int | None = None
+            if src is not None and getattr(src, "last_sync_duration_sec", None) is not None:
+                try:
+                    duration = max(0, int(getattr(src, "last_sync_duration_sec")))
+                except Exception:
+                    duration = None
+            duration_by_key[norm] = duration
+
+        def sort_key(raw_key: str) -> tuple[int, int, str]:
+            norm = raw_key.lower()
+            duration = duration_by_key.get(norm)
+            # Sources with known duration go first, ascending by duration.
+            # Unknown durations (e.g. first deploy) go to the end.
+            missing_rank = 1 if duration is None else 0
+            duration_rank = int(duration or 0)
+            # Stable deterministic tiebreaker by source key.
+            service_item = service_by_key.get(norm)
+            label = str((service_item or {}).get("key") or raw_key).strip().lower()
+            return (missing_rank, duration_rank, label)
+
+        return sorted(unique, key=sort_key)
+    finally:
+        db.close()
 
 
 def _load_source_strategy_sequence(source_key: str | None) -> list[str]:
@@ -1533,7 +1590,7 @@ def _rebuild_category_index_after_sync() -> None:
         db.close()
 
 
-@router.post("/jobs")
+@router.post("/jobs", dependencies=[Depends(require_permission("control.sources.edit"))])
 def run_sync_all_enabled_sources(payload: StartSyncRequest | None = None) -> dict[str, Any]:
     latest = STATE.get_latest()
     if latest and latest.status in {"pending", "queued", "in_progress"}:
@@ -1544,16 +1601,18 @@ def run_sync_all_enabled_sources(payload: StartSyncRequest | None = None) -> dic
         "triggered_by": str((payload.triggered_by if payload else None) or "manual"),
         "dry_run": False,
     }
+    service_sources = _service_sources_list()
     source_keys = [str(s).strip() for s in ((payload.sources if payload else None) or []) if str(s).strip()]
+    if not source_keys:
+        source_keys = [
+            str(item.get("key") or "").strip()
+            for item in service_sources
+            if bool(item.get("enabled", True)) and bool(item.get("sync_enabled", True)) and str(item.get("key") or "").strip()
+        ]
+    source_keys = _sort_source_keys_by_last_duration(source_keys, service_sources=service_sources)
     if source_keys:
         request_payload["sources"] = source_keys
     selected_for_manual_mode = list(source_keys)
-    if not selected_for_manual_mode:
-        selected_for_manual_mode = [
-            str(item.get("key") or "").strip()
-            for item in _service_sources_list()
-            if bool(item.get("enabled", True)) and bool(item.get("sync_enabled", True)) and str(item.get("key") or "").strip()
-        ]
     manual_candidate_urls = _build_manual_candidate_urls_by_source(source_keys=selected_for_manual_mode)
     if manual_candidate_urls:
         request_payload["candidate_urls_by_source"] = manual_candidate_urls
@@ -1584,7 +1643,7 @@ def run_sync_all_enabled_sources(payload: StartSyncRequest | None = None) -> dic
     return {"ok": True, "job_id": agg.job_id}
 
 
-@router.get("/jobs/latest")
+@router.get("/jobs/latest", dependencies=[Depends(require_permission("control.sources.read"))])
 def jobs_latest() -> dict[str, Any] | None:
     latest = STATE.get_latest()
     if latest is None:
@@ -1592,7 +1651,7 @@ def jobs_latest() -> dict[str, Any] | None:
     return _map_latest_response(latest)
 
 
-@router.post("/jobs/{job_id}/cancel")
+@router.post("/jobs/{job_id}/cancel", dependencies=[Depends(require_permission("control.sources.edit"))])
 def cancel_job(job_id: str) -> dict[str, Any]:
     latest = STATE.get_latest()
     if latest is None or latest.job_id != job_id:

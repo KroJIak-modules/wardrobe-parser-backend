@@ -186,6 +186,11 @@ class AdminUiSettingsResponse(BaseModel):
     designers_min_products: int = Field(ge=1, le=1_000_000)
     designers_exclude_store_vendors: bool = False
     auto_sync_period_minutes: int = Field(ge=60, le=1_000_000, default=60)
+    auto_sync_next_run_at: str | None = None
+    auto_sync_last_started_at: str | None = None
+    auto_sync_last_finished_at: str | None = None
+    auto_sync_last_status: str | None = None
+    auto_sync_last_error: str | None = None
     showcase_hero_image_asset_id: int | None = None
     showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
 
@@ -325,6 +330,13 @@ class SettingsTransferSourceEntry(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     url: str = Field(min_length=1, max_length=2048)
     enabled: bool = True
+    sync_enabled: bool = True
+    hide_auto_added_products: bool = False
+    show_description: bool = True
+    show_images: bool = True
+    currency_priority: list[str] = Field(default_factory=list)
+    currency_method: Literal["priority_list", "locked_param_currency", "locked_no_currency"] = "priority_list"
+    locked_currency: str | None = Field(default=None, min_length=3, max_length=3)
     supplier_key: str | None = Field(default=None, min_length=1, max_length=64)
     promo_factor: float = Field(default=1.0, ge=0.0, le=10.0)
     promo_only_no_discount: bool = False
@@ -350,7 +362,14 @@ class SettingsTransferCategoryEntry(BaseModel):
 class SettingsTransferCategoryKeywordEntry(BaseModel):
     category_slug: str = Field(min_length=1, max_length=255)
     keyword: str = Field(min_length=1, max_length=255)
-    scope: Literal["local", "title"] = "local"
+    scope: Literal["local", "title", "status"] = "local"
+
+
+class SettingsTransferBrandMappingEntry(BaseModel):
+    source_brand: str = Field(min_length=1, max_length=255)
+    source_brand_key: str = Field(min_length=1, max_length=255)
+    target_brand: str = Field(min_length=1, max_length=255)
+    include_in_designers: bool = True
 
 
 class SettingsTransferPayload(BaseModel):
@@ -364,6 +383,7 @@ class SettingsTransferPayload(BaseModel):
     weight_rules: list[SettingsTransferWeightRuleEntry] = Field(default_factory=list)
     categories: list[SettingsTransferCategoryEntry] = Field(default_factory=list)
     category_keywords: list[SettingsTransferCategoryKeywordEntry] = Field(default_factory=list)
+    brand_mappings: list[SettingsTransferBrandMappingEntry] = Field(default_factory=list)
 
 
 class SettingsTransferResponse(BaseModel):
@@ -475,6 +495,7 @@ class DedupCandidateListResponse(BaseModel):
     items: list[DedupCandidateResponse]
     total: int
     limit: int
+    offset: int = 0
 
 
 class DedupMergeRequest(BaseModel):
@@ -506,6 +527,7 @@ class DedupDecisionListResponse(BaseModel):
     items: list[DedupDecisionResponse]
     total: int
     limit: int
+    offset: int = 0
 
 
 class DedupUndoRequest(BaseModel):

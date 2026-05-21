@@ -4,18 +4,24 @@ import base64
 import hashlib
 import hmac
 import json
-import secrets
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import Cookie, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.database import get_db
+from app.models import AdminRole, AdminUser
+from app.repositories import AdminUserRepository
+from app.services.auth.admin_accounts_service import AdminAccountsService
+from app.services.auth.passwords import verify_password
+from app.services.auth.permissions import normalize_permission_list
 
-_TOKEN_VERSION = 1
+_TOKEN_VERSION = 2
 _ACCESS_TOKEN_TYPE = "access"
 _REFRESH_TOKEN_TYPE = "refresh"
 _auth_scheme = HTTPBearer(auto_error=False)
@@ -25,11 +31,39 @@ REFRESH_COOKIE_NAME = "admin_refresh_token"
 
 @dataclass(frozen=True)
 class AdminTokenClaims:
-    sub: str
+    user_id: int
+    login: str
     token_type: str
     exp: int
     iat: int
     jti: str
+
+
+@dataclass(frozen=True)
+class AdminAuthContext:
+    claims: AdminTokenClaims
+    user: AdminUser
+    permissions: frozenset[str]
+
+    @property
+    def is_superuser(self) -> bool:
+        return bool(self.user.is_superuser)
+
+    @property
+    def user_id(self) -> int:
+        return int(self.user.id)
+
+    @property
+    def login(self) -> str:
+        return str(self.user.login)
+
+    def has_permission(self, permission: str) -> bool:
+        normalized = str(permission or "").strip()
+        if not normalized:
+            return False
+        if self.is_superuser:
+            return True
+        return normalized in self.permissions
 
 
 def _b64_encode(raw: bytes) -> str:
@@ -73,25 +107,51 @@ def _decode_and_validate(token: str, *, expected_type: str) -> AdminTokenClaims:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Неверный тип токена")
     if exp <= now:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Токен истёк")
-    sub = str(payload.get("sub") or "")
-    if sub != settings.admin_superuser_login:
+    user_id = int(payload.get("uid") or 0)
+    login = str(payload.get("sub") or "").strip()
+    if user_id <= 0 or not login:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Неверный пользователь токена")
     iat = int(payload.get("iat") or 0)
     jti = str(payload.get("jti") or "")
-    return AdminTokenClaims(sub=sub, token_type=token_type, exp=exp, iat=iat, jti=jti)
+    return AdminTokenClaims(user_id=user_id, login=login, token_type=token_type, exp=exp, iat=iat, jti=jti)
 
 
-def issue_admin_token_pair() -> dict[str, Any]:
+def _role_permissions(role: AdminRole | None) -> frozenset[str]:
+    if role is None:
+        return frozenset()
+    return frozenset(normalize_permission_list(role.permissions))
+
+
+def _build_auth_context(claims: AdminTokenClaims, user: AdminUser) -> AdminAuthContext:
+    permissions = frozenset() if bool(user.is_superuser) else _role_permissions(user.role)
+    return AdminAuthContext(claims=claims, user=user, permissions=permissions)
+
+
+def _load_user_for_claims(db: Session, claims: AdminTokenClaims) -> AdminUser:
+    repository = AdminUserRepository(db)
+    user = repository.get_with_role(claims.user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Пользователь токена не найден")
+    if str(user.login or "").strip() != claims.login:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Токен не соответствует пользователю")
+    if not bool(user.is_active):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Пользователь отключен")
+    return user
+
+
+def issue_admin_token_pair(*, user_id: int, login: str) -> dict[str, Any]:
     now = int(time.time())
     access_claims = {
-        "sub": settings.admin_superuser_login,
+        "uid": int(user_id),
+        "sub": str(login),
         "type": _ACCESS_TOKEN_TYPE,
         "iat": now,
         "exp": now + settings.admin_access_token_ttl_sec,
         "jti": uuid.uuid4().hex,
     }
     refresh_claims = {
-        "sub": settings.admin_superuser_login,
+        "uid": int(user_id),
+        "sub": str(login),
         "type": _REFRESH_TOKEN_TYPE,
         "iat": now,
         "exp": now + settings.admin_refresh_token_ttl_sec,
@@ -105,26 +165,53 @@ def issue_admin_token_pair() -> dict[str, Any]:
     }
 
 
-def verify_admin_credentials(login: str, password: str) -> bool:
-    # compare_digest for str raises TypeError on non-ASCII input in Python 3.12.
-    # Compare UTF-8 bytes to keep constant-time semantics and avoid 500 on brute-force payloads.
-    login_ok = secrets.compare_digest(login.encode("utf-8"), settings.admin_superuser_login.encode("utf-8"))
-    password_ok = secrets.compare_digest(password.encode("utf-8"), settings.admin_superuser_password.encode("utf-8"))
-    return login_ok and password_ok
+def verify_admin_credentials(db: Session, login: str, password: str) -> AdminUser | None:
+    AdminAccountsService(db).ensure_superadmin_user()
+    repository = AdminUserRepository(db)
+    user = repository.get_by_login(str(login or "").strip())
+    if user is None:
+        return None
+    if not bool(user.is_active):
+        return None
+    if not verify_password(password, str(user.password_hash or "")):
+        return None
+    return repository.get_with_role(int(user.id))
 
 
 def require_admin_access(
     credentials: HTTPAuthorizationCredentials | None = Depends(_auth_scheme),
     access_cookie_token: str | None = Cookie(default=None, alias=ACCESS_COOKIE_NAME),
-) -> AdminTokenClaims:
+    db: Session = Depends(get_db),
+) -> AdminAuthContext:
     bearer_token = None
     if credentials is not None and str(credentials.scheme).lower() == "bearer" and credentials.credentials:
         bearer_token = credentials.credentials
     token = bearer_token or access_cookie_token
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Требуется авторизация")
-    return _decode_and_validate(token, expected_type=_ACCESS_TOKEN_TYPE)
+    claims = _decode_and_validate(token, expected_type=_ACCESS_TOKEN_TYPE)
+    user = _load_user_for_claims(db, claims)
+    return _build_auth_context(claims, user)
 
 
-def verify_refresh_token(refresh_token: str) -> AdminTokenClaims:
-    return _decode_and_validate(refresh_token, expected_type=_REFRESH_TOKEN_TYPE)
+def verify_refresh_token(refresh_token: str, db: Session) -> AdminAuthContext:
+    claims = _decode_and_validate(refresh_token, expected_type=_REFRESH_TOKEN_TYPE)
+    user = _load_user_for_claims(db, claims)
+    return _build_auth_context(claims, user)
+
+
+def require_superadmin(context: AdminAuthContext = Depends(require_admin_access)) -> AdminAuthContext:
+    if not context.is_superuser:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Недостаточно прав")
+    return context
+
+
+def require_permission(permission: str) -> Callable[[AdminAuthContext], AdminAuthContext]:
+    required = str(permission or "").strip()
+
+    def dependency(context: AdminAuthContext = Depends(require_admin_access)) -> AdminAuthContext:
+        if context.has_permission(required):
+            return context
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Недостаточно прав")
+
+    return dependency

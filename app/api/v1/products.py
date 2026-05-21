@@ -59,7 +59,7 @@ from app.schemas.parser import (
 from app.services.catalog.category_index_service import CategoryIndexService
 from app.services.catalog.category_tree_utils import build_tree
 from app.services.proxy.service_api_proxy import forward_service_request
-from app.services.auth.admin_auth_service import require_admin_access
+from app.services.auth.admin_auth_service import require_permission
 from app.services.brand_mapping_service import BrandMappingService
 from app.services.settings.pricing_service import PricingSettingsService
 from app.services.settings.weight_rule_service import WeightRuleService
@@ -790,7 +790,7 @@ def _project_catalog_item(item: dict[str, Any]) -> dict[str, Any]:
         "vendor_display": item.get("vendor_display"),
         "url": str(item.get("url") or ""),
         "price": _safe_float(item.get("price")),
-        "currency": str(item.get("currency") or "RUB"),
+        "currency": str(item.get("currency") or item.get("source_currency") or ""),
         "source_price": _safe_float(item.get("source_price")),
         "source_currency": item.get("source_currency"),
         "status": str(item.get("status") or "hidden"),
@@ -818,7 +818,7 @@ def _project_showcase_product_detail(item: dict[str, Any]) -> dict[str, Any]:
         "vendor_display": item.get("vendor_display"),
         "url": str(item.get("url") or ""),
         "price": _safe_float(item.get("price")),
-        "currency": str(item.get("currency") or "RUB"),
+        "currency": str(item.get("currency") or item.get("source_currency") or ""),
         "source_price": _safe_float(item.get("source_price")),
         "source_currency": item.get("source_currency"),
         "final_price": _safe_float(item.get("final_price")),
@@ -1349,7 +1349,7 @@ def _project_admin_table_item(item: dict[str, Any]) -> dict[str, Any]:
 @router.get("/admin/products/table")
 def get_admin_products_table(
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("control.products.read")),
     search: str | None = Query(default=None),
     source_id: int | None = Query(default=None),
     vendor: str | None = Query(default=None),
@@ -1509,7 +1509,7 @@ def get_admin_products_table(
 @router.get("/admin/products/table/facets")
 def get_admin_products_table_facets(
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("control.products.read")),
     search: str | None = Query(default=None),
     source_id: int | None = Query(default=None),
     vendor: str | None = Query(default=None),
@@ -1643,7 +1643,7 @@ def get_admin_products_table_facets(
 @router.get("/admin/brand-mapping", response_model=BrandMappingListResponse)
 def get_admin_brand_mapping(
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("control.designers.read")),
 ) -> dict[str, Any]:
     return BrandMappingService(db).get_admin_brand_mapping_payload()
 
@@ -1652,7 +1652,7 @@ def get_admin_brand_mapping(
 def put_admin_brand_mapping(
     payload: BrandMappingUpdateRequest,
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("control.designers.edit")),
 ) -> dict[str, Any]:
     try:
         return BrandMappingService(db).save_admin_brand_mapping([item.model_dump() for item in payload.items])
@@ -2090,7 +2090,7 @@ def get_catalog_products(
 @router.get("/admin/products")
 def get_admin_products(
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("control.products.read")),
     search: str | None = Query(default=None),
     source_id: int | None = Query(default=None),
     vendor: str | None = Query(default=None),
@@ -2236,7 +2236,7 @@ def get_admin_products(
 @router.get("/products/pricing-example", response_model=PricingExampleProductResponse)
 def get_pricing_example_product(
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("control.pricing.read")),
 ) -> dict[str, Any]:
     base_query = (
         _with_active_sources(db.query(ParserProduct))
@@ -2453,7 +2453,7 @@ async def update_product(
     product_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("showcase.edit")),
 ) -> Response:
     payload = await request.json()
     if not isinstance(payload, dict):
@@ -2659,7 +2659,7 @@ async def update_product(
 async def upload_product_image(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("showcase.edit")),
 ):
     image_asset_id = _save_manual_product_image(file, db)
     return {"ok": True, "image_asset_id": image_asset_id}
@@ -2669,7 +2669,7 @@ async def upload_product_image(
 def upload_product_image_by_url(
     payload: ProductImageUrlPayload,
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("showcase.edit")),
 ):
     raw_url = str(payload.url or "").strip()
     if raw_url.startswith("//"):
@@ -2697,7 +2697,7 @@ def upload_product_image_by_url(
 def preview_product_by_url(
     payload: ProductUrlPayload,
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("control.products.edit")),
 ) -> dict[str, Any]:
     normalized_input = _normalize_url_loose(payload.url)
     if not normalized_input:
@@ -2774,7 +2774,7 @@ def preview_product_by_url(
 def probe_product_by_url(
     payload: ProductUrlPayload,
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("control.products.edit")),
 ) -> dict[str, Any]:
     normalized_input = _normalize_url_loose(payload.url)
     if not normalized_input:
@@ -2870,7 +2870,7 @@ def probe_product_by_url(
 @router.get("/products/starred-categories/options")
 def get_starred_categories_options(
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("showcase.read")),
 ) -> dict[str, Any]:
     category_repo = ParserCategoryRepository(db)
     starred_categories = category_repo.get_favorites()
@@ -2886,7 +2886,7 @@ def get_starred_categories_options(
 def create_manual_product(
     payload: CreateManualProductRequest,
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("control.products.edit")),
 ) -> dict[str, Any]:
     title = str(payload.title or "").strip()
     if not title:
@@ -3009,7 +3009,7 @@ def update_manual_product(
     product_id: int,
     payload: UpdateManualProductRequest,
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("control.products.edit")),
 ) -> dict[str, Any]:
     title = str(payload.title or "").strip()
     if not title:
@@ -3132,7 +3132,7 @@ def update_manual_product(
 def delete_manual_product(
     product_id: int,
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("control.products.edit")),
 ) -> dict[str, Any]:
     product = (
         db.query(ParserProduct)
@@ -3176,7 +3176,7 @@ def get_product_manual_image(image_id: int, db: Session = Depends(get_db)):
 
 @router.get("/products/{product_id}/starred-categories")
 def get_product_starred_categories(
-    product_id: int, db: Session = Depends(get_db), _: object = Depends(require_admin_access)
+    product_id: int, db: Session = Depends(get_db), _: object = Depends(require_permission("showcase.read"))
 ) -> dict[str, Any]:
     product = ParserProductRepository(db).get_active_by_id(product_id)
     if product is None:
@@ -3212,7 +3212,7 @@ async def set_product_starred_categories(
     product_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    _: object = Depends(require_admin_access),
+    _: object = Depends(require_permission("showcase.edit")),
 ) -> dict[str, Any]:
     product = ParserProductRepository(db).get_active_by_id(product_id)
     if product is None:
@@ -3265,13 +3265,13 @@ async def set_product_starred_categories(
 
 
 @router.api_route("/products", methods=_PROXY_ROOT_METHODS)
-async def proxy_products_root(request: Request, _: object = Depends(require_admin_access)) -> Response:
+async def proxy_products_root(request: Request, _: object = Depends(require_permission("control.products.edit"))) -> Response:
     body = await request.body()
     return forward_service_request(request=request, path="products", body=body)
 
 
 @router.api_route("/products/{path:path}", methods=_PROXY_PATH_METHODS)
-async def proxy_products_path(path: str, request: Request, _: object = Depends(require_admin_access)) -> Response:
+async def proxy_products_path(path: str, request: Request, _: object = Depends(require_permission("control.products.edit"))) -> Response:
     if request.method.upper() == "GET":
         try:
             int(path)

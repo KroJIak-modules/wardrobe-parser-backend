@@ -29,49 +29,50 @@ from app.schemas.parser import (
 from app.services.settings.pricing_service import PricingSettingsService
 from app.services.settings.settings_transfer_service import SettingsTransferService
 from app.services.settings.weight_rule_service import WeightRuleService
+from app.services.auth.admin_auth_service import require_permission
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 LOGGER = logging.getLogger(__name__)
 
 
-@router.get("/pricing", response_model=PricingSettingsResponse)
+@router.get("/pricing", response_model=PricingSettingsResponse, dependencies=[Depends(require_permission("control.pricing.read"))])
 def get_pricing_settings(db: Session = Depends(get_db)):
     return PricingSettingsService(db).get_settings(refresh_bybit=False)
 
 
-@router.patch("/pricing", response_model=PricingSettingsResponse)
+@router.patch("/pricing", response_model=PricingSettingsResponse, dependencies=[Depends(require_permission("control.pricing.edit"))])
 def update_pricing_settings(payload: PricingSettingsUpdateRequest, db: Session = Depends(get_db)):
     return PricingSettingsService(db).update_settings(payload)
 
 
-@router.get("/admin-ui", response_model=AdminUiSettingsResponse)
+@router.get("/admin-ui", response_model=AdminUiSettingsResponse, dependencies=[Depends(require_permission("control.settings.read"))])
 def get_admin_ui_settings(db: Session = Depends(get_db)):
     return PricingSettingsService(db).get_admin_ui_settings()
 
 
-@router.patch("/admin-ui", response_model=AdminUiSettingsResponse)
+@router.patch("/admin-ui", response_model=AdminUiSettingsResponse, dependencies=[Depends(require_permission("control.settings.edit"))])
 def update_admin_ui_settings(payload: AdminUiSettingsUpdateRequest, db: Session = Depends(get_db)):
     return PricingSettingsService(db).update_admin_ui_settings(payload)
 
 
 
 
-@router.patch("/pricing/suppliers/{supplier_id}", response_model=PricingSupplierResponse)
+@router.patch("/pricing/suppliers/{supplier_id}", response_model=PricingSupplierResponse, dependencies=[Depends(require_permission("control.pricing.edit"))])
 def update_pricing_supplier(supplier_id: int, payload: PricingSupplierUpdateRequest, db: Session = Depends(get_db)):
     return PricingSettingsService(db).update_supplier(supplier_id=supplier_id, payload=payload)
 
 
-@router.post("/pricing/suppliers", response_model=PricingSupplierResponse)
+@router.post("/pricing/suppliers", response_model=PricingSupplierResponse, dependencies=[Depends(require_permission("control.pricing.edit"))])
 def create_pricing_supplier(payload: PricingSupplierCreateRequest, db: Session = Depends(get_db)):
     return PricingSettingsService(db).create_supplier(payload)
 
 
-@router.delete("/pricing/suppliers/{supplier_id}")
+@router.delete("/pricing/suppliers/{supplier_id}", dependencies=[Depends(require_permission("control.pricing.edit"))])
 def delete_pricing_supplier(supplier_id: int, db: Session = Depends(get_db)):
     return PricingSettingsService(db).delete_supplier(supplier_id)
 
 
-@router.get("/weight-rules", response_model=list[WeightRuleResponse])
+@router.get("/weight-rules", response_model=list[WeightRuleResponse], dependencies=[Depends(require_permission("control.weight.read"))])
 def list_weight_rules(db: Session = Depends(get_db)):
     try:
         return WeightRuleService(db).list_rules()
@@ -80,7 +81,7 @@ def list_weight_rules(db: Session = Depends(get_db)):
         return []
 
 
-@router.get("/weight-rules/parser-contract", response_model=ParserWeightRulesContractResponse)
+@router.get("/weight-rules/parser-contract", response_model=ParserWeightRulesContractResponse, dependencies=[Depends(require_permission("control.weight.read"))])
 def parser_weight_rules_contract(db: Session = Depends(get_db)):
     try:
         rules = WeightRuleService(db).list_rules()
@@ -100,7 +101,7 @@ def parser_weight_rules_contract(db: Session = Depends(get_db)):
     return ParserWeightRulesContractResponse(revision=revision, rules=payload_rules)
 
 
-@router.get("/weight-rules/missing-products", response_model=list[WeightMissingProductResponse])
+@router.get("/weight-rules/missing-products", response_model=list[WeightMissingProductResponse], dependencies=[Depends(require_permission("control.weight.read"))])
 def list_missing_weight_products(limit: int = 500, offset: int = 0, db: Session = Depends(get_db)):
     try:
         return WeightRuleService(db).list_missing_weight_products(limit=limit, offset=offset)
@@ -109,41 +110,41 @@ def list_missing_weight_products(limit: int = 500, offset: int = 0, db: Session 
         return []
 
 
-@router.post("/weight-rules", response_model=WeightRuleResponse)
+@router.post("/weight-rules", response_model=WeightRuleResponse, dependencies=[Depends(require_permission("control.weight.edit"))])
 def create_weight_rule(payload: WeightRuleCreateRequest, db: Session = Depends(get_db)):
     return WeightRuleService(db).create_rule(payload)
 
 
-@router.patch("/weight-rules/{rule_id}", response_model=WeightRuleResponse)
+@router.patch("/weight-rules/{rule_id}", response_model=WeightRuleResponse, dependencies=[Depends(require_permission("control.weight.edit"))])
 def update_weight_rule(rule_id: int, payload: WeightRuleUpdateRequest, db: Session = Depends(get_db)):
     return WeightRuleService(db).update_rule(rule_id, payload)
 
 
-@router.delete("/weight-rules/{rule_id}")
+@router.delete("/weight-rules/{rule_id}", dependencies=[Depends(require_permission("control.weight.edit"))])
 def delete_weight_rule(rule_id: int, db: Session = Depends(get_db)):
     return WeightRuleService(db).delete_rule(rule_id)
 
 
-@router.post("/weight-rules/{rule_id}/keywords")
+@router.post("/weight-rules/{rule_id}/keywords", dependencies=[Depends(require_permission("control.weight.edit"))])
 def add_weight_rule_keyword(rule_id: int, payload: WeightRuleKeywordRequest, db: Session = Depends(get_db)):
     return WeightRuleService(db).add_keyword(rule_id, payload)
 
 
-@router.delete("/weight-rules/{rule_id}/keywords/{keyword}")
+@router.delete("/weight-rules/{rule_id}/keywords/{keyword}", dependencies=[Depends(require_permission("control.weight.edit"))])
 def remove_weight_rule_keyword(rule_id: int, keyword: str, db: Session = Depends(get_db)):
     return WeightRuleService(db).remove_keyword(rule_id, keyword)
 
 
-@router.get("/export", response_model=SettingsTransferPayload)
+@router.get("/export", response_model=SettingsTransferPayload, dependencies=[Depends(require_permission("control.settings.read"))])
 def export_settings(db: Session = Depends(get_db)):
     return SettingsTransferService(db).export_payload()
 
 
-@router.post("/import", response_model=SettingsTransferResponse)
+@router.post("/import", response_model=SettingsTransferResponse, dependencies=[Depends(require_permission("control.settings.edit"))])
 def import_settings(payload: SettingsTransferPayload, db: Session = Depends(get_db)):
     return SettingsTransferService(db).import_payload(payload)
 
 
-@router.post("/reset", response_model=SettingsTransferResponse)
+@router.post("/reset", response_model=SettingsTransferResponse, dependencies=[Depends(require_permission("control.settings.edit"))])
 def reset_settings(db: Session = Depends(get_db)):
     return SettingsTransferService(db).reset_all()

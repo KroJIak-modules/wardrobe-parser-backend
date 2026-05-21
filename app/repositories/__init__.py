@@ -1,6 +1,7 @@
 """Data access layer repositories."""
 
 from app.repositories.base import BaseRepository
+from app.repositories.admin_auth import AdminRoleRepository, AdminUserRepository
 from app.repositories.parser_brand_mapping import ParserBrandMappingRepository
 from app.repositories.parser_category import ParserCategoryKeywordRepository, ParserCategoryRepository
 from app.repositories.parser_category_index import (
@@ -19,6 +20,8 @@ from app.repositories.weight_settings import ParserWeightKeywordRepository, Pars
 
 __all__ = [
     "BaseRepository",
+    "AdminRoleRepository",
+    "AdminUserRepository",
     "ParserBrandMappingRepository",
     "ParserCategoryKeywordRepository",
     "ParserCategoryCountSnapshotRepository",

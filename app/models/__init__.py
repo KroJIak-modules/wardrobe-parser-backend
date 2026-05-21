@@ -1,5 +1,6 @@
 from app.models.image_asset import ImageAsset
 from app.models.admin_ui_settings import AdminUiSettings
+from app.models.admin_auth import AdminRole, AdminUser
 from app.models.category import (
     ParserCategory,
     ParserCategoryCountSnapshot,
@@ -27,6 +28,8 @@ from app.models.weight import ParserWeightKeyword, ParserWeightRule
 __all__ = [
     "ImageAsset",
     "AdminUiSettings",
+    "AdminRole",
+    "AdminUser",
     "ParserCategory",
     "ParserCategoryCountSnapshot",
     "ParserCategoryIndexState",

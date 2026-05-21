@@ -14,8 +14,10 @@ from starlette import status
 
 from app.api.v1 import api_router
 from app.api.v1.jobs import mark_interrupted_jobs_on_startup
+from app.core.database import SessionLocal
 from app.core.config import settings
 from app.core.exceptions import IntegrityError, NotFoundError, ValidationError
+from app.services.auth.admin_accounts_service import AdminAccountsService
 
 
 HTTP_NOT_FOUND = status.HTTP_404_NOT_FOUND
@@ -113,6 +115,11 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def _on_startup_sync_runtime() -> None:
+        db = SessionLocal()
+        try:
+            AdminAccountsService(db).ensure_superadmin_user()
+        finally:
+            db.close()
         mark_interrupted_jobs_on_startup()
 
     @app.get("/health", summary="Health check")

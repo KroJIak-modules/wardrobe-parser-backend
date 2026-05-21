@@ -6,9 +6,11 @@ from datetime import datetime, timezone
 import re
 from typing import Any
 
+import requests
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models import (
     AdminUiSettings,
     ParserBrandMapping,
@@ -35,6 +37,7 @@ from app.repositories import (
 )
 from app.services.settings.pricing_service import PricingSettingsService
 from app.schemas.parser import (
+    SettingsTransferBrandMappingEntry,
     SettingsTransferCategoryEntry,
     SettingsTransferCategoryKeywordEntry,
     SettingsTransferAdminUiSettings,
@@ -75,6 +78,7 @@ _PRICING_EXPORT_FIELDS = [
 ]
 
 _PRICING_IMPORT_FIELDS = set(_PRICING_EXPORT_FIELDS)
+_DEFAULT_CURRENCY_PRIORITY = ["USD", "EUR", "GBP"]
 
 
 def _normalize_currency(raw: str | None, *, default: str = "RUB") -> str:
@@ -94,6 +98,14 @@ def _normalize_supplier_key(raw_key: str, fallback_name: str, index: int) -> str
     return source[:64]
 
 
+def _norm_host(raw: str) -> str:
+    value = str(raw or "").strip().lower()
+    if not value:
+        return ""
+    value = re.sub(r"^https?://", "", value)
+    return value.split("/", 1)[0]
+
+
 class SettingsTransferService:
     """Application service for settings export/import."""
 
@@ -105,6 +117,28 @@ class SettingsTransferService:
         self.weight_keyword_repo = ParserWeightKeywordRepository(db)
         self.category_repo = ParserCategoryRepository(db)
         self.category_keyword_repo = ParserCategoryKeywordRepository(db)
+
+    @staticmethod
+    def _service_sources_base() -> str:
+        return f"{settings.service_base_url.rstrip('/')}/api/v1/sync/sources"
+
+    def _service_list(self) -> list[dict[str, Any]]:
+        try:
+            res = requests.get(self._service_sources_base(), timeout=(5, 30))
+            res.raise_for_status()
+            payload = res.json()
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Service API unavailable: {exc}") from exc
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    def _service_patch(self, source_key: str, payload: dict[str, Any]) -> None:
+        try:
+            res = requests.patch(f"{self._service_sources_base()}/{source_key}", json=payload, timeout=(5, 30))
+            res.raise_for_status()
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Service API unavailable: {exc}") from exc
 
     def export_payload(self) -> SettingsTransferPayload:
         pricing_row, _ = self.pricing_repo.get_or_create_default()
@@ -172,23 +206,56 @@ class SettingsTransferService:
             for supplier in suppliers
         ]
 
-        source_entries = [
-            SettingsTransferSourceEntry(
-                name=str(source.name),
-                url=str(source.url),
-                enabled=bool(source.enabled),
-                supplier_key=(
-                    str(supplier_by_id[int(source.supplier_id)].key)
-                    if source.supplier_id is not None and int(source.supplier_id) in supplier_by_id
-                    else None
-                ),
-                promo_factor=float(source.promo_factor),
-                promo_only_no_discount=bool(source.promo_only_no_discount),
-                buyout_surcharge_value=float(source.buyout_surcharge_value),
-                buyout_surcharge_currency=_normalize_currency(source.buyout_surcharge_currency, default="RUB"),
+        service_sources = self._service_list()
+        service_by_host: dict[str, dict[str, Any]] = {}
+        for item in service_sources:
+            host = _norm_host(item.get("url"))
+            if host and host not in service_by_host:
+                service_by_host[host] = item
+
+        source_entries: list[SettingsTransferSourceEntry] = []
+        for source in sources:
+            service_item = service_by_host.get(_norm_host(source.url))
+            cfg = service_item.get("config") if isinstance(service_item, dict) and isinstance(service_item.get("config"), dict) else {}
+            currency_cfg = cfg.get("shopify_currency") if isinstance(cfg.get("shopify_currency"), dict) else {}
+            currency_priority_raw = currency_cfg.get("requested_currency_priority")
+            currency_priority = [
+                str(x).strip().upper()
+                for x in (currency_priority_raw if isinstance(currency_priority_raw, list) else _DEFAULT_CURRENCY_PRIORITY)
+                if str(x).strip()
+            ] or list(_DEFAULT_CURRENCY_PRIORITY)
+            currency_method = str(currency_cfg.get("method") or "priority_list").strip().lower()
+            if currency_method not in {"priority_list", "locked_param_currency", "locked_no_currency"}:
+                currency_method = "priority_list"
+            locked_currency = str(currency_cfg.get("locked_currency") or "").strip().upper() or None
+            if locked_currency == "GBR":
+                locked_currency = "GBP"
+            if locked_currency not in {"USD", "EUR", "GBP", "JPY"}:
+                locked_currency = None
+
+            source_entries.append(
+                SettingsTransferSourceEntry(
+                    name=str(source.name),
+                    url=str(source.url),
+                    enabled=bool(source.enabled),
+                    sync_enabled=bool(service_item.get("sync_enabled", True)) if isinstance(service_item, dict) else True,
+                    hide_auto_added_products=bool(getattr(source, "hide_auto_added_products", False)),
+                    show_description=bool(getattr(source, "show_description", True)),
+                    show_images=bool(getattr(source, "show_images", True)),
+                    currency_priority=currency_priority,
+                    currency_method=currency_method,  # type: ignore[arg-type]
+                    locked_currency=locked_currency,
+                    supplier_key=(
+                        str(supplier_by_id[int(source.supplier_id)].key)
+                        if source.supplier_id is not None and int(source.supplier_id) in supplier_by_id
+                        else None
+                    ),
+                    promo_factor=float(source.promo_factor),
+                    promo_only_no_discount=bool(source.promo_only_no_discount),
+                    buyout_surcharge_value=float(source.buyout_surcharge_value),
+                    buyout_surcharge_currency=_normalize_currency(source.buyout_surcharge_currency, default="RUB"),
+                )
             )
-            for source in sources
-        ]
 
         weight_entries = [
             SettingsTransferWeightRuleEntry(
@@ -239,6 +306,15 @@ class SettingsTransferService:
             weight_rules=weight_entries,
             categories=category_entries,
             category_keywords=category_keyword_entries,
+            brand_mappings=[
+                SettingsTransferBrandMappingEntry(
+                    source_brand=str(row.source_brand),
+                    source_brand_key=str(row.source_brand_key),
+                    target_brand=str(row.target_brand),
+                    include_in_designers=bool(getattr(row, "include_in_designers", True)),
+                )
+                for row in self.db.query(ParserBrandMapping).order_by(ParserBrandMapping.id.asc()).all()
+            ],
         )
 
     def import_payload(self, payload: SettingsTransferPayload) -> SettingsTransferResponse:
@@ -254,6 +330,7 @@ class SettingsTransferService:
         source_count = self._import_sources(payload.sources, supplier_map=supplier_map)
         weight_count = self._import_weight_rules(payload.weight_rules)
         categories_updated, keywords_updated = self._import_categories(payload.categories, payload.category_keywords)
+        brand_mappings_updated = self._import_brand_mappings(payload.brand_mappings)
 
         self.db.commit()
         return SettingsTransferResponse(
@@ -269,6 +346,7 @@ class SettingsTransferService:
                 "weight_rules_replaced": weight_count,
                 "categories_upserted": categories_updated,
                 "category_keywords_replaced": keywords_updated,
+                "brand_mappings_replaced": brand_mappings_updated,
             },
         )
 
@@ -437,6 +515,12 @@ class SettingsTransferService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет тарифов для назначения источникам")
         fallback_supplier = next(iter(supplier_map.values()))
         updated = 0
+        service_sources = self._service_list()
+        service_by_host: dict[str, dict[str, Any]] = {}
+        for item in service_sources:
+            host = _norm_host(item.get("url"))
+            if host and host not in service_by_host:
+                service_by_host[host] = item
 
         for item in sources:
             existing = (
@@ -457,6 +541,9 @@ class SettingsTransferService:
                         name=item.name,
                         url=item.url,
                         enabled=bool(item.enabled),
+                        hide_auto_added_products=bool(item.hide_auto_added_products),
+                        show_description=bool(item.show_description),
+                        show_images=bool(item.show_images),
                         supplier_id=supplier_id,
                         promo_factor=float(item.promo_factor),
                         promo_only_no_discount=bool(item.promo_only_no_discount),
@@ -467,12 +554,33 @@ class SettingsTransferService:
             else:
                 existing.name = item.name
                 existing.enabled = bool(item.enabled)
+                existing.hide_auto_added_products = bool(item.hide_auto_added_products)
+                existing.show_description = bool(item.show_description)
+                existing.show_images = bool(item.show_images)
                 existing.supplier_id = supplier_id
                 existing.promo_factor = float(item.promo_factor)
                 existing.promo_only_no_discount = bool(item.promo_only_no_discount)
                 existing.buyout_surcharge_value = float(item.buyout_surcharge_value)
                 existing.buyout_surcharge_currency = _normalize_currency(item.buyout_surcharge_currency, default="RUB")
             updated += 1
+
+            service_item = service_by_host.get(_norm_host(item.url))
+            if isinstance(service_item, dict):
+                source_key = str(service_item.get("key") or "").strip()
+                if source_key:
+                    self._service_patch(source_key, {"sync_enabled": bool(item.sync_enabled)})
+                    self._service_patch(
+                        source_key,
+                        {
+                            "requested_currency_priority": [
+                                str(x).strip().upper()
+                                for x in (item.currency_priority or _DEFAULT_CURRENCY_PRIORITY)
+                                if str(x).strip()
+                            ] or list(_DEFAULT_CURRENCY_PRIORITY),
+                            "currency_method": str(item.currency_method),
+                            "locked_currency": str(item.locked_currency or "").strip().upper(),
+                        },
+                    )
         return updated
 
     def _import_weight_rules(self, rules: list[SettingsTransferWeightRuleEntry]) -> int:
@@ -559,7 +667,10 @@ class SettingsTransferService:
             keyword = item.keyword.strip().lower()
             if not keyword:
                 continue
-            dedupe_key = (int(category.id), keyword, item.scope)
+            scope = str(item.scope or "local").strip().lower()
+            if scope not in {"local", "title", "status"}:
+                scope = "local"
+            dedupe_key = (int(category.id), keyword, scope)
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
@@ -567,8 +678,29 @@ class SettingsTransferService:
                 ParserCategoryKeyword(
                     category_id=int(category.id),
                     keyword=keyword,
-                    keyword_scope="title" if item.scope == "title" else "local",
+                    keyword_scope=scope,
                 )
             )
             keyword_count += 1
         return len(upserted), keyword_count
+
+    def _import_brand_mappings(self, rows: list[SettingsTransferBrandMappingEntry]) -> int:
+        self.db.query(ParserBrandMapping).delete(synchronize_session=False)
+        self.db.flush()
+        inserted = 0
+        seen_keys: set[str] = set()
+        for item in rows:
+            key = str(item.source_brand_key or "").strip().lower()
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            self.db.add(
+                ParserBrandMapping(
+                    source_brand=str(item.source_brand).strip(),
+                    source_brand_key=key,
+                    target_brand=str(item.target_brand).strip(),
+                    include_in_designers=bool(item.include_in_designers),
+                )
+            )
+            inserted += 1
+        return inserted
