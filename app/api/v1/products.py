@@ -356,6 +356,20 @@ def _normalize_url_loose(raw: str) -> str:
     return f"{scheme}://{netloc}{path}"
 
 
+def _extract_handle_from_url_any_products(raw_url: str) -> str:
+    try:
+        parts = [p for p in urlparse(str(raw_url or "").strip()).path.split("/") if p]
+    except Exception:
+        return ""
+    lowered = [p.lower() for p in parts]
+    if "products" not in lowered:
+        return ""
+    idx = lowered.index("products")
+    if idx + 1 >= len(parts):
+        return ""
+    return str(parts[idx + 1] or "").strip()
+
+
 def _norm_host(raw: str) -> str:
     value = str(raw or "").strip()
     if not value:
@@ -2710,10 +2724,7 @@ def preview_product_by_url(
         .first()
     )
     if matched is None:
-        input_parts = [p for p in urlparse(normalized_input).path.split("/") if p]
-        handle = ""
-        if len(input_parts) >= 2 and input_parts[0].lower() == "products":
-            handle = input_parts[1]
+        handle = _extract_handle_from_url_any_products(normalized_input)
         if handle:
             candidates = (
                 db.query(ParserProduct)
@@ -2958,7 +2969,32 @@ def create_manual_product(
     )
     db.add(product)
     try:
+        db.flush()
+        if bind_sync_enabled:
+            source_id = int(payload.bind_source_id)
+            source_product_url = bound_source_url
+            for idx, variant in enumerate(variants, start=1):
+                variant_title = str(variant.get("title") or "").strip() or f"Variant {idx}"
+                variant_price = _safe_float(variant.get("price"))
+                variant_available = bool(variant.get("available"))
+                source_variant_id = f"manual-bound-{int(product.id)}-{idx}"
+                origin_key = f"{source_id}:{source_product_url}:{source_variant_id}"
+                db.add(
+                    ParserProductOriginVariant(
+                        origin_key=origin_key,
+                        product_id=int(product.id),
+                        source_id=source_id,
+                        source_product_url=source_product_url,
+                        source_variant_id=source_variant_id,
+                        source_variant_title=variant_title,
+                        price=variant_price,
+                        currency=_variant_currency(variant.get("currency")),
+                        available=variant_available,
+                        payload={"bound_from_manual_create": True},
+                    )
+                )
         db.commit()
+        db.refresh(product)
     except IntegrityError as exc:
         db.rollback()
         if "parser_product_url_key" in str(getattr(exc, "orig", exc)):
@@ -2966,40 +3002,12 @@ def create_manual_product(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Товар с таким URL уже существует в базе",
             ) from exc
+        if "parser_product_origin_variant_origin_key_key" in str(getattr(exc, "orig", exc)):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Связь ручного товара с источником уже существует",
+            ) from exc
         raise
-    db.refresh(product)
-
-    if bind_sync_enabled:
-        source_id = int(payload.bind_source_id)
-        source_product_url = bound_source_url
-        for idx, variant in enumerate(variants, start=1):
-            variant_title = str(variant.get("title") or "").strip() or f"Variant {idx}"
-            variant_price = _safe_float(variant.get("price"))
-            variant_available = bool(variant.get("available"))
-            source_variant_id = f"manual-bound-{int(product.id)}-{idx}"
-            origin_key = f"{source_id}:{source_product_url}:{source_variant_id}"
-            existing = (
-                db.query(ParserProductOriginVariant)
-                .filter(ParserProductOriginVariant.origin_key == origin_key)
-                .one_or_none()
-            )
-            if existing is not None:
-                continue
-            db.add(
-                ParserProductOriginVariant(
-                    origin_key=origin_key,
-                    product_id=int(product.id),
-                    source_id=source_id,
-                    source_product_url=source_product_url,
-                    source_variant_id=source_variant_id,
-                    source_variant_title=variant_title,
-                    price=variant_price,
-                    currency=_variant_currency(variant.get("currency")),
-                    available=variant_available,
-                    payload={"bound_from_manual_create": True},
-                )
-            )
-        db.commit()
 
     return {"ok": True, "id": int(product.id)}
 

@@ -128,6 +128,8 @@ class ParserDedupDecision(Base):
     right_product_id = Column(Integer, ForeignKey("parser_product.id"), nullable=False)
     action = Column(String(20), nullable=False)
     merged_into_product_id = Column(Integer, ForeignKey("parser_product.id"), nullable=True)
+    snapshot_payload = Column(JSON, nullable=True)
+    restore_payload = Column(JSON, nullable=True)
     decided_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

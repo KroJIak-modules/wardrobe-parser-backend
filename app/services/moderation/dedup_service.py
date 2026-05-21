@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from itertools import combinations
 from typing import Any, Iterable
 
@@ -323,6 +324,181 @@ class DedupService:
             return "available"
         return "out_of_stock"
 
+    @staticmethod
+    def _serialize_datetime(value: Any) -> str | None:
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc).isoformat()
+        return None
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> datetime | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except ValueError:
+            return None
+
+    def _snapshot_product(self, product: Any) -> dict[str, Any]:
+        return {
+            "id": int(product.id),
+            "source_id": int(product.source_id),
+            "source_external_id": str(product.source_external_id or "").strip() or None,
+            "canonical_url": str(product.canonical_url or "").strip() or None,
+            "handle": str(product.handle or "").strip(),
+            "title": str(product.title or "").strip(),
+            "description": product.description,
+            "vendor": str(product.vendor or "").strip() or None,
+            "product_type": str(product.product_type or "").strip() or None,
+            "url": str(product.url or "").strip(),
+            "price": self._safe_float(product.price),
+            "status": str(product.status or "unavailable"),
+            "image_count": int(product.image_count or 0),
+            "image_urls": list(product.image_urls or []),
+            "image_asset_ids": list(product.image_asset_ids or []),
+            "variants": list(product.variants or []),
+            "deleted_at": self._serialize_datetime(getattr(product, "deleted_at", None)),
+            "updated_at": self._serialize_datetime(getattr(product, "updated_at", None)),
+            "title_override": getattr(product, "title_override", None),
+            "description_override": getattr(product, "description_override", None),
+            "title_sync_locked": bool(getattr(product, "title_sync_locked", False)),
+            "description_sync_locked": bool(getattr(product, "description_sync_locked", False)),
+            "description_visible_override": getattr(product, "description_visible_override", None),
+            "images_sync_locked": bool(getattr(product, "images_sync_locked", False)),
+            "hidden_source_image_asset_ids": list(getattr(product, "hidden_source_image_asset_ids", []) or []),
+            "manual_image_asset_ids": list(getattr(product, "manual_image_asset_ids", []) or []),
+            "manual_image_order": list(getattr(product, "manual_image_order", []) or []),
+            "is_auto_added": bool(getattr(product, "is_auto_added", True)),
+            "auto_hide_force_visible": bool(getattr(product, "auto_hide_force_visible", False)),
+            "weight_grams": self._safe_float(getattr(product, "weight_grams", None)),
+            "weight_source": str(getattr(product, "weight_source", "") or "").strip() or None,
+            "weight_match_keyword": str(getattr(product, "weight_match_keyword", "") or "").strip() or None,
+            "weight_value": self._safe_float(getattr(product, "weight_value", None)),
+            "weight_unit": str(getattr(product, "weight_unit", "") or "").strip() or None,
+        }
+
+    def _restore_product(self, product: Any, snapshot: dict[str, Any]) -> None:
+        product.source_id = int(snapshot.get("source_id") or product.source_id)
+        product.source_external_id = snapshot.get("source_external_id")
+        product.canonical_url = snapshot.get("canonical_url")
+        product.handle = str(snapshot.get("handle") or product.handle)
+        product.title = str(snapshot.get("title") or product.title)
+        product.description = snapshot.get("description")
+        product.vendor = snapshot.get("vendor")
+        product.product_type = snapshot.get("product_type")
+        product.url = str(snapshot.get("url") or product.url)
+        product.price = self._safe_float(snapshot.get("price"))
+        product.status = str(snapshot.get("status") or product.status)
+        product.image_count = int(snapshot.get("image_count") or 0)
+        product.image_urls = list(snapshot.get("image_urls") or [])
+        product.image_asset_ids = list(snapshot.get("image_asset_ids") or [])
+        product.variants = list(snapshot.get("variants") or [])
+        product.deleted_at = self._parse_datetime(snapshot.get("deleted_at"))
+        product.title_override = snapshot.get("title_override")
+        product.description_override = snapshot.get("description_override")
+        product.title_sync_locked = bool(snapshot.get("title_sync_locked", False))
+        product.description_sync_locked = bool(snapshot.get("description_sync_locked", False))
+        product.description_visible_override = snapshot.get("description_visible_override")
+        product.images_sync_locked = bool(snapshot.get("images_sync_locked", False))
+        product.hidden_source_image_asset_ids = list(snapshot.get("hidden_source_image_asset_ids") or [])
+        product.manual_image_asset_ids = list(snapshot.get("manual_image_asset_ids") or [])
+        product.manual_image_order = list(snapshot.get("manual_image_order") or [])
+        product.is_auto_added = bool(snapshot.get("is_auto_added", True))
+        product.auto_hide_force_visible = bool(snapshot.get("auto_hide_force_visible", False))
+        product.weight_grams = self._safe_float(snapshot.get("weight_grams"))
+        product.weight_source = snapshot.get("weight_source")
+        product.weight_match_keyword = snapshot.get("weight_match_keyword")
+        product.weight_value = self._safe_float(snapshot.get("weight_value"))
+        product.weight_unit = snapshot.get("weight_unit")
+
+    def _origin_rows_for_products(self, product_ids: set[int]) -> list[ParserProductOriginVariant]:
+        if not product_ids:
+            return []
+        return (
+            self.db.query(ParserProductOriginVariant)
+            .filter(ParserProductOriginVariant.product_id.in_(list(product_ids)))
+            .order_by(ParserProductOriginVariant.id.asc())
+            .all()
+        )
+
+    @staticmethod
+    def _variant_sort_key(item: dict[str, Any]) -> tuple[int, str]:
+        return (
+            0 if bool(item.get("available")) else 1,
+            str(item.get("title") or item.get("source_variant_title") or item.get("id") or "").strip().lower(),
+        )
+
+    def _materialize_variants_from_origin_rows(self, origin_rows: list[ParserProductOriginVariant]) -> list[dict[str, Any]]:
+        variants: list[dict[str, Any]] = []
+        for row in origin_rows:
+            payload = dict(row.payload) if isinstance(row.payload, dict) else {}
+            payload_currency = str(payload.get("currency") or "").strip().upper()[:3]
+            item: dict[str, Any] = {
+                "id": str(row.source_variant_id or "").strip() or str(payload.get("id") or "").strip() or None,
+                "title": str(row.source_variant_title or "").strip() or str(payload.get("title") or "").strip() or None,
+                "sku": str(row.sku or "").strip() or str(payload.get("sku") or "").strip() or None,
+                "price": self._safe_float(row.price),
+                "currency": str(row.currency or "").strip().upper() or (payload_currency if len(payload_currency) == 3 else None),
+                "available": bool(row.available),
+                "source_key": str(payload.get("source_key") or "").strip() or None,
+                "source_product_url": str(row.source_product_url or "").strip() or str(payload.get("source_product_url") or "").strip() or None,
+                "source_variant_id": str(row.source_variant_id or "").strip() or None,
+                "source_variant_title": str(row.source_variant_title or "").strip() or None,
+            }
+            for key, value in payload.items():
+                if key not in item:
+                    item[key] = value
+            variants.append(item)
+        variants.sort(key=self._variant_sort_key)
+        return variants
+
+    def _assign_variants_and_status_from_origins(self, product: Any) -> None:
+        rows = self._origin_rows_for_products({int(product.id)})
+        variants = self._materialize_variants_from_origin_rows(rows)
+        product.variants = variants
+        product.price = self._resolve_price_from_variants(variants=variants, fallback_price=self._safe_float(product.price))
+        product.status = self._resolve_status_from_variants(variants, str(product.status or "out_of_stock"))
+
+    def _build_created_product(
+        self,
+        *,
+        left: Any,
+        right: Any,
+        pair_key_value: str,
+    ) -> Any:
+        product_model = self.product_repo.model_class
+        merged_title = str(left.title or "").strip() or str(right.title or "").strip() or f"Dedup {pair_key_value}"
+        merged_description = left.description if left.description else right.description
+        merged_vendor = left.vendor if left.vendor else right.vendor
+        merged_type = left.product_type if left.product_type else right.product_type
+        merged_images = self._unique_list([*(left.image_urls or []), *(right.image_urls or [])])
+        merged_image_ids = self._unique_list([*(left.image_asset_ids or []), *(right.image_asset_ids or [])])
+        dedup_product = product_model(
+            source_id=int(left.source_id),
+            source_external_id=None,
+            canonical_url=None,
+            handle=f"dedup-{pair_key_value}",
+            title=merged_title,
+            description=merged_description,
+            vendor=merged_vendor,
+            product_type=merged_type,
+            url=f"dedup://{pair_key_value}",
+            price=None,
+            status="out_of_stock",
+            image_count=max(len(merged_images), int(left.image_count or 0), int(right.image_count or 0)),
+            image_urls=merged_images,
+            image_asset_ids=merged_image_ids,
+            variants=[],
+            is_auto_added=True,
+        )
+        self.db.add(dedup_product)
+        self.db.flush()
+        return dedup_product
+
     def _decision_undo_block_reason(self, decision: Any) -> str | None:
         action = str(getattr(decision, "action", "") or "").strip().lower()
         if action == "reject":
@@ -438,6 +614,17 @@ class DedupService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="IDs должны отличаться")
 
         primary, duplicate = self._resolve_pair_or_404(payload.primary_product_id, payload.duplicate_product_id)
+        primary_before = self._snapshot_product(primary)
+        duplicate_before = self._snapshot_product(duplicate)
+        origin_rows = self._origin_rows_for_products({int(duplicate.id)})
+        moved_origins = [
+            {
+                "origin_id": int(row.id),
+                "from_product_id": int(row.product_id),
+                "to_product_id": int(primary.id),
+            }
+            for row in origin_rows
+        ]
 
         if not primary.vendor and duplicate.vendor:
             primary.vendor = duplicate.vendor
@@ -455,8 +642,15 @@ class DedupService:
             fallback_price=self._safe_float(getattr(primary, "price", None)),
         )
 
+        for row in origin_rows:
+            row.product_id = int(primary.id)
+        self.db.flush()
+        self._assign_variants_and_status_from_origins(primary)
+
         duplicate.status = "unavailable"
         duplicate.deleted_at = None
+        duplicate.variants = []
+        duplicate.price = None
         key = pair_key(primary.id, duplicate.id)
         upsert_merge_decision(
             self.decision_repo,
@@ -464,6 +658,16 @@ class DedupService:
             left_product_id=min(primary.id, duplicate.id),
             right_product_id=max(primary.id, duplicate.id),
             merged_into_product_id=primary.id,
+            snapshot_payload={
+                "left_before": primary_before if int(primary.id) == min(primary.id, duplicate.id) else duplicate_before,
+                "right_before": duplicate_before if int(duplicate.id) == max(primary.id, duplicate.id) else primary_before,
+            },
+            restore_payload={
+                "mode": "merge",
+                "kept_product_id": int(primary.id),
+                "disabled_product_id": int(duplicate.id),
+                "moved_origins": moved_origins,
+            },
         )
 
         self.db.commit()
@@ -538,22 +742,60 @@ class DedupService:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=block_reason)
 
         action = str(decision.action or "").strip().lower()
+        decision_deleted = False
         if action in {"merge", "combine"}:
-            merged_into_id = int(decision.merged_into_product_id or 0)
-            left_id = int(decision.left_product_id)
-            right_id = int(decision.right_product_id)
-            if merged_into_id not in {left_id, right_id}:
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Невозможно определить отключенный товар")
-            disabled_id = right_id if merged_into_id == left_id else left_id
-            disabled_product = self.product_repo.get_by_id(disabled_id)
-            if disabled_product is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Отключенный товар не найден")
-            disabled_product.status = self._derive_unavailable_fallback_status(
-                disabled_product.variants if isinstance(disabled_product.variants, list) else []
-            )
-            disabled_product.deleted_at = None
+            snapshot_payload = decision.snapshot_payload if isinstance(decision.snapshot_payload, dict) else {}
+            restore_payload = decision.restore_payload if isinstance(decision.restore_payload, dict) else {}
+            left_snapshot = snapshot_payload.get("left_before") if isinstance(snapshot_payload.get("left_before"), dict) else None
+            right_snapshot = snapshot_payload.get("right_before") if isinstance(snapshot_payload.get("right_before"), dict) else None
+            if left_snapshot is None or right_snapshot is None:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Нет snapshot для отката решения")
 
-        self.db.delete(decision)
+            left_product = self.product_repo.get_by_id(int(decision.left_product_id))
+            right_product = self.product_repo.get_by_id(int(decision.right_product_id))
+            if left_product is None or right_product is None:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Невозможно откатить: товар из пары не найден")
+            self._restore_product(left_product, left_snapshot)
+            self._restore_product(right_product, right_snapshot)
+
+            moved_origins = restore_payload.get("moved_origins") if isinstance(restore_payload.get("moved_origins"), list) else []
+            if moved_origins:
+                origin_ids = [
+                    int(item.get("origin_id"))
+                    for item in moved_origins
+                    if isinstance(item, dict) and (isinstance(item.get("origin_id"), int) or str(item.get("origin_id")).isdigit())
+                ]
+                rows = (
+                    self.db.query(ParserProductOriginVariant)
+                    .filter(ParserProductOriginVariant.id.in_(origin_ids))
+                    .all()
+                )
+                from_map = {
+                    int(item.get("origin_id")): int(item.get("from_product_id"))
+                    for item in moved_origins
+                    if isinstance(item, dict)
+                    and (isinstance(item.get("origin_id"), int) or str(item.get("origin_id")).isdigit())
+                    and (isinstance(item.get("from_product_id"), int) or str(item.get("from_product_id")).isdigit())
+                }
+                for row in rows:
+                    row.product_id = int(from_map.get(int(row.id), decision.left_product_id))
+
+            mode = str(restore_payload.get("mode") or "").strip().lower()
+            if mode == "combine":
+                created_product_id = int(restore_payload.get("created_product_id") or 0)
+                if created_product_id > 0:
+                    self.db.delete(decision)
+                    self.db.flush()
+                    decision_deleted = True
+                    self.db.query(ParserProductOriginVariant).filter(
+                        ParserProductOriginVariant.product_id == int(created_product_id)
+                    ).delete(synchronize_session=False)
+                    self.db.query(self.product_repo.model_class).filter(
+                        self.product_repo.model_class.id == int(created_product_id)
+                    ).delete(synchronize_session=False)
+
+        if not decision_deleted:
+            self.db.delete(decision)
         self.db.commit()
         return {"ok": True, "pair_key": pair_key_value}
 
@@ -562,55 +804,53 @@ class DedupService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="IDs должны отличаться")
 
         left, right = self._resolve_pair_or_404(payload.product_a_id, payload.product_b_id)
-        primary, duplicate = self._choose_primary_for_combine(left, right)
+        left_before = self._snapshot_product(left)
+        right_before = self._snapshot_product(right)
+        key = pair_key(left.id, right.id)
+        combined = self._build_created_product(left=left, right=right, pair_key_value=key)
 
-        primary_variants = primary.variants if isinstance(primary.variants, list) else []
-        duplicate_variants = duplicate.variants if isinstance(duplicate.variants, list) else []
-        merged_variants = self._merge_variants(primary_variants, duplicate_variants)
+        origin_rows = self._origin_rows_for_products({int(left.id), int(right.id)})
+        moved_origins = [
+            {
+                "origin_id": int(row.id),
+                "from_product_id": int(row.product_id),
+                "to_product_id": int(combined.id),
+            }
+            for row in origin_rows
+        ]
+        for row in origin_rows:
+            row.product_id = int(combined.id)
+        self.db.flush()
+        self._assign_variants_and_status_from_origins(combined)
 
-        primary_images = primary.image_urls if isinstance(primary.image_urls, list) else []
-        duplicate_images = duplicate.image_urls if isinstance(duplicate.image_urls, list) else []
-        merged_images = self._unique_list([*primary_images, *duplicate_images])
-
-        primary_image_ids = primary.image_asset_ids if isinstance(primary.image_asset_ids, list) else []
-        duplicate_image_ids = duplicate.image_asset_ids if isinstance(duplicate.image_asset_ids, list) else []
-        merged_image_ids = self._unique_list([*primary_image_ids, *duplicate_image_ids])
-
-        if not primary.vendor and duplicate.vendor:
-            primary.vendor = duplicate.vendor
-        if not primary.product_type and duplicate.product_type:
-            primary.product_type = duplicate.product_type
-
-        primary.variants = merged_variants
-        primary.image_urls = merged_images
-        primary.image_asset_ids = merged_image_ids
-        primary.image_count = max(int(primary.image_count or 0), len(merged_images), int(duplicate.image_count or 0))
-        primary.price = self._resolve_price_from_variants(
-            variants=merged_variants,
-            fallback_price=self._safe_float(getattr(primary, "price", None)),
-        )
-        primary.status = self._resolve_status_from_variants(
-            merged_variants,
-            str(primary.status or duplicate.status or "out_of_stock"),
-        )
-
-        duplicate.status = "unavailable"
-        duplicate.deleted_at = None
-        key = pair_key(primary.id, duplicate.id)
+        left.status = "unavailable"
+        left.deleted_at = None
+        right.status = "unavailable"
+        right.deleted_at = None
         upsert_combine_decision(
             self.decision_repo,
             pair_key_value=key,
-            left_product_id=min(primary.id, duplicate.id),
-            right_product_id=max(primary.id, duplicate.id),
-            merged_into_product_id=primary.id,
+            left_product_id=min(left.id, right.id),
+            right_product_id=max(left.id, right.id),
+            merged_into_product_id=int(combined.id),
+            snapshot_payload={
+                "left_before": left_before if int(left.id) == min(left.id, right.id) else right_before,
+                "right_before": right_before if int(right.id) == max(left.id, right.id) else left_before,
+            },
+            restore_payload={
+                "mode": "combine",
+                "created_product_id": int(combined.id),
+                "moved_origins": moved_origins,
+            },
         )
 
         self.db.commit()
         return {
             "ok": True,
             "mode": "combine",
-            "merged_into_product_id": primary.id,
-            "disabled_product_id": duplicate.id,
-            "merged_variants_count": len(merged_variants),
-            "primary_variant_fingerprints": len(extract_variant_fingerprints(primary)),
+            "merged_into_product_id": int(combined.id),
+            "disabled_product_id": int(right.id),
+            "disabled_product_ids": [int(left.id), int(right.id)],
+            "merged_variants_count": len(combined.variants if isinstance(combined.variants, list) else []),
+            "primary_variant_fingerprints": len(extract_variant_fingerprints(combined)),
         }

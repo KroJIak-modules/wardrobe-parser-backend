@@ -809,7 +809,7 @@ def _update_source_sync_telemetry(
 
 def _derive_status(variants: Any) -> str:
     if not isinstance(variants, list) or not variants:
-        return "available"
+        return "out_of_stock"
     for variant in variants:
         if isinstance(variant, dict) and bool(variant.get("available")):
             return "available"
@@ -1050,9 +1050,44 @@ def _upsert_origin_variants(
 ) -> None:
     source_id = int(source.id)
     source_key = _normalize_source_key_from_source(source)
-    for variant in variants:
-        if not isinstance(variant, dict):
-            continue
+    normalized_variants = [v for v in variants if isinstance(v, dict)]
+    incoming_urls: set[str] = set()
+    incoming_keys: set[str] = set()
+    for variant in normalized_variants:
+        source_variant_id = (
+            str(variant.get("source_variant_id") or variant.get("id") or "").strip()
+            or _fallback_source_variant_id(variant)
+        )
+        source_variant_title = (
+            str(variant.get("source_variant_title") or variant.get("title") or "").strip()
+            or _fallback_source_variant_title(variant, source_variant_id)
+        )
+        candidate_source_url = str(variant.get("source_product_url") or source_product_url or "").strip() or source_product_url
+        incoming_urls.add(candidate_source_url)
+        incoming_keys.add(
+            _origin_key(
+                source_id=source_id,
+                source_product_url=candidate_source_url,
+                source_variant_id=source_variant_id,
+                source_variant_title=source_variant_title,
+            )
+        )
+
+    # Drop stale variants for this product/source/url scope so variant count cannot
+    # silently accumulate across runs when source variant identity changes.
+    if incoming_urls:
+        existing_rows = (
+            db.query(ParserProductOriginVariant)
+            .filter(ParserProductOriginVariant.product_id == int(product.id))
+            .filter(ParserProductOriginVariant.source_id == source_id)
+            .filter(ParserProductOriginVariant.source_product_url.in_(list(incoming_urls)))
+            .all()
+        )
+        for row in existing_rows:
+            if str(row.origin_key or "") not in incoming_keys:
+                db.delete(row)
+
+    for variant in normalized_variants:
         source_variant_id = (
             str(variant.get("source_variant_id") or variant.get("id") or "").strip()
             or _fallback_source_variant_id(variant)
@@ -1131,8 +1166,6 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
                 row = query.filter(ParserProduct.source_external_id == external_id).first()
             if row is None and canonical_url:
                 row = query.filter(ParserProduct.canonical_url == canonical_url).first()
-            if row is None and source_product_url:
-                row = query.filter(ParserProduct.url == source_product_url).first()
             if row is None:
                 row = (
                     query.join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
@@ -1140,6 +1173,8 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
                     .filter(ParserProductOriginVariant.source_product_url == source_product_url)
                     .first()
                 )
+            if row is None and source_product_url:
+                row = query.filter(ParserProduct.url == source_product_url).first()
             if row is None:
                 row = ParserProduct(
                     source_id=int(source.id),
@@ -1159,7 +1194,9 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
             incoming_description = item.get("description")
             row.vendor = str(item.get("vendor") or item.get("brand") or "").strip() or None
             row.product_type = str(item.get("product_type") or item.get("category") or "").strip() or None
-            row.url = source_product_url or str(row.url or "").strip()
+            existing_url = str(getattr(row, "url", "") or "").strip()
+            if source_product_url and (not existing_url or existing_url == source_product_url):
+                row.url = source_product_url
             row.price = _safe_float(item.get("price"))
             images = item.get("images") if isinstance(item.get("images"), list) else []
             incoming_image_urls = [str(url).strip() for url in images if str(url).strip()]

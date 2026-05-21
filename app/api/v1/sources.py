@@ -213,6 +213,11 @@ def _map_source(db: Session, item: dict) -> dict:
         "is_password_protected": is_password_protected,
         "is_auto_ingest": is_auto_ingest,
         "is_personal": False,
+        "supplier_id": int(getattr(profile, "supplier_id", 0) or 0) if profile is not None else None,
+        "promo_factor": float(getattr(profile, "promo_factor", 1.0) or 1.0) if profile is not None else 1.0,
+        "promo_only_no_discount": bool(getattr(profile, "promo_only_no_discount", False)) if profile is not None else False,
+        "buyout_surcharge_value": float(getattr(profile, "buyout_surcharge_value", 0.0) or 0.0) if profile is not None else 0.0,
+        "buyout_surcharge_currency": str(getattr(profile, "buyout_surcharge_currency", "USD") or "USD") if profile is not None else "USD",
     }
 
 
@@ -273,6 +278,11 @@ def _map_manual_source(db: Session, source: ParserSource) -> dict:
         "is_password_protected": None,
         "is_auto_ingest": None,
         "is_personal": True,
+        "supplier_id": int(getattr(source, "supplier_id", 0) or 0),
+        "promo_factor": float(getattr(source, "promo_factor", 1.0) or 1.0),
+        "promo_only_no_discount": bool(getattr(source, "promo_only_no_discount", False)),
+        "buyout_surcharge_value": float(getattr(source, "buyout_surcharge_value", 0.0) or 0.0),
+        "buyout_surcharge_currency": str(getattr(source, "buyout_surcharge_currency", "USD") or "USD"),
     }
 
 
@@ -297,6 +307,14 @@ class CurrencyPriorityPayload(BaseModel):
     currency_priority: list[str] | None = None
     currency_method: str | None = None
     locked_currency: str | None = None
+
+
+class SourceSupplierPayload(BaseModel):
+    supplier_id: int
+    promo_factor: float
+    promo_only_no_discount: bool
+    buyout_surcharge_value: float
+    buyout_surcharge_currency: str
 
 
 @router.get("/sources", dependencies=[Depends(require_permission("control.sources.read"))])
@@ -462,4 +480,49 @@ def patch_currency_priority(source_key: str, payload: CurrencyPriorityPayload, d
     src = next((it for it in items if str(it.get("key") or "").strip() == source_key), None)
     if src is None:
         raise HTTPException(status_code=404, detail=f"source not found: {source_key}")
+    return _map_source(db, src)
+
+
+@router.patch("/sources/{source_key}/supplier", dependencies=[Depends(require_permission("control.pricing.edit"))])
+def patch_source_supplier(source_key: str, payload: SourceSupplierPayload, db: Session = Depends(get_db)) -> dict:
+    supplier = db.query(ParserSupplier).filter(ParserSupplier.id == int(payload.supplier_id)).first()
+    if supplier is None:
+        raise HTTPException(status_code=404, detail="Тариф не найден")
+
+    buyout_currency = str(payload.buyout_surcharge_currency or "").strip().upper()
+    if buyout_currency == "GBR":
+        buyout_currency = "GBP"
+    if buyout_currency not in {"USD", "EUR", "GBP", "JPY"}:
+        raise HTTPException(status_code=400, detail="Некорректная валюта выкупа")
+    if payload.buyout_surcharge_value < 0:
+        raise HTTPException(status_code=400, detail="Некорректная доплата за выкуп")
+    if payload.promo_factor < 0:
+        raise HTTPException(status_code=400, detail="Некорректный promo_factor")
+
+    if source_key == _MANUAL_SOURCE_KEY:
+        profile = _get_or_create_manual_source(db)
+        profile.supplier_id = int(payload.supplier_id)
+        profile.promo_factor = float(payload.promo_factor)
+        profile.promo_only_no_discount = bool(payload.promo_only_no_discount)
+        profile.buyout_surcharge_value = float(payload.buyout_surcharge_value)
+        profile.buyout_surcharge_currency = buyout_currency
+        db.commit()
+        db.refresh(profile)
+        return _map_manual_source(db, profile)
+
+    items = _service_list()
+    src = next((it for it in items if str(it.get("key") or "").strip() == source_key), None)
+    if src is None:
+        raise HTTPException(status_code=404, detail=f"source not found: {source_key}")
+    profile = _find_profile(db, source_key, str(src.get("url") or ""))
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"backend source profile not found: {source_key}")
+
+    profile.supplier_id = int(payload.supplier_id)
+    profile.promo_factor = float(payload.promo_factor)
+    profile.promo_only_no_discount = bool(payload.promo_only_no_discount)
+    profile.buyout_surcharge_value = float(payload.buyout_surcharge_value)
+    profile.buyout_surcharge_currency = buyout_currency
+    db.commit()
+    db.refresh(profile)
     return _map_source(db, src)
