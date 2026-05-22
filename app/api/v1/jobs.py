@@ -675,12 +675,9 @@ def _is_password_related_error(error_text: str | None) -> bool:
     patterns = (
         "storefront_password_gate",
         "/password",
-        "password",
         "http 401",
         "status code 401",
         " 401 ",
-        "unauthorized",
-        "forbidden",
     )
     return any(p in raw for p in patterns)
 
@@ -704,10 +701,11 @@ def _probe_source_password_gate(source_key: str | None) -> bool:
         res = requests.get(source_url, timeout=(5, 10), allow_redirects=True)
         final_url = str(res.url or "").lower()
         body = str(res.text or "").lower()
-        if res.status_code in {401, 403}:
+        if res.status_code == 401:
             return True
         if "/password" in final_url:
             return True
+        # Keep this strict to avoid false positives from generic forms/scripts.
         markers = (
             'action="/password"',
             "action='/password'",
@@ -715,11 +713,12 @@ def _probe_source_password_gate(source_key: str | None) -> bool:
             "name='password'",
             'id="password"',
             "id='password'",
+            "templates/password",
             "shopify-section-password",
-            "enter using password",
-            "storefront password",
         )
-        return any(m in body for m in markers)
+        has_marker = any(m in body for m in markers)
+        has_phrase = ("storefront password" in body) or ("enter using password" in body)
+        return has_marker and has_phrase
     except Exception:
         return False
 
