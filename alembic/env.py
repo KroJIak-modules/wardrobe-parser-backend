@@ -1,6 +1,7 @@
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
+from sqlalchemy import text
 from alembic import context
 import sys
 from pathlib import Path
@@ -45,6 +46,34 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        # Older environments may have alembic_version_backend.version_num as varchar(32),
+        # while our revision ids are longer; widen once before migration steps.
+        try:
+            connection.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        IF EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_name = 'alembic_version_backend'
+                              AND column_name = 'version_num'
+                              AND character_maximum_length IS NOT NULL
+                              AND character_maximum_length < 64
+                        ) THEN
+                            ALTER TABLE alembic_version_backend
+                            ALTER COLUMN version_num TYPE varchar(64);
+                        END IF;
+                    END $$;
+                    """
+                )
+            )
+            connection.commit()
+        except Exception:
+            # Table may not exist on first migration run yet; ignore safely.
+            connection.rollback()
+
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
