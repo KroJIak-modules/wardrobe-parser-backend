@@ -32,6 +32,7 @@ def upgrade() -> None:
         "hidden",
         "unavailable",
         name="productstatus",
+        create_type=False,
     )
     product_status.create(bind, checkfirst=True)
 
