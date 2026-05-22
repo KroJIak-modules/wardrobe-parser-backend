@@ -46,14 +46,25 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        # Older environments may have alembic_version_backend.version_num as varchar(32),
-        # while our revision ids are longer; widen once before migration steps.
+        # Ensure version table can store long revision ids before Alembic starts stepping.
         try:
             connection.execute(
                 text(
                     """
                     DO $$
                     BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1
+                            FROM information_schema.tables
+                            WHERE table_name = 'alembic_version_backend'
+                        ) THEN
+                            CREATE TABLE alembic_version_backend (
+                                version_num varchar(64) NOT NULL
+                            );
+                            ALTER TABLE alembic_version_backend
+                                ADD CONSTRAINT alembic_version_backend_pkc PRIMARY KEY (version_num);
+                        END IF;
+
                         IF EXISTS (
                             SELECT 1
                             FROM information_schema.columns
