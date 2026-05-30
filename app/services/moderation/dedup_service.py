@@ -41,8 +41,6 @@ from app.services.settings.pricing_service import PricingSettingsService
 
 class DedupService:
     """Encapsulates duplicate detection and moderation business rules."""
-    _DEDUP_BUCKET_PRODUCT_CAP = 50
-    _DEDUP_PAIR_SCAN_CAP = 25000
 
     def __init__(self, db: Session):
         self.db = db
@@ -567,15 +565,15 @@ class DedupService:
             unique_ids = list(dict.fromkeys(product_ids))
             if len(unique_ids) < 2:
                 continue
-            bounded_ids = unique_ids[: self._DEDUP_BUCKET_PRODUCT_CAP]
+            bounded_ids = unique_ids[: settings.dedup_bucket_product_cap]
             for left_id, right_id in combinations(bounded_ids, 2):
                 key = pair_key(left_id, right_id)
                 if key in blocked_pair_keys:
                     continue
                 candidate_pairs.add(key)
-                if len(candidate_pairs) >= self._DEDUP_PAIR_SCAN_CAP:
+                if len(candidate_pairs) >= settings.dedup_pair_scan_cap:
                     break
-            if len(candidate_pairs) >= self._DEDUP_PAIR_SCAN_CAP:
+            if len(candidate_pairs) >= settings.dedup_pair_scan_cap:
                 break
 
         candidates: list[DedupCandidateResponse] = []
@@ -599,14 +597,8 @@ class DedupService:
                     pair_key=raw_key,
                     score=score,
                     reasons=reasons,
-                    left=self._product_response_with_effective_price(
-                        left,
-                        effective_prices.get(int(left.id)),
-                    ),
-                    right=self._product_response_with_effective_price(
-                        right,
-                        effective_prices.get(int(right.id)),
-                    ),
+                    left=self._to_product_response(left),
+                    right=self._to_product_response(right),
                 )
             )
         candidates.sort(key=lambda item: item.score, reverse=True)
