@@ -41,6 +41,8 @@ from app.services.settings.pricing_service import PricingSettingsService
 
 class DedupService:
     """Encapsulates duplicate detection and moderation business rules."""
+    _DEDUP_BUCKET_PRODUCT_CAP = 50
+    _DEDUP_PAIR_SCAN_CAP = 25000
 
     def __init__(self, db: Session):
         self.db = db
@@ -552,7 +554,6 @@ class DedupService:
         if len(product_by_id) < 2:
             return DedupCandidateListResponse(items=[], total=0, limit=safe_limit, offset=safe_offset)
 
-        effective_prices = self._build_effective_prices(products)
         blocked_pair_keys = self.decision_repo.list_pair_keys()
 
         buckets: dict[str, list[int]] = {}
@@ -566,12 +567,16 @@ class DedupService:
             unique_ids = list(dict.fromkeys(product_ids))
             if len(unique_ids) < 2:
                 continue
-            bounded_ids = unique_ids[:80]
+            bounded_ids = unique_ids[: self._DEDUP_BUCKET_PRODUCT_CAP]
             for left_id, right_id in combinations(bounded_ids, 2):
                 key = pair_key(left_id, right_id)
                 if key in blocked_pair_keys:
                     continue
                 candidate_pairs.add(key)
+                if len(candidate_pairs) >= self._DEDUP_PAIR_SCAN_CAP:
+                    break
+            if len(candidate_pairs) >= self._DEDUP_PAIR_SCAN_CAP:
+                break
 
         candidates: list[DedupCandidateResponse] = []
         for raw_key in sorted(candidate_pairs):
@@ -584,8 +589,8 @@ class DedupService:
             score, reasons = candidate_score(
                 left,
                 right,
-                left_price=effective_prices.get(int(left.id)),
-                right_price=effective_prices.get(int(right.id)),
+                left_price=self._safe_float(getattr(left, "price", None)),
+                right_price=self._safe_float(getattr(right, "price", None)),
             )
             if score < settings.dedup_score_threshold:
                 continue
@@ -607,6 +612,29 @@ class DedupService:
         candidates.sort(key=lambda item: item.score, reverse=True)
         total = len(candidates)
         sliced = candidates[safe_offset : safe_offset + safe_limit]
+
+        # Expensive final price (RUB) calculation only for current page,
+        # not for full scan dataset.
+        page_product_ids: set[int] = set()
+        for item in sliced:
+            page_product_ids.add(int(item.left.id))
+            page_product_ids.add(int(item.right.id))
+        if page_product_ids:
+            page_products = [p for p in products if int(p.id) in page_product_ids]
+            effective_prices = self._build_effective_prices(page_products)
+            for item in sliced:
+                left_product = product_by_id.get(int(item.left.id))
+                right_product = product_by_id.get(int(item.right.id))
+                if left_product is not None:
+                    item.left = self._product_response_with_effective_price(
+                        left_product,
+                        effective_prices.get(int(item.left.id)),
+                    )
+                if right_product is not None:
+                    item.right = self._product_response_with_effective_price(
+                        right_product,
+                        effective_prices.get(int(item.right.id)),
+                    )
         return DedupCandidateListResponse(items=sliced, total=total, limit=safe_limit, offset=safe_offset)
 
     def merge_duplicate(self, payload: DedupMergeRequest) -> dict:
