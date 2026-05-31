@@ -7,12 +7,193 @@ from datetime import datetime, timezone
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models import ParserBrandMapping, ParserCategory, ParserCategoryKeyword, ParserCategoryManualProduct, ParserProduct
 from app.repositories import (
     ParserCategoryCountSnapshotRepository,
     ParserCategoryIndexStateRepository,
     ParserProductCategoryMatchRepository,
 )
+
+_PRODUCT_WITH_VENDOR_CTE = """
+product_with_vendor AS (
+    SELECT
+        p.id,
+        p.source_id,
+        p.title,
+        p.product_type,
+        p.handle,
+        p.url,
+        p.description,
+        p.variants,
+        p.status,
+        p.deleted_at,
+        trim(coalesce(
+            (
+                SELECT bm.target_brand
+                FROM parser_brand_mapping bm
+                WHERE bm.source_brand_key = regexp_replace(lower(trim(coalesce(p.vendor, ''))), '[^[:alnum:]]+', '', 'g')
+                LIMIT 1
+            ),
+            p.vendor
+        )) AS mapped_vendor
+    FROM parser_product p
+)
+"""
+
+_PRODUCT_WITH_GENDER_CTE = """
+product_with_gender AS (
+    SELECT
+        p.*,
+        regexp_replace(lower(trim(coalesce(p.product_type, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_product_type,
+        regexp_replace(lower(trim(coalesce(p.title, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_title,
+        regexp_replace(lower(trim(coalesce(p.handle, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_handle,
+        regexp_replace(lower(trim(coalesce(p.url, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_url,
+        regexp_replace(lower(trim(coalesce(p.description, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_description,
+        regexp_replace(lower(trim(coalesce(p.variants::text, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_variants
+    FROM product_with_vendor p
+)
+"""
+
+_GENDER_INFERRED_CTE = """
+gender_inferred AS (
+    WITH gender_scored AS (
+        SELECT
+            g.id,
+            g.source_id,
+            g.norm_product_type,
+            (
+                (CASE WHEN g.norm_product_type ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 10 ELSE 0 END) +
+                (CASE WHEN g.norm_title ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 6 ELSE 0 END) +
+                (CASE WHEN g.norm_handle ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 3 ELSE 0 END) +
+                (CASE WHEN g.norm_url ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 3 ELSE 0 END) +
+                (CASE WHEN g.norm_description ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 4 ELSE 0 END) +
+                (CASE WHEN g.norm_variants ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 4 ELSE 0 END)
+            ) AS men_score,
+            (
+                (CASE WHEN g.norm_product_type ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 10 ELSE 0 END) +
+                (CASE WHEN g.norm_title ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 6 ELSE 0 END) +
+                (CASE WHEN g.norm_handle ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 3 ELSE 0 END) +
+                (CASE WHEN g.norm_url ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 3 ELSE 0 END) +
+                (CASE WHEN g.norm_description ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 4 ELSE 0 END) +
+                (CASE WHEN g.norm_variants ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 4 ELSE 0 END)
+            ) AS women_score,
+            (
+                g.norm_product_type ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
+                OR g.norm_title ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
+                OR g.norm_handle ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
+                OR g.norm_url ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
+                OR g.norm_description ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
+                OR g.norm_variants ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
+            ) AS has_unisex
+        FROM product_with_gender g
+    ),
+    direct_gender AS (
+        SELECT
+            s.id,
+            s.source_id,
+            s.norm_product_type,
+            CASE
+                WHEN s.men_score > s.women_score THEN 'male'
+                WHEN s.women_score > s.men_score THEN 'female'
+                WHEN s.has_unisex THEN 'unisex'
+                ELSE NULL
+            END AS direct_gender
+        FROM gender_scored s
+    ),
+    profile_stats AS (
+        SELECT
+            d.source_id,
+            d.norm_product_type,
+            count(*) FILTER (WHERE d.direct_gender = 'male')::int AS male_count,
+            count(*) FILTER (WHERE d.direct_gender = 'female')::int AS female_count,
+            count(*) FILTER (WHERE d.direct_gender IN ('male', 'female'))::int AS known_count
+        FROM direct_gender d
+        WHERE d.norm_product_type IS NOT NULL
+          AND char_length(trim(d.norm_product_type)) > 0
+        GROUP BY d.source_id, d.norm_product_type
+    ),
+    profile_pick AS (
+        SELECT
+            p.source_id,
+            p.norm_product_type,
+            CASE
+                WHEN p.known_count >= {profile_min_samples}
+                     AND p.male_count::float / NULLIF(p.known_count, 0)::float >= {profile_min_confidence}
+                    THEN 'male'
+                WHEN p.known_count >= {profile_min_samples}
+                     AND p.female_count::float / NULLIF(p.known_count, 0)::float >= {profile_min_confidence}
+                    THEN 'female'
+                ELSE NULL
+            END AS profile_gender
+        FROM profile_stats p
+    )
+    SELECT
+        d.id,
+        coalesce(d.direct_gender, p.profile_gender) AS inferred_gender
+    FROM direct_gender d
+    LEFT JOIN profile_pick p
+      ON p.source_id = d.source_id
+     AND p.norm_product_type = d.norm_product_type
+)
+"""
+
+_CATEGORY_GENDER_CONSTRAINT_CTE = """
+category_gender_constraint AS (
+    WITH RECURSIVE gtree AS (
+        SELECT
+            c.id,
+            c.parent_id,
+            CASE
+                WHEN c.slug = 'muzhskoe' THEN 'male'
+                WHEN c.slug = 'zhenskoe' THEN 'female'
+                ELSE NULL
+            END::text AS required_gender
+        FROM parser_category c
+        WHERE c.deleted_at IS NULL
+        UNION ALL
+        SELECT ch.id, ch.parent_id, gt.required_gender
+        FROM parser_category ch
+        JOIN gtree gt ON ch.parent_id = gt.id
+        WHERE ch.deleted_at IS NULL
+    )
+    SELECT DISTINCT id AS category_id, required_gender
+    FROM gtree
+    WHERE required_gender IS NOT NULL
+)
+"""
+
+_KEYWORD_MATCH_PREDICATE = """
+(
+  k.keyword_scope = 'local'
+  AND strpos(
+    regexp_replace(
+      lower(trim(coalesce(p.mapped_vendor, '') || ' ' || coalesce(p.product_type, ''))),
+      '[^[:alnum:]]+',
+      ' ',
+      'g'
+    ),
+    regexp_replace(lower(trim(k.keyword)), '[^[:alnum:]]+', ' ', 'g')
+  ) > 0
+)
+OR
+(
+  k.keyword_scope = 'title'
+  AND strpos(
+    regexp_replace(lower(trim(coalesce(p.title, ''))), '[^[:alnum:]]+', ' ', 'g'),
+    regexp_replace(lower(trim(k.keyword)), '[^[:alnum:]]+', ' ', 'g')
+  ) > 0
+)
+OR
+(k.keyword_scope = 'status' AND lower(trim(p.status::text)) = lower(trim(k.keyword)))
+"""
+
+
+def _gender_inferred_cte_sql() -> str:
+    return _GENDER_INFERRED_CTE.format(
+        profile_min_samples=int(settings.category_gender_profile_min_samples),
+        profile_min_confidence=float(settings.category_gender_profile_min_confidence),
+    )
 
 
 class CategoryIndexService:
@@ -154,47 +335,47 @@ class CategoryIndexService:
         )
         self.db.execute(
             text(
-                """
+                f"""
                 INSERT INTO parser_product_category_match (product_id, category_id, match_source, score, created_at, updated_at)
-                WITH product_with_vendor AS (
-                    SELECT
-                        p.id,
-                        p.title,
-                        p.product_type,
-                        p.status,
-                        p.deleted_at,
-                        trim(coalesce(
-                            (
-                                SELECT bm.target_brand
-                                FROM parser_brand_mapping bm
-                                WHERE bm.source_brand_key = regexp_replace(lower(trim(coalesce(p.vendor, ''))), '[^[:alnum:]]+', '', 'g')
-                                LIMIT 1
-                            ),
-                            p.vendor
-                        )) AS mapped_vendor
-                    FROM parser_product p
-                )
+                WITH
+                {_PRODUCT_WITH_VENDOR_CTE},
+                {_PRODUCT_WITH_GENDER_CTE},
+                {_gender_inferred_cte_sql()},
+                {_CATEGORY_GENDER_CONSTRAINT_CTE}
                 SELECT
                     p.id AS product_id,
                     :category_id AS category_id,
                     'auto' AS match_source,
-                    SUM(char_length(k.keyword))::int AS score,
+                    COALESCE(SUM(char_length(k.keyword))::int, 100)::int AS score,
                     now(),
                     now()
                 FROM product_with_vendor p
+                JOIN gender_inferred gi ON gi.id = p.id
                 JOIN parser_category c ON c.id = :category_id
-                JOIN parser_category_keyword k ON k.category_id = c.id
+                LEFT JOIN category_gender_constraint cgc ON cgc.category_id = c.id
+                LEFT JOIN parser_category_keyword k ON k.category_id = c.id
                 WHERE p.deleted_at IS NULL
                   AND c.deleted_at IS NULL
                   AND c.is_fallback IS FALSE
                   AND c.is_enabled IS TRUE
-                  AND char_length(trim(k.keyword)) > 0
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM parser_category ch
+                    WHERE ch.parent_id = c.id
+                      AND ch.deleted_at IS NULL
+                  )
                   AND (
-                    (k.keyword_scope = 'local' AND strpos(lower(trim(coalesce(p.mapped_vendor, '') || ' ' || coalesce(p.product_type, ''))), lower(k.keyword)) > 0)
-                    OR
-                    (k.keyword_scope = 'title' AND strpos(lower(trim(coalesce(p.title, ''))), lower(k.keyword)) > 0)
-                    OR
-                    (k.keyword_scope = 'status' AND lower(trim(p.status::text)) = lower(trim(k.keyword)))
+                    cgc.required_gender IS NULL
+                    OR cgc.required_gender = gi.inferred_gender
+                    OR gi.inferred_gender = 'unisex'
+                  )
+                  AND (
+                    (
+                      char_length(trim(coalesce(k.keyword, ''))) > 0
+                      AND (
+                        {_KEYWORD_MATCH_PREDICATE}
+                      )
+                    )
                   )
                 GROUP BY p.id
                 ON CONFLICT (product_id, category_id, match_source)
@@ -273,7 +454,7 @@ class CategoryIndexService:
         self.db.execute(text("DELETE FROM parser_product_category_match WHERE match_source IN ('auto', 'designer')"))
         self.db.execute(
             text(
-                """
+                f"""
                 INSERT INTO parser_product_category_match (product_id, category_id, match_source, score, created_at, updated_at)
                 WITH designers_root AS (
                     SELECT c.id
@@ -293,24 +474,10 @@ class CategoryIndexService:
                     JOIN designers_root r ON c.parent_id = r.id
                     WHERE c.deleted_at IS NULL
                 ),
-                product_with_vendor AS (
-                    SELECT
-                        p.id,
-                        p.title,
-                        p.product_type,
-                        p.status,
-                        p.deleted_at,
-                        trim(coalesce(
-                            (
-                                SELECT bm.target_brand
-                                FROM parser_brand_mapping bm
-                                WHERE bm.source_brand_key = regexp_replace(lower(trim(coalesce(p.vendor, ''))), '[^[:alnum:]]+', '', 'g')
-                                LIMIT 1
-                            ),
-                            p.vendor
-                        )) AS mapped_vendor
-                    FROM parser_product p
-                ),
+                {_CATEGORY_GENDER_CONSTRAINT_CTE},
+                {_PRODUCT_WITH_VENDOR_CTE},
+                {_PRODUCT_WITH_GENDER_CTE},
+                {_gender_inferred_cte_sql()},
                 auto_matches AS (
                     SELECT
                         p.id AS product_id,
@@ -318,19 +485,28 @@ class CategoryIndexService:
                         'auto' AS match_source,
                         SUM(char_length(k.keyword))::int AS score
                     FROM product_with_vendor p
+                    JOIN gender_inferred gi ON gi.id = p.id
                     JOIN parser_category_keyword k ON TRUE
                     JOIN parser_category c ON c.id = k.category_id
+                    LEFT JOIN category_gender_constraint cgc ON cgc.category_id = c.id
                     WHERE p.deleted_at IS NULL
                       AND c.deleted_at IS NULL
                       AND c.is_fallback IS FALSE
                       AND c.is_enabled IS TRUE
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM parser_category ch
+                        WHERE ch.parent_id = c.id
+                          AND ch.deleted_at IS NULL
+                      )
+                      AND (
+                        cgc.required_gender IS NULL
+                        OR cgc.required_gender = gi.inferred_gender
+                        OR gi.inferred_gender = 'unisex'
+                      )
                       AND char_length(trim(k.keyword)) > 0
                       AND (
-                        (k.keyword_scope = 'local' AND strpos(lower(trim(coalesce(p.mapped_vendor, '') || ' ' || coalesce(p.product_type, ''))), lower(k.keyword)) > 0)
-                        OR
-                        (k.keyword_scope = 'title' AND strpos(lower(trim(coalesce(p.title, ''))), lower(k.keyword)) > 0)
-                        OR
-                        (k.keyword_scope = 'status' AND lower(trim(p.status::text)) = lower(trim(k.keyword)))
+                        {_KEYWORD_MATCH_PREDICATE}
                       )
                     GROUP BY p.id, k.category_id
                 ),

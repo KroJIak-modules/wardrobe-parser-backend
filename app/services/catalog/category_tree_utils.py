@@ -6,6 +6,8 @@ from app.models import ParserCategory
 from app.repositories import ParserCategoryKeywordRepository
 from app.schemas.parser import CategoryTreeNodeResponse
 
+_PROTECTED_ROOT_SLUGS = {"muzhskoe", "zhenskoe"}
+
 
 def build_tree(
     categories: list[ParserCategory],
@@ -31,7 +33,7 @@ def build_tree(
         raw_children = by_parent.get(node.id, [])
         next_in_designers = in_designers_branch or (designers_root_id is not None and int(node.id) == int(designers_root_id))
         children = [walk(child, next_in_designers) for child in raw_children]
-        is_system = bool(node.is_fallback) or next_in_designers
+        is_system = bool(node.is_fallback) or next_in_designers or (str(getattr(node, "slug", "")).strip().lower() in _PROTECTED_ROOT_SLUGS)
         has_children = len(raw_children) > 0
         keywords_editable = (not is_system) and (not has_children)
         if not keywords_editable:
@@ -112,10 +114,14 @@ def build_single_node_response(
         is_fallback=category.is_fallback,
         is_favorite=bool(getattr(category, "is_favorite", False)),
         is_enabled=bool(getattr(category, "is_enabled", True)),
-        is_system=bool(category.is_fallback),
+        is_system=bool(category.is_fallback) or (str(getattr(category, "slug", "")).strip().lower() in _PROTECTED_ROOT_SLUGS),
         has_children=False,
-        keywords_editable=not bool(category.is_fallback),
-        keywords_locked_reason=None,
+        keywords_editable=not (bool(category.is_fallback) or (str(getattr(category, "slug", "")).strip().lower() in _PROTECTED_ROOT_SLUGS)),
+        keywords_locked_reason=(
+            "У системной категории ключевые слова недоступны."
+            if (bool(category.is_fallback) or (str(getattr(category, "slug", "")).strip().lower() in _PROTECTED_ROOT_SLUGS))
+            else None
+        ),
         is_designers_root=False,
         is_in_designers_branch=False,
         product_count=0,

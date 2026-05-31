@@ -49,6 +49,8 @@ _CYRILLIC_TO_LATIN = {
     "я": "ya",
 }
 
+_PROTECTED_ROOT_SLUGS = {"muzhskoe", "zhenskoe"}
+
 
 def _transliterate(value: str) -> str:
     chunks: list[str] = []
@@ -118,3 +120,7 @@ def normalize_keyword(keyword: str) -> str:
     if not normalized:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ключевое слово не может быть пустым")
     return normalized
+
+
+def is_protected_root_category_slug(slug: str | None) -> bool:
+    return str(slug or "").strip().lower() in _PROTECTED_ROOT_SLUGS

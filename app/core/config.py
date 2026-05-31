@@ -62,6 +62,18 @@ class Settings(BaseSettings):
     admin_refresh_token_ttl_sec: int = Field(default=604_800, ge=3600, le=7_776_000, validation_alias="ADMIN_REFRESH_TOKEN_TTL_SEC")
     admin_token_secret: str = Field(default="", validation_alias="ADMIN_TOKEN_SECRET")
     admin_auth_cookie_secure: bool = Field(default=False, validation_alias="ADMIN_AUTH_COOKIE_SECURE")
+    category_gender_profile_min_samples: int = Field(
+        default=5,
+        ge=1,
+        le=1000,
+        validation_alias="CATEGORY_GENDER_PROFILE_MIN_SAMPLES",
+    )
+    category_gender_profile_min_confidence: float = Field(
+        default=0.95,
+        ge=0.5,
+        le=1.0,
+        validation_alias="CATEGORY_GENDER_PROFILE_MIN_CONFIDENCE",
+    )
 
     @model_validator(mode="after")
     def build_database_url(self) -> "Settings":

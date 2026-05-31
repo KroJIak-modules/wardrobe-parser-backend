@@ -37,6 +37,7 @@ from app.services.catalog.category_index_service import CategoryIndexService
 from app.services.catalog.category_tree_rules import (
     build_unique_slug,
     ensure_fallback,
+    is_protected_root_category_slug,
     normalize_keyword,
     slugify,
     validate_parent_for_create,
@@ -473,7 +474,7 @@ class CategoryTreeService:
         if not category or category.deleted_at is not None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Категория не найдена")
         in_designers_branch = int(category.id) in designers_branch_ids
-        is_system = bool(category.is_fallback) or in_designers_branch
+        is_system = bool(category.is_fallback) or in_designers_branch or is_protected_root_category_slug(category.slug)
 
         if payload.name is not None:
             if is_system:
@@ -520,6 +521,8 @@ class CategoryTreeService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Категория не найдена")
         if category.is_fallback:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Категорию 'Прочее' нельзя удалить")
+        if is_protected_root_category_slug(category.slug):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Категории 'Мужское' и 'Женское' нельзя удалить")
         if int(category.id) in designers_branch_ids:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ветка «Дизайнеры» синхронизируется автоматически и не удаляется вручную")
         if self.category_repo.get_children(category_id):
