@@ -178,6 +178,7 @@ def _map_source(db: Session, item: dict) -> dict:
     last_sync_status = str(getattr(profile, "last_sync_status", "") or "").strip().lower() if profile is not None else ""
     is_password_protected = last_sync_status == "password_protected"
     cfg = item.get("config") if isinstance(item.get("config"), dict) else {}
+    supplier = getattr(profile, "supplier", None) if profile is not None else None
     currency_method, locked_currency = _currency_method_from_config(cfg)
     source_mode = str(cfg.get("mode") or "auto").strip().lower()
     if source_mode not in {"auto", "manual"}:
@@ -214,6 +215,8 @@ def _map_source(db: Session, item: dict) -> dict:
         "is_auto_ingest": is_auto_ingest,
         "is_personal": False,
         "supplier_id": int(getattr(profile, "supplier_id", 0) or 0) if profile is not None else None,
+        "supplier_key": str(getattr(supplier, "key", "") or "") or None,
+        "supplier_name": str(getattr(supplier, "name", "") or "") or None,
         "promo_factor": float(getattr(profile, "promo_factor", 1.0) or 1.0) if profile is not None else 1.0,
         "promo_only_no_discount": bool(getattr(profile, "promo_only_no_discount", False)) if profile is not None else False,
         "buyout_surcharge_value": float(getattr(profile, "buyout_surcharge_value", 0.0) or 0.0) if profile is not None else 0.0,
@@ -221,23 +224,21 @@ def _map_source(db: Session, item: dict) -> dict:
     }
 
 
-def _get_or_create_manual_source(db: Session) -> ParserSource:
-    existing = (
+def _get_manual_source(db: Session) -> ParserSource | None:
+    return (
         db.query(ParserSource)
         .filter(ParserSource.deleted_at.is_(None))
         .filter(ParserSource.name == _MANUAL_SOURCE_NAME)
         .first()
     )
-    if existing is not None:
-        return existing
-    supplier = db.query(ParserSupplier).order_by(ParserSupplier.id.asc()).first()
-    if supplier is None:
-        raise HTTPException(status_code=500, detail="Нет доступного supplier для личного источника")
+
+
+def _create_manual_source(db: Session, *, supplier_id: int) -> ParserSource:
     source = ParserSource(
         name=_MANUAL_SOURCE_NAME,
         url=_MANUAL_SOURCE_URL,
         enabled=True,
-        supplier_id=int(supplier.id),
+        supplier_id=int(supplier_id),
         show_description=True,
         show_images=True,
         hide_auto_added_products=False,
@@ -248,8 +249,19 @@ def _get_or_create_manual_source(db: Session) -> ParserSource:
     return source
 
 
+def _require_manual_source(db: Session) -> ParserSource:
+    existing = _get_manual_source(db)
+    if existing is not None:
+        return existing
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Сначала назначьте тариф для личного каталога",
+    )
+
+
 def _map_manual_source(db: Session, source: ParserSource) -> dict:
     total_manual, manual_only, bound_sync = _manual_products_breakdown(db, int(source.id))
+    supplier = getattr(source, "supplier", None)
     return {
         "key": _MANUAL_SOURCE_KEY,
         "source_id": int(source.id),
@@ -279,10 +291,51 @@ def _map_manual_source(db: Session, source: ParserSource) -> dict:
         "is_auto_ingest": None,
         "is_personal": True,
         "supplier_id": int(getattr(source, "supplier_id", 0) or 0),
+        "supplier_key": str(getattr(supplier, "key", "") or "") or None,
+        "supplier_name": str(getattr(supplier, "name", "") or "") or None,
         "promo_factor": float(getattr(source, "promo_factor", 1.0) or 1.0),
         "promo_only_no_discount": bool(getattr(source, "promo_only_no_discount", False)),
         "buyout_surcharge_value": float(getattr(source, "buyout_surcharge_value", 0.0) or 0.0),
         "buyout_surcharge_currency": str(getattr(source, "buyout_surcharge_currency", "USD") or "USD"),
+    }
+
+
+def _map_virtual_manual_source() -> dict:
+    return {
+        "key": _MANUAL_SOURCE_KEY,
+        "source_id": None,
+        "service_source_id": 0,
+        "name": "Личный каталог",
+        "base_url": "",
+        "parser_type": "backend_manual",
+        "enabled": True,
+        "sync_enabled": True,
+        "hide_auto_added_products": False,
+        "show_description": True,
+        "show_images": True,
+        "currency_priority": [],
+        "currency_method": "priority_list",
+        "locked_currency": "",
+        "currency_priority_editable": False,
+        "notes": None,
+        "status_label": None,
+        "products_count": 0,
+        "manual_products_count": 0,
+        "bound_sync_products_count": 0,
+        "categories_count": 0,
+        "last_sync_at": None,
+        "last_sync_duration_sec": None,
+        "last_sync_status": None,
+        "is_password_protected": None,
+        "is_auto_ingest": None,
+        "is_personal": True,
+        "supplier_id": None,
+        "supplier_key": None,
+        "supplier_name": None,
+        "promo_factor": 1.0,
+        "promo_only_no_discount": False,
+        "buyout_surcharge_value": 0.0,
+        "buyout_surcharge_currency": "USD",
     }
 
 
@@ -319,16 +372,17 @@ class SourceSupplierPayload(BaseModel):
 
 @router.get("/sources", dependencies=[Depends(require_permission("control.sources.read"))])
 def list_sources(db: Session = Depends(get_db)) -> list[dict]:
-    manual_source = _get_or_create_manual_source(db)
+    manual_source = _get_manual_source(db)
     items = _service_list()
     mapped = [_map_source(db, item) for item in items]
-    return [_map_manual_source(db, manual_source), *mapped]
+    manual_item = _map_manual_source(db, manual_source) if manual_source is not None else _map_virtual_manual_source()
+    return [manual_item, *mapped]
 
 
 @router.patch("/sources/{source_key}/enabled", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_enabled(source_key: str, payload: EnabledPayload, db: Session = Depends(get_db)) -> dict:
     if source_key == _MANUAL_SOURCE_KEY:
-        profile = _get_or_create_manual_source(db)
+        profile = _require_manual_source(db)
         profile.enabled = bool(payload.enabled)
         db.commit()
         db.refresh(profile)
@@ -351,7 +405,7 @@ def patch_sync_enabled(source_key: str, payload: SyncEnabledPayload, db: Session
     if source_key == _MANUAL_SOURCE_KEY:
         # Personal source sync toggle is UI-visible and accepted, but currently
         # manual source always participates as backend-only source.
-        profile = _get_or_create_manual_source(db)
+        profile = _require_manual_source(db)
         return _map_manual_source(db, profile)
     _service_patch(source_key, {"sync_enabled": bool(payload.sync_enabled)})
     items = _service_list()
@@ -364,7 +418,7 @@ def patch_sync_enabled(source_key: str, payload: SyncEnabledPayload, db: Session
 @router.patch("/sources/{source_key}/hide-auto-added-products", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_hide_auto(source_key: str, payload: HideAutoPayload, db: Session = Depends(get_db)) -> dict:
     if source_key == _MANUAL_SOURCE_KEY:
-        profile = _get_or_create_manual_source(db)
+        profile = _require_manual_source(db)
         profile.hide_auto_added_products = bool(payload.hide_auto_added_products)
         rows = (
             db.query(ParserProduct)
@@ -427,7 +481,7 @@ def patch_hide_auto(source_key: str, payload: HideAutoPayload, db: Session = Dep
 @router.patch("/sources/{source_key}/attribute-visibility", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_attr_visibility(source_key: str, payload: AttrVisibilityPayload, db: Session = Depends(get_db)) -> dict:
     if source_key == _MANUAL_SOURCE_KEY:
-        profile = _get_or_create_manual_source(db)
+        profile = _require_manual_source(db)
         if payload.show_description is not None:
             setattr(profile, "show_description", bool(payload.show_description))
         if payload.show_images is not None:
@@ -500,7 +554,9 @@ def patch_source_supplier(source_key: str, payload: SourceSupplierPayload, db: S
         raise HTTPException(status_code=400, detail="Некорректный promo_factor")
 
     if source_key == _MANUAL_SOURCE_KEY:
-        profile = _get_or_create_manual_source(db)
+        profile = _get_manual_source(db)
+        if profile is None:
+            profile = _create_manual_source(db, supplier_id=int(payload.supplier_id))
         profile.supplier_id = int(payload.supplier_id)
         profile.promo_factor = float(payload.promo_factor)
         profile.promo_only_no_discount = bool(payload.promo_only_no_discount)

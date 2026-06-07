@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
-import re
 from typing import Any
+from uuid import uuid4
 import requests
 
 from fastapi import HTTPException, status
@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings as app_settings
-from app.models import AdminUiSettings, ParserSource, ParserSupplier
+from app.models import AdminUiSettings, ParserSupplier
 from app.repositories import ParserPricingSettingsRepository, ParserSourceRepository, ParserSupplierRepository
 from app.schemas.parser import (
     AdminUiSettingsResponse,
@@ -98,98 +98,6 @@ _DEFAULT_SERVICE_FEE_RULES: list[dict[str, Any]] = [
     {"min_rub": 40000.0, "max_rub": None, "mode": "percent", "value": 0.15},
 ]
 
-_DEFAULT_SHIPPING_RULES: dict[str, dict[str, list[dict[str, Any]]]] = {
-    "US": {
-        "normal": [
-            {"min_kg": 0.0, "max_kg": 0.5, "rub": 1400.0},
-            {"min_kg": 0.5, "max_kg": 1.0, "rub": 1650.0},
-            {"min_kg": 1.0, "max_kg": 1.5, "rub": 2250.0},
-            {"min_kg": 1.5, "max_kg": 2.0, "rub": 2900.0},
-            {"min_kg": 2.0, "max_kg": 2.5, "rub": 3500.0},
-            {"min_kg": 2.5, "max_kg": None, "rub": 4100.0},
-        ],
-        "alt": [
-            {"min_kg": 0.0, "max_kg": 0.5, "rub": 1700.0},
-            {"min_kg": 0.5, "max_kg": 1.0, "rub": 3350.0},
-            {"min_kg": 1.0, "max_kg": 1.5, "rub": 4100.0},
-            {"min_kg": 1.5, "max_kg": 2.0, "rub": 4950.0},
-            {"min_kg": 2.0, "max_kg": 2.5, "rub": 5650.0},
-            {"min_kg": 2.5, "max_kg": None, "rub": 6500.0},
-        ],
-    },
-    "EU": {
-        "normal": [
-            {"min_kg": 0.0, "max_kg": 0.5, "rub": 1100.0},
-            {"min_kg": 0.5, "max_kg": 1.0, "rub": 1500.0},
-            {"min_kg": 1.0, "max_kg": 1.5, "rub": 1900.0},
-            {"min_kg": 1.5, "max_kg": 2.0, "rub": 2300.0},
-            {"min_kg": 2.0, "max_kg": 2.5, "rub": 2700.0},
-            {"min_kg": 2.5, "max_kg": None, "rub": 3150.0},
-        ],
-        "alt": [
-            {"min_kg": 0.0, "max_kg": 0.5, "rub": 2300.0},
-            {"min_kg": 0.5, "max_kg": 1.0, "rub": 2750.0},
-            {"min_kg": 1.0, "max_kg": 1.5, "rub": 3750.0},
-            {"min_kg": 1.5, "max_kg": 2.0, "rub": 4800.0},
-            {"min_kg": 2.0, "max_kg": 2.5, "rub": 5800.0},
-            {"min_kg": 2.5, "max_kg": None, "rub": 6800.0},
-        ],
-    },
-    "UK": {
-        "normal": [
-            {"min_kg": 0.0, "max_kg": 0.5, "rub": 3400.0},
-            {"min_kg": 0.5, "max_kg": 1.0, "rub": 3900.0},
-            {"min_kg": 1.0, "max_kg": 1.5, "rub": 4400.0},
-            {"min_kg": 1.5, "max_kg": 2.0, "rub": 4900.0},
-            {"min_kg": 2.0, "max_kg": 2.5, "rub": 5450.0},
-            {"min_kg": 2.5, "max_kg": None, "rub": 5950.0},
-        ],
-        "alt": [],
-    },
-}
-
-_PRODUCTION_SUPPLIER_PRESETS: list[dict[str, Any]] = [
-    {
-        "alias_keys": ["us-express-test", "us-main", "default"],
-        "key": "usa",
-        "name": "США",
-        "category": "main",
-        "rate_currency": "RUB",
-    },
-    {
-        "alias_keys": ["us-alt", "usa-alt-1"],
-        "key": "usa-alt-1",
-        "name": "ALT 1 США",
-        "category": "alt",
-        "parent_key": "usa",
-        "alt_position": 1,
-        "rate_currency": "RUB",
-    },
-    {
-        "alias_keys": ["eu-priority-test", "eu-main"],
-        "key": "eu",
-        "name": "ЕС",
-        "category": "main",
-        "rate_currency": "RUB",
-    },
-    {
-        "alias_keys": ["eu-economy-test", "eu-alt", "eu-alt-1"],
-        "key": "eu-alt-1",
-        "name": "ALT 1 ЕС",
-        "category": "alt",
-        "parent_key": "eu",
-        "alt_position": 1,
-        "rate_currency": "RUB",
-    },
-    {
-        "alias_keys": ["uk-main", "gb-main"],
-        "key": "uk",
-        "name": "Великобритания",
-        "category": "main",
-        "rate_currency": "RUB",
-    },
-]
-
 @dataclass(slots=True)
 class ProductPricingComputation:
     final_price_rub: float | None
@@ -207,65 +115,6 @@ class PricingSettingsService:
         self.repo = ParserPricingSettingsRepository(db)
         self.supplier_repo = ParserSupplierRepository(db)
         self.source_repo = ParserSourceRepository(db)
-
-    def _bootstrap_suppliers(self) -> bool:
-        changed = False
-        created_or_matched: dict[str, ParserSupplier] = {}
-        for preset in _PRODUCTION_SUPPLIER_PRESETS:
-            canonical = self.supplier_repo.get_by_key(str(preset["key"]))
-            alias_items = [
-                item
-                for item in (self.supplier_repo.get_by_key(str(raw_key)) for raw_key in preset["alias_keys"])
-                if item is not None
-            ]
-            target = canonical or (alias_items[0] if alias_items else None)
-            if target is None:
-                target = self.supplier_repo.create(
-                    key=str(preset["key"]),
-                    name=str(preset["name"]),
-                    category=self._normalize_supplier_category(str(preset.get("category") or "main")),
-                    rate_currency=str(preset["rate_currency"]),
-                )
-                self.supplier_repo.flush()
-                changed = True
-
-            for alias in alias_items:
-                if alias.id == target.id:
-                    continue
-                self.db.query(ParserSource).filter(ParserSource.supplier_id == alias.id).update(
-                    {ParserSource.supplier_id: target.id},
-                    synchronize_session=False,
-                )
-                self.db.delete(alias)
-                changed = True
-
-            # One-time key migration from alias key to canonical key.
-            if canonical is None and target.key != preset["key"]:
-                target.key = str(preset["key"])
-                changed = True
-            created_or_matched[str(preset["key"])] = target
-
-        for preset in _PRODUCTION_SUPPLIER_PRESETS:
-            target = created_or_matched[str(preset["key"])]
-            if preset.get("category") == "alt":
-                parent = created_or_matched.get(str(preset.get("parent_key") or ""))
-                parent_id = int(parent.id) if parent is not None else None
-                if parent_id is not None and getattr(target, "parent_supplier_id", None) != parent_id:
-                    target.parent_supplier_id = parent_id
-                    changed = True
-                desired_pos = int(preset.get("alt_position") or 1)
-                if int(getattr(target, "alt_position", 0) or 0) != desired_pos:
-                    target.alt_position = desired_pos
-                    changed = True
-            else:
-                if getattr(target, "parent_supplier_id", None) is not None:
-                    target.parent_supplier_id = None
-                    changed = True
-                if int(getattr(target, "alt_position", 0) or 0) != 0:
-                    target.alt_position = 0
-                    changed = True
-
-        return changed
 
     @staticmethod
     def _normalize_currency(raw: str | None, *, default: str = "RUB", allowed: set[str] | None = None) -> str:
@@ -296,6 +145,16 @@ class PricingSettingsService:
         if value not in {"main", "alt"}:
             return default
         return value
+
+    @staticmethod
+    def _build_supplier_key(supplier_id: int) -> str:
+        return f"supplier-{int(supplier_id)}"
+
+    @staticmethod
+    def _read_row_value(row: Any, key: str) -> Any:
+        if isinstance(row, dict):
+            return row.get(key)
+        return getattr(row, key, None)
 
     @staticmethod
     def _validate_alt_parent(parent: ParserSupplier | None) -> ParserSupplier:
@@ -518,12 +377,12 @@ class PricingSettingsService:
         normalized: list[dict[str, Any]] = []
         threshold_points: list[tuple[float, float]] = []
         for row in rows:
-            if not isinstance(row, dict):
+            if row is None:
                 continue
-            min_kg = PricingSettingsService._safe_float(row.get("min_kg"))
-            max_kg = PricingSettingsService._safe_float(row.get("max_kg"))
-            kg = PricingSettingsService._safe_float(row.get("kg"))
-            rub = PricingSettingsService._safe_float(row.get("rub"))
+            min_kg = PricingSettingsService._safe_float(PricingSettingsService._read_row_value(row, "min_kg"))
+            max_kg = PricingSettingsService._safe_float(PricingSettingsService._read_row_value(row, "max_kg"))
+            kg = PricingSettingsService._safe_float(PricingSettingsService._read_row_value(row, "kg"))
+            rub = PricingSettingsService._safe_float(PricingSettingsService._read_row_value(row, "rub"))
             safe_rub = max(0.0, float(rub or 0.0))
             if min_kg is not None or max_kg is not None:
                 safe_min = max(0.0, float(min_kg or 0.0))
@@ -546,26 +405,6 @@ class PricingSettingsService:
                 normalized.append({"min_kg": previous_kg, "max_kg": None, "rub": float(normalized[-1]["rub"])})
         normalized.sort(key=lambda item: (float(item.get("min_kg") or 0.0), float(item.get("max_kg") or float("inf"))))
         return normalized
-
-    @staticmethod
-    def _normalize_shipping_rules(raw_rules: Any) -> dict[str, dict[str, list[dict[str, Any]]]]:
-        rules = raw_rules if isinstance(raw_rules, dict) else {}
-        output: dict[str, dict[str, list[dict[str, Any]]]] = {}
-        for region in ("US", "EU", "UK"):
-            region_payload = rules.get(region) if isinstance(rules.get(region), dict) else {}
-            output[region] = {
-                "normal": PricingSettingsService._normalize_shipping_rows(region_payload.get("normal")),
-                "alt": PricingSettingsService._normalize_shipping_rows(region_payload.get("alt")),
-            }
-        # Fill gaps by defaults to avoid broken calculations
-        for region, region_default in _DEFAULT_SHIPPING_RULES.items():
-            if not output[region]["normal"]:
-                output[region]["normal"] = [dict(row) for row in region_default.get("normal", [])]
-            if region in {"US", "EU"} and not output[region]["alt"]:
-                output[region]["alt"] = [dict(row) for row in region_default.get("alt", [])]
-            if region == "UK":
-                output[region]["alt"] = []
-        return output
 
     @staticmethod
     def _normalize_image_asset_ids(raw: Any, *, limit: int) -> list[int]:
@@ -664,10 +503,6 @@ class PricingSettingsService:
             entity.svc_rules = normalized_svc_rules
             changed = True
 
-        normalized_shipping = cls._normalize_shipping_rules(getattr(entity, "shipping_rules", None))
-        if normalized_shipping != (getattr(entity, "shipping_rules", None) or {}):
-            entity.shipping_rules = normalized_shipping
-            changed = True
         return changed
 
     @staticmethod
@@ -731,7 +566,6 @@ class PricingSettingsService:
         return True, "live_updated", snapshot, None
 
     def get_settings(self, *, refresh_bybit: bool = True) -> PricingSettingsResponse:
-        bootstrap_changed = self._bootstrap_suppliers()
         entity, created = self.repo.get_or_create_default()
         defaults_changed = self._coerce_settings_defaults(entity)
         bybit_status = "skipped"
@@ -750,7 +584,7 @@ class PricingSettingsService:
             bybit_error = str(getattr(entity, "bybit_last_error", "") or "") or None
             if bybit_error:
                 bybit_warning = f"WARN: Bybit временно недоступен, используется сохраненный курс. Причина: {bybit_error}"
-        if created or bootstrap_changed or defaults_changed or bybit_changed:
+        if created or defaults_changed or bybit_changed:
             self.db.commit()
             self.db.refresh(entity)
         suppliers = self.supplier_repo.list_all_with_rates()
@@ -764,7 +598,6 @@ class PricingSettingsService:
         )
 
     def update_settings(self, payload: PricingSettingsUpdateRequest) -> PricingSettingsResponse:
-        bootstrap_changed = self._bootstrap_suppliers()
         entity, created = self.repo.get_or_create_default()
         patch = payload.model_dump(exclude_none=True)
         for forbidden_key in ("usd_to_rub", "eur_to_rub", "bybit_usdt_to_rub"):
@@ -801,8 +634,6 @@ class PricingSettingsService:
         if "svc_rules" in patch:
             patch["svc_rules"] = self._normalize_svc_rules(patch.get("svc_rules"))
             self._validate_svc_rules_no_overlap(patch["svc_rules"])
-        if "shipping_rules" in patch:
-            patch["shipping_rules"] = self._normalize_shipping_rules(patch.get("shipping_rules"))
         if "dedup_only_available_products" in patch:
             patch["dedup_only_available_products"] = bool(patch.get("dedup_only_available_products"))
         if "show_product_description" in patch:
@@ -811,7 +642,7 @@ class PricingSettingsService:
             setattr(entity, key, value)
         defaults_changed = self._coerce_settings_defaults(entity)
         self.db.commit()
-        if created or patch or defaults_changed or bootstrap_changed:
+        if created or patch or defaults_changed:
             self.db.refresh(entity)
         suppliers = self.supplier_repo.list_all_with_rates()
         return self._to_response(entity, suppliers=suppliers)
@@ -840,7 +671,6 @@ class PricingSettingsService:
         )
         normalized_svc_rules = PricingSettingsService._normalize_svc_rules(getattr(entity, "svc_rules", None))
         PricingSettingsService._validate_svc_rules_no_overlap(normalized_svc_rules)
-        normalized_shipping = PricingSettingsService._normalize_shipping_rules(getattr(entity, "shipping_rules", None))
         bybit_bucket_rates = PricingSettingsService._normalize_bybit_bucket_rates(
             getattr(entity, "bybit_bucket_rates", None),
             step_usdt=int(app_settings.pricing_bybit_bucket_step_usdt),
@@ -892,7 +722,6 @@ class PricingSettingsService:
             svc_rules=normalized_svc_rules,
             insurance_rules=normalized_insurance,
             service_fee_rules=normalized_service_fee,
-            shipping_rules=normalized_shipping,
             bybit_rate_status=bybit_rate_status,
             bybit_rate_warning=bybit_rate_warning,
             bybit_bucket_step_usdt=int(app_settings.pricing_bybit_bucket_step_usdt),
@@ -1031,20 +860,7 @@ class PricingSettingsService:
             ],
         )
 
-    @staticmethod
-    def _default_tariff_ranges(*, region: str, mode: str) -> list[dict[str, Any]]:
-        defaults = _DEFAULT_SHIPPING_RULES.get(region, {}).get(mode, [])
-        return [
-            {
-                "min_kg": float(item["min_kg"]),
-                "max_kg": (float(item["max_kg"]) if item.get("max_kg") is not None else None),
-                "rub": float(item["rub"]),
-            }
-            for item in defaults
-        ]
-
     def update_supplier(self, supplier_id: int, payload: PricingSupplierUpdateRequest) -> PricingSupplierResponse:
-        self._bootstrap_suppliers()
         supplier = self.supplier_repo.get_by_id(supplier_id)
         if supplier is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Тариф не найден")
@@ -1077,20 +893,6 @@ class PricingSettingsService:
         )
 
     def create_supplier(self, payload: PricingSupplierCreateRequest) -> PricingSupplierResponse:
-        self._bootstrap_suppliers()
-
-        base_key = (payload.key or "").strip().lower()
-        if not base_key:
-            base_key = re.sub(r"[^a-z0-9]+", "-", payload.name.lower()).strip("-")
-        if not base_key:
-            base_key = "supplier"
-
-        key = base_key
-        suffix = 2
-        while self.supplier_repo.get_by_key(key) is not None:
-            key = f"{base_key}-{suffix}"
-            suffix += 1
-
         parent_supplier_id = payload.parent_supplier_id
         parent_supplier = None
         if parent_supplier_id is not None:
@@ -1109,7 +911,7 @@ class PricingSettingsService:
             )
         )
         supplier = self.supplier_repo.create(
-            key=key,
+            key=f"pending-{uuid4().hex}",
             name=payload.name.strip(),
             category=(
                 "alt"
@@ -1121,13 +923,10 @@ class PricingSettingsService:
             rate_currency=self._normalize_currency(payload.rate_currency, default="RUB"),
         )
         self.supplier_repo.flush()
+        supplier.key = self._build_supplier_key(int(supplier.id))
         settings_entity, _ = self.repo.get_or_create_default()
         usd_to_rub_effective, eur_to_rub_effective = self._effective_rates_from_entity(settings_entity)
         incoming_rates = self._normalize_shipping_rows(payload.rates or [])
-        if not incoming_rates:
-            region = self._infer_shipping_region(supplier.name, supplier.key)
-            mode = "alt" if supplier.parent_supplier_id is not None else "normal"
-            incoming_rates = self._default_tariff_ranges(region=region, mode=mode)
         self.supplier_repo.replace_ranges(supplier_id=int(supplier.id), ranges=incoming_rates)
         self.db.commit()
         created = self.supplier_repo.get_by_id(int(supplier.id))
@@ -1183,7 +982,6 @@ class PricingSettingsService:
                 "supplier_id": supplier_id,
                 "supplier_key": None,
                 "supplier_name": None,
-                "shipping_region": "EU",
                 "shipping_mode": "normal",
                 "shipping_billable_kg": round(float(billable_kg), 4),
                 "shipping_rate_mode": "missing_supplier",
@@ -1202,46 +1000,21 @@ class PricingSettingsService:
             candidates = alternatives if alternatives else [selected]
 
         selected_candidate = candidates[0] if candidates else selected
-        region = PricingSettingsService._infer_shipping_region(selected_candidate.name, selected_candidate.key)
         tariff_rows = selected_candidate.rates or []
         normalized_tariff_rows = PricingSettingsService._normalize_shipping_rows(tariff_rows)
-        if normalized_tariff_rows:
-            value, meta = PricingSettingsService._resolve_tariff_by_weight(
-                rows=normalized_tariff_rows,
-                billable_kg=billable_kg,
-            )
-        else:
-            shipping_tree = settings.shipping_rules or {}
-            region_tree = shipping_tree.get(region) if isinstance(shipping_tree, dict) else None
-            mode_rows: list[dict[str, Any]] = []
-            if isinstance(region_tree, dict):
-                raw_rows = region_tree.get(mode) or []
-                if isinstance(raw_rows, list):
-                    mode_rows = [row for row in raw_rows if isinstance(row, dict)]
-            value, meta = PricingSettingsService._resolve_tariff_by_weight(
-                rows=mode_rows,
-                billable_kg=billable_kg,
-            )
+        value, meta = PricingSettingsService._resolve_tariff_by_weight(
+            rows=normalized_tariff_rows,
+            billable_kg=billable_kg,
+        )
 
         return float(value or 0.0), {
             "supplier_id": selected_candidate.id,
             "supplier_key": selected_candidate.key,
             "supplier_name": selected_candidate.name,
-            "shipping_region": region,
             "shipping_mode": mode,
             "shipping_billable_kg": round(float(billable_kg), 4),
             **meta,
         }
-
-    @staticmethod
-    def _infer_shipping_region(supplier_name: str | None, supplier_key: str | None) -> str:
-        name_value = (supplier_name or "").strip().upper()
-        key_value = (supplier_key or "").strip().lower()
-        if name_value == "US" or key_value.startswith("us-"):
-            return "US"
-        if name_value in {"UK", "GB"} or key_value.startswith("uk-") or key_value.startswith("gb-"):
-            return "UK"
-        return "EU"
 
     @staticmethod
     def _resolve_tariff_by_weight(*, rows: list[dict[str, Any]], billable_kg: float) -> tuple[float, dict[str, Any]]:
@@ -1627,6 +1400,24 @@ class PricingSettingsService:
             use_alt_rate=use_alt_shipping,
             settings=settings,
         )
+        shipping_rate_mode = str(supplier_meta.get("shipping_rate_mode") or "").strip().lower()
+        if shipping_rate_mode in {"missing_supplier", "missing_tariff"}:
+            return ProductPricingComputation(
+                final_price_rub=None,
+                manual_required=True,
+                reason=shipping_rate_mode,
+                components={
+                    "source_price": round(float(source_price), 4),
+                    "source_currency": currency,
+                    "weight_grams": round(float(weight_grams), 4),
+                    "weight_tolerance": round(settings.weight_tolerance, 6),
+                    "effective_weight_grams": round(effective_weight_grams, 4),
+                    "billable_weight_kg": round(billable_kg, 4),
+                    "supplier_transport_rub": 0.0,
+                    "delivery_rub": 0.0,
+                    **supplier_meta,
+                },
+            )
         delivery_rub = supplier_shipping_rub
 
         svc_rule = PricingSettingsService._pick_range_rule(

@@ -74,7 +74,6 @@ _PRICING_EXPORT_FIELDS = [
     "svc_rules",
     "insurance_rules",
     "service_fee_rules",
-    "shipping_rules",
 ]
 
 _PRICING_IMPORT_FIELDS = set(_PRICING_EXPORT_FIELDS)
@@ -513,7 +512,6 @@ class SettingsTransferService:
     ) -> int:
         if not supplier_map:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет тарифов для назначения источникам")
-        fallback_supplier = next(iter(supplier_map.values()))
         updated = 0
         service_sources = self._service_list()
         service_by_host: dict[str, dict[str, Any]] = {}
@@ -529,12 +527,13 @@ class SettingsTransferService:
                 .filter(ParserSource.url == item.url)
                 .first()
             )
-            supplier = (
-                supplier_map.get(item.supplier_key)
-                if item.supplier_key
-                else None
-            )
-            supplier_id = int((supplier or fallback_supplier).id)
+            supplier = supplier_map.get(item.supplier_key) if item.supplier_key else None
+            if supplier is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Для источника '{item.name}' не найден назначенный тариф",
+                )
+            supplier_id = int(supplier.id)
             if existing is None:
                 self.db.add(
                     ParserSource(

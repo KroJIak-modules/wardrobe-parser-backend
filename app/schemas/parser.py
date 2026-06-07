@@ -160,7 +160,6 @@ class PricingSettingsUpdateRequest(BaseModel):
     svc_rules: list[dict] | None = None
     insurance_rules: list[dict] | None = None
     service_fee_rules: list[dict] | None = None
-    shipping_rules: dict[str, dict[str, list[dict]]] | None = None
 
 
 class ShowcaseMediaSettingsUpdateRequest(BaseModel):
@@ -229,7 +228,6 @@ class PricingSupplierUpdateRequest(BaseModel):
 
 
 class PricingSupplierCreateRequest(BaseModel):
-    key: str | None = Field(default=None, min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=255)
     category: str = Field(default="main", min_length=3, max_length=16)
     parent_supplier_id: int | None = None
@@ -261,7 +259,6 @@ class PricingSettingsResponse(BaseModel):
     svc_rules: list[dict] = Field(default_factory=list)
     insurance_rules: list[dict] = Field(default_factory=list)
     service_fee_rules: list[dict] = Field(default_factory=list)
-    shipping_rules: dict[str, dict[str, list[dict]]] = Field(default_factory=dict)
     bybit_rate_status: str = "unknown"
     bybit_rate_warning: str | None = None
     bybit_bucket_step_usdt: int = 0
@@ -299,7 +296,6 @@ class SettingsTransferPricingSettings(BaseModel):
     svc_rules: list[dict] = Field(default_factory=list)
     insurance_rules: list[dict] = Field(default_factory=list)
     service_fee_rules: list[dict] = Field(default_factory=list)
-    shipping_rules: dict[str, dict[str, list[dict]]] = Field(default_factory=dict)
 
 
 class SettingsTransferAdminUiSettings(BaseModel):

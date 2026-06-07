@@ -41,7 +41,6 @@ from app.models import (
     ParserProductOriginVariant,
     ParserSource,
 )
-from app.models.pricing import ParserSupplier
 from app.repositories import (
     ParserCategoryKeywordRepository,
     ParserCategoryManualProductRepository,
@@ -755,30 +754,23 @@ def _extract_product_description(item: dict[str, Any]) -> str | None:
     return None
 
 
-def _get_or_create_manual_source(db: Session) -> ParserSource:
-    existing = (
+def _get_manual_source(db: Session) -> ParserSource | None:
+    return (
         db.query(ParserSource)
         .filter(ParserSource.deleted_at.is_(None))
         .filter(ParserSource.name == _MANUAL_SOURCE_NAME)
         .first()
     )
+
+
+def _require_manual_source(db: Session) -> ParserSource:
+    existing = _get_manual_source(db)
     if existing is not None:
         return existing
-    supplier = db.query(ParserSupplier).order_by(ParserSupplier.id.asc()).first()
-    if supplier is None:
-        raise HTTPException(status_code=500, detail="Нет доступного supplier для ручного источника")
-    source = ParserSource(
-        name=_MANUAL_SOURCE_NAME,
-        url=_MANUAL_SOURCE_URL,
-        enabled=True,
-        supplier_id=int(supplier.id),
-        show_description=True,
-        show_images=True,
-        hide_auto_added_products=False,
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Сначала назначьте тариф для личного каталога",
     )
-    db.add(source)
-    db.flush()
-    return source
 
 
 def _extract_buyout_price_rub(item: dict[str, Any]) -> float | None:
@@ -2903,7 +2895,7 @@ def create_manual_product(
     if not title:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Название товара обязательно")
 
-    manual_source = _get_or_create_manual_source(db)
+    manual_source = _require_manual_source(db)
     description = str(payload.description or "").strip() or None
     vendor = str(payload.vendor or "").strip() or None
     product_type = str(payload.product_type or "").strip() or None
@@ -3032,7 +3024,7 @@ def update_manual_product(
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
 
-    manual_source = _get_or_create_manual_source(db)
+    manual_source = _require_manual_source(db)
     if int(product.source_id) != int(manual_source.id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Можно редактировать только товары личного каталога")
 
@@ -3151,7 +3143,7 @@ def delete_manual_product(
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Товар не найден")
 
-    manual_source = _get_or_create_manual_source(db)
+    manual_source = _require_manual_source(db)
     if int(product.source_id) != int(manual_source.id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Удалять можно только товары личного каталога")
 

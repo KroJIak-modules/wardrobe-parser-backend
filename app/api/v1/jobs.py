@@ -726,18 +726,10 @@ def _probe_source_password_gate(source_key: str | None) -> bool:
 def _default_supplier_id(db) -> int | None:
     from app.models.pricing import ParserSupplier
 
-    row = (
-        db.query(ParserSupplier.id)
-        .filter(ParserSupplier.key == "eu")
-        .order_by(ParserSupplier.id.asc())
-        .first()
-    )
-    if row is not None:
-        return int(row[0])
-    row_any = db.query(ParserSupplier.id).order_by(ParserSupplier.id.asc()).first()
-    if row_any is None:
+    row = db.query(ParserSupplier.id).order_by(ParserSupplier.id.asc()).first()
+    if row is None:
         return None
-    return int(row_any[0])
+    return int(row[0])
 
 
 def _ensure_backend_source(db, source_key: str, sample_item: dict[str, Any] | None = None) -> ParserSource | None:

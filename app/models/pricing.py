@@ -27,58 +27,6 @@ def _default_service_fee_rules() -> list[dict]:
     ]
 
 
-def _default_shipping_rules() -> dict:
-    return {
-        "US": {
-            "normal": [
-                {"kg": 0.5, "rub": 1400.0},
-                {"kg": 1.0, "rub": 1650.0},
-                {"kg": 1.5, "rub": 2250.0},
-                {"kg": 2.0, "rub": 2900.0},
-                {"kg": 2.5, "rub": 3500.0},
-                {"kg": 3.0, "rub": 4100.0},
-            ],
-            "alt": [
-                {"kg": 0.5, "rub": 1700.0},
-                {"kg": 1.0, "rub": 3350.0},
-                {"kg": 1.5, "rub": 4100.0},
-                {"kg": 2.0, "rub": 4950.0},
-                {"kg": 2.5, "rub": 5650.0},
-                {"kg": 3.0, "rub": 6500.0},
-            ],
-        },
-        "EU": {
-            "normal": [
-                {"kg": 0.5, "rub": 1100.0},
-                {"kg": 1.0, "rub": 1500.0},
-                {"kg": 1.5, "rub": 1900.0},
-                {"kg": 2.0, "rub": 2300.0},
-                {"kg": 2.5, "rub": 2700.0},
-                {"kg": 3.0, "rub": 3150.0},
-            ],
-            "alt": [
-                {"kg": 0.5, "rub": 2300.0},
-                {"kg": 1.0, "rub": 2750.0},
-                {"kg": 1.5, "rub": 3750.0},
-                {"kg": 2.0, "rub": 4800.0},
-                {"kg": 2.5, "rub": 5800.0},
-                {"kg": 3.0, "rub": 6800.0},
-            ],
-        },
-        "UK": {
-            "normal": [
-                {"kg": 0.5, "rub": 3400.0},
-                {"kg": 1.0, "rub": 3900.0},
-                {"kg": 1.5, "rub": 4400.0},
-                {"kg": 2.0, "rub": 4900.0},
-                {"kg": 2.5, "rub": 5450.0},
-                {"kg": 3.0, "rub": 5950.0},
-            ],
-            "alt": [],
-        },
-    }
-
-
 class ParserSupplier(Base):
     """Supplier (country) used for shipping tariff mapping."""
 
@@ -164,7 +112,6 @@ class ParserPricingSettings(Base):
     svc_rules = Column(JSON, nullable=False, default=list)
     insurance_rules = Column(JSON, nullable=False, default=_default_insurance_rules)
     service_fee_rules = Column(JSON, nullable=False, default=_default_service_fee_rules)
-    shipping_rules = Column(JSON, nullable=False, default=_default_shipping_rules)
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
