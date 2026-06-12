@@ -64,42 +64,6 @@ class CategoryTreeNodeResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class CatalogCategoryNodeResponse(BaseModel):
-    slug: str
-    name: str
-    count: int = 0
-    is_designers_root: bool = False
-    is_in_designers_branch: bool = False
-    children: list["CatalogCategoryNodeResponse"] = Field(default_factory=list)
-
-
-class CatalogProductCardResponse(BaseModel):
-    id: int
-    source_id: int
-    title: str
-    vendor: str | None = None
-    vendor_original: str | None = None
-    vendor_mapped: str | None = None
-    vendor_display: str | None = None
-    url: str
-    price: float | None = None
-    currency: str
-    source_price: float | None = None
-    source_currency: str | None = None
-    status: str
-    image_count: int = 0
-    image_urls: list[str] = Field(default_factory=list)
-    buyout_price_rub: float | None = None
-    is_favorite: bool = False
-
-
-class CatalogProductsResponse(BaseModel):
-    items: list[CatalogProductCardResponse] = Field(default_factory=list)
-    next_cursor: str | None = None
-    has_more: bool = False
-    limit: int
-
-
 class WeightRuleKeywordRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=255)
 
@@ -531,4 +495,3 @@ class DedupUndoRequest(BaseModel):
 
 
 CategoryTreeNodeResponse.model_rebuild()
-CatalogCategoryNodeResponse.model_rebuild()

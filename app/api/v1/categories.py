@@ -1,12 +1,10 @@
 """API endpoints for recursive category tree and keyword rules."""
 
-from fastapi import HTTPException, status
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.schemas.parser import (
-    CatalogCategoryNodeResponse,
     CategoryCreateRequest,
     CategoryKeywordRequest,
     CategoryManualProductRequest,
@@ -20,17 +18,6 @@ from app.services.catalog.category_tree_service import CategoryTreeService
 router = APIRouter(tags=["categories"])
 
 
-def _to_catalog_node(node: CategoryTreeNodeResponse) -> CatalogCategoryNodeResponse:
-    return CatalogCategoryNodeResponse(
-        slug=node.slug,
-        name=node.name,
-        count=int(node.product_count or 0),
-        is_designers_root=bool(node.is_designers_root),
-        is_in_designers_branch=bool(node.is_in_designers_branch),
-        children=[_to_catalog_node(child) for child in (node.children or []) if child.is_enabled],
-    )
-
-
 @router.get(
     "/categories/tree",
     response_model=list[CategoryTreeNodeResponse],
@@ -41,106 +28,6 @@ def get_category_tree(
     db: Session = Depends(get_db),
 ):
     return CategoryTreeService(db).get_category_tree(include_counts=include_counts)
-
-
-@router.get(
-    "/catalog/categories/roots",
-    response_model=list[CatalogCategoryNodeResponse],
-    summary="Список корневых категорий витрины",
-    description="Возвращает только включённые корневые категории, доступные для публичной витрины.",
-    responses={
-        200: {
-            "description": "Корневые категории витрины.",
-            "content": {
-                "application/json": {
-                    "example": [
-                        {
-                            "slug": "muzhskoe",
-                            "name": "Мужское",
-                            "count": 1240,
-                            "is_designers_root": False,
-                            "is_in_designers_branch": False,
-                            "children": [],
-                        },
-                        {
-                            "slug": "dizajnery",
-                            "name": "Дизайнеры",
-                            "count": 860,
-                            "is_designers_root": True,
-                            "is_in_designers_branch": False,
-                            "children": [],
-                        },
-                    ]
-                }
-            },
-        }
-    },
-)
-def get_catalog_roots(
-    include_counts: bool = Query(default=True, description="Добавить количество товаров в категории."),
-    db: Session = Depends(get_db),
-):
-    tree = CategoryTreeService(db).get_category_tree(include_counts=include_counts)
-    roots: list[CatalogCategoryNodeResponse] = []
-    for node in tree:
-        if node.parent_id is not None or not node.is_enabled:
-            continue
-        roots.append(
-            CatalogCategoryNodeResponse(
-                slug=node.slug,
-                name=node.name,
-                count=int(node.product_count or 0),
-                is_designers_root=bool(node.is_designers_root),
-                is_in_designers_branch=bool(node.is_in_designers_branch),
-                children=[],
-            )
-        )
-    return roots
-
-
-@router.get(
-    "/catalog/categories/root/{root_slug}",
-    response_model=CatalogCategoryNodeResponse,
-    summary="Дерево категорий выбранного корня",
-    description="Возвращает выбранный корень и всех его включённых потомков для меню/навигации витрины.",
-    responses={
-        200: {
-            "description": "Ветка дерева категорий.",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "slug": "muzhskoe",
-                        "name": "Мужское",
-                        "count": 1240,
-                        "is_designers_root": False,
-                        "is_in_designers_branch": False,
-                        "children": [
-                            {
-                                "slug": "muzhskoe-kurtki",
-                                "name": "Куртки",
-                                "count": 310,
-                                "is_designers_root": False,
-                                "is_in_designers_branch": False,
-                                "children": [],
-                            }
-                        ],
-                    }
-                }
-            },
-        }
-    },
-)
-def get_catalog_root_branch(
-    root_slug: str,
-    include_counts: bool = Query(default=True, description="Добавить количество товаров для каждой категории."),
-    db: Session = Depends(get_db),
-):
-    slug = root_slug.strip().lower()
-    tree = CategoryTreeService(db).get_category_tree(include_counts=include_counts)
-    for node in tree:
-        if node.parent_id is None and node.is_enabled and node.slug == slug:
-            return _to_catalog_node(node)
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Root category not found")
 
 
 @router.post(

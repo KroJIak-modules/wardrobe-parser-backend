@@ -27,9 +27,6 @@ HTTP_CONFLICT = status.HTTP_409_CONFLICT
 _DOCS_DIR = Path(__file__).resolve().parents[1] / "docs"
 _PUBLIC_OPENAPI_PATHS = {
     "/health",
-    "/api/v1/catalog/categories/roots",
-    "/api/v1/catalog/categories/root/{root_slug}",
-    "/api/v1/catalog/products",
     "/api/v1/products/{product_id}",
     "/api/v1/products/images/{image_id}",
     "/api/v1/showcase/state",
@@ -39,9 +36,6 @@ _PUBLIC_OPENAPI_PATHS = {
 }
 _PUBLIC_OPENAPI_OPERATIONS = {
     "/health": {"get"},
-    "/api/v1/catalog/categories/roots": {"get"},
-    "/api/v1/catalog/categories/root/{root_slug}": {"get"},
-    "/api/v1/catalog/products": {"get"},
     "/api/v1/products/{product_id}": {"get"},
     "/api/v1/products/images/{image_id}": {"get"},
     "/api/v1/showcase/state": {"get"},
@@ -83,8 +77,8 @@ def _build_public_openapi(app: FastAPI) -> dict[str, Any]:
         title="Wardrobe Public API",
         version="1.0.0",
         description=(
-            "Публичный API для пользовательской витрины (категории, каталог, карточка товара, "
-            "медиа витрины и внутренние изображения товаров). Без админ-методов."
+            "Публичный API для пользовательской витрины (карточка товара, медиа витрины и "
+            "внутренние изображения товаров). Без админ-методов."
         ),
         routes=app.routes,
     )
