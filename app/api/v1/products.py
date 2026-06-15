@@ -122,29 +122,29 @@ class ProductVariantIn(BaseModel):
 class CreateManualProductRequest(BaseModel):
     title: str
     description: str | None = None
-    vendor: str | None = None
-    product_type: str | None = None
+    designer: str | None = None
+    category: str | None = None
     variants: list[ProductVariantIn] = []
     manual_image_asset_ids: list[int] = []
     weight_grams: float | None = None
     status: str | None = None
     bind_sync: bool = False
     bind_source_id: int | None = None
-    bind_source_product_url: str | None = None
+    bind_source_url: str | None = None
 
 
 class UpdateManualProductRequest(BaseModel):
     title: str
     description: str | None = None
-    vendor: str | None = None
-    product_type: str | None = None
+    designer: str | None = None
+    category: str | None = None
     variants: list[ProductVariantIn] = []
     manual_image_asset_ids: list[int] = []
     weight_grams: float | None = None
     status: str | None = None
     bind_sync: bool = False
     bind_source_id: int | None = None
-    bind_source_product_url: str | None = None
+    bind_source_url: str | None = None
 
 
 class ProductUrlPayload(BaseModel):
@@ -576,6 +576,10 @@ def _apply_brand_mapping_to_item(item: dict[str, Any], mapping_service: BrandMap
     item["vendor_mapped"] = vendor_mapped
     item["vendor_display"] = vendor_display
     item["vendor"] = vendor_display
+    item["designer_original"] = vendor_original
+    item["designer_mapped"] = vendor_mapped
+    item["designer_display"] = vendor_display
+    item["designer"] = vendor_display
 
 
 def _compose_effective_image_urls(
@@ -787,10 +791,10 @@ def _project_catalog_item(item: dict[str, Any]) -> dict[str, Any]:
         "source_id": int(item.get("source_id") or 0),
         "source_name": str(item.get("source_name") or ""),
         "title": str(item.get("title") or ""),
-        "vendor": item.get("vendor"),
-        "vendor_original": item.get("vendor_original"),
-        "vendor_mapped": item.get("vendor_mapped"),
-        "vendor_display": item.get("vendor_display"),
+        "designer": item.get("designer"),
+        "designer_original": item.get("designer_original"),
+        "designer_mapped": item.get("designer_mapped"),
+        "designer_display": item.get("designer_display"),
         "url": str(item.get("url") or ""),
         "price": _safe_float(item.get("price")),
         "currency": str(item.get("currency") or item.get("source_currency") or ""),
@@ -815,10 +819,10 @@ def _project_showcase_product_detail(item: dict[str, Any]) -> dict[str, Any]:
         "id": int(item.get("id") or 0),
         "source_id": int(item.get("source_id") or 0),
         "title": str(item.get("title") or ""),
-        "vendor": item.get("vendor"),
-        "vendor_original": item.get("vendor_original"),
-        "vendor_mapped": item.get("vendor_mapped"),
-        "vendor_display": item.get("vendor_display"),
+        "designer": item.get("designer"),
+        "designer_original": item.get("designer_original"),
+        "designer_mapped": item.get("designer_mapped"),
+        "designer_display": item.get("designer_display"),
         "url": str(item.get("url") or ""),
         "price": _safe_float(item.get("price")),
         "currency": str(item.get("currency") or item.get("source_currency") or ""),
@@ -853,7 +857,11 @@ def _status_sort_rank(raw_status: Any) -> int:
 def _vendor_sort_value(item: dict[str, Any]) -> str:
     return (
         str(
-            item.get("vendor_display")
+            item.get("designer_display")
+            or item.get("designer_mapped")
+            or item.get("designer")
+            or item.get("designer_original")
+            or item.get("vendor_display")
             or item.get("vendor_mapped")
             or item.get("vendor")
             or item.get("vendor_original")
@@ -873,6 +881,29 @@ def _sort_products_for_display(items: list[dict[str, Any]]) -> None:
             int(item.get("id") or 0),
         )
     )
+
+
+def _strip_legacy_product_contract_fields(item: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(item)
+    if "designer" not in cleaned:
+        cleaned["designer"] = cleaned.get("vendor")
+    if "designer_original" not in cleaned:
+        cleaned["designer_original"] = cleaned.get("vendor_original")
+    if "designer_mapped" not in cleaned:
+        cleaned["designer_mapped"] = cleaned.get("vendor_mapped")
+    if "designer_display" not in cleaned:
+        cleaned["designer_display"] = cleaned.get("vendor_display")
+    if "category" not in cleaned:
+        cleaned["category"] = cleaned.get("product_type")
+    for legacy_key in (
+        "vendor",
+        "vendor_original",
+        "vendor_mapped",
+        "vendor_display",
+        "product_type",
+    ):
+        cleaned.pop(legacy_key, None)
+    return cleaned
 
 
 def _resolve_primary_image_url(item: dict[str, Any]) -> str | None:
@@ -943,6 +974,27 @@ def _first_variant_price_and_currency(item: dict[str, Any]) -> tuple[float | Non
     return None, None
 
 
+def _derive_price_from_variants(variants: list[dict[str, Any]] | None) -> float | None:
+    if not variants:
+        return None
+    available_prices: list[float] = []
+    any_prices: list[float] = []
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        variant_price = _safe_float(variant.get("price"))
+        if variant_price is None:
+            continue
+        any_prices.append(variant_price)
+        if bool(variant.get("available", True)):
+            available_prices.append(variant_price)
+    if available_prices:
+        return min(available_prices)
+    if any_prices:
+        return min(any_prices)
+    return None
+
+
 def _price_input_from_item(item: dict[str, Any]) -> tuple[float | None, str | None]:
     source_currency_raw = item.get("source_currency")
     if source_currency_raw is None:
@@ -951,10 +1003,7 @@ def _price_input_from_item(item: dict[str, Any]) -> tuple[float | None, str | No
     source_currency = str(source_currency_raw).upper() if source_currency_raw is not None else None
     raw_source_price = item.get("source_price")
     if raw_source_price is None:
-        raw_source_price = item.get("price")
-    if raw_source_price is None:
-        variant_price, _ = _first_variant_price_and_currency(item)
-        raw_source_price = variant_price
+        raw_source_price = _derive_price_from_variants(item.get("variants") if isinstance(item.get("variants"), list) else [])
     source_price = _normalize_source_price(raw_source_price, source_currency)
     return source_price, source_currency
 
@@ -1241,9 +1290,15 @@ def _product_row_to_item(product: ParserProduct, *, default_show_description: bo
         "vendor_original": product.vendor,
         "vendor_mapped": product.vendor,
         "vendor_display": product.vendor,
+        "designer": product.vendor,
+        "designer_original": product.vendor,
+        "designer_mapped": product.vendor,
+        "designer_display": product.vendor,
         "product_type": product.product_type,
+        "category": product.product_type,
+        "gender": str(getattr(product, "gender", "unisex") or "unisex"),
         "url": str(product.url),
-        "price": product.price,
+        "price": _derive_price_from_variants(list(product.variants or [])),
         "currency": derived_currency,
         "status": str(product.status),
         "is_auto_added": bool(getattr(product, "is_auto_added", True)),
@@ -1268,8 +1323,8 @@ def _apply_admin_product_filters(
     *,
     search: str | None,
     source_id: int | None,
-    vendor: str | None,
-    product_type: str | None,
+    designer: str | None,
+    category: str | None,
     status_filter: str | None,
 ):
     normalized_vendor_expr = _normalized_mapped_vendor_key_expr()
@@ -1286,8 +1341,8 @@ def _apply_admin_product_filters(
                 .exists(),
             )
         )
-    if vendor:
-        if vendor == _NO_BRAND_FILTER_TOKEN:
+    if designer:
+        if designer == _NO_BRAND_FILTER_TOKEN:
             query = query.filter(
                 or_(
                     ParserProduct.vendor.is_(None),
@@ -1297,12 +1352,12 @@ def _apply_admin_product_filters(
         else:
             normalized_vendor_key = "".join(
                 ch
-                for ch in unicodedata.normalize("NFKC", str(vendor or "")).casefold().strip()
+                for ch in unicodedata.normalize("NFKC", str(designer or "")).casefold().strip()
                 if ch.isalnum()
             )
             query = query.filter(normalized_vendor_expr == normalized_vendor_key)
-    if product_type:
-        query = query.filter(normalized_type_expr == str(product_type).strip().lower())
+    if category:
+        query = query.filter(normalized_type_expr == str(category).strip().lower())
     if status_filter:
         query = query.filter(ParserProduct.status == status_filter)
     if search:
@@ -1332,12 +1387,12 @@ def _project_admin_table_item(item: dict[str, Any]) -> dict[str, Any]:
         "source_id": int(item.get("source_id") or 0),
         "source_name": str(item.get("source_name") or "").strip() or None,
         "title": str(item.get("title") or ""),
-        "vendor": item.get("vendor"),
-        "vendor_original": item.get("vendor_original"),
-        "vendor_mapped": item.get("vendor_mapped"),
-        "vendor_display": item.get("vendor_display"),
+        "designer": item.get("designer"),
+        "designer_original": item.get("designer_original"),
+        "designer_mapped": item.get("designer_mapped"),
+        "designer_display": item.get("designer_display"),
         "url": str(item.get("url") or ""),
-        "product_type": item.get("product_type"),
+        "category": item.get("category"),
         "status": str(item.get("status") or "hidden"),
         "image_count": int(item.get("image_count") or 0),
         "image_urls": list(item.get("image_urls") or []),
@@ -1355,8 +1410,8 @@ def get_admin_products_table(
     _: object = Depends(require_permission("control.products.read")),
     search: str | None = Query(default=None),
     source_id: int | None = Query(default=None),
-    vendor: str | None = Query(default=None),
-    product_type: str | None = Query(default=None),
+    designer: str | None = Query(default=None),
+    category: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=_CATALOG_MAX_LIMIT),
     offset: int = Query(default=0, ge=0),
@@ -1371,8 +1426,8 @@ def get_admin_products_table(
             )
 
     normalized_search = (search or "").strip()
-    normalized_vendor = (vendor or "").strip() or None
-    normalized_type = (product_type or "").strip() or None
+    normalized_designer = (designer or "").strip() or None
+    normalized_category = (category or "").strip() or None
 
     base_query = (
         _with_active_sources(db.query(ParserProduct))
@@ -1383,8 +1438,8 @@ def get_admin_products_table(
         base_query,
         search=normalized_search or None,
         source_id=source_id,
-        vendor=normalized_vendor,
-        product_type=normalized_type,
+        designer=normalized_designer,
+        category=normalized_category,
         status_filter=selected_status,
     )
 
@@ -1515,8 +1570,8 @@ def get_admin_products_table_facets(
     _: object = Depends(require_permission("control.products.read")),
     search: str | None = Query(default=None),
     source_id: int | None = Query(default=None),
-    vendor: str | None = Query(default=None),
-    product_type: str | None = Query(default=None),
+    designer: str | None = Query(default=None),
+    category: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
 ) -> dict[str, Any]:
     selected_status = None
@@ -1529,8 +1584,8 @@ def get_admin_products_table_facets(
             )
 
     normalized_search = (search or "").strip() or None
-    normalized_vendor = (vendor or "").strip() or None
-    normalized_type = (product_type or "").strip() or None
+    normalized_designer = (designer or "").strip() or None
+    normalized_category = (category or "").strip() or None
 
     base_all = (
         db.query(ParserProduct)
@@ -1541,8 +1596,8 @@ def get_admin_products_table_facets(
         base_all,
         search=normalized_search,
         source_id=source_id,
-        vendor=normalized_vendor,
-        product_type=normalized_type,
+        designer=normalized_designer,
+        category=normalized_category,
         status_filter=selected_status,
     )
     filtered_total = (
@@ -1563,8 +1618,8 @@ def get_admin_products_table_facets(
         base_all,
         search=normalized_search,
         source_id=source_id,
-        vendor=None,
-        product_type=normalized_type,
+        designer=None,
+        category=normalized_category,
         status_filter=selected_status,
     )
     normalized_vendor_expr = _normalized_mapped_vendor_key_expr()
@@ -1581,7 +1636,7 @@ def get_admin_products_table_facets(
         .all()
     )
 
-    vendors: list[dict[str, Any]] = []
+    designers: list[dict[str, Any]] = []
     no_brand_count = 0
     for vendor_key, vendor_label, vendor_count in vendor_rows:
         vendor_key_normalized = str(vendor_key or "").strip()
@@ -1590,13 +1645,13 @@ def get_admin_products_table_facets(
             no_brand_count += count_int
             continue
         display_name = str(vendor_label or "").strip() or vendor_key_normalized
-        vendors.append({
+        designers.append({
             "value": vendor_key_normalized,
             "label": display_name,
             "count": count_int,
         })
     if no_brand_count > 0:
-        vendors.insert(0, {
+        designers.insert(0, {
             "value": _NO_BRAND_FILTER_TOKEN,
             "label": "Без бренда",
             "count": int(no_brand_count),
@@ -1606,8 +1661,8 @@ def get_admin_products_table_facets(
         base_all,
         search=normalized_search,
         source_id=source_id,
-        vendor=normalized_vendor,
-        product_type=None,
+        designer=normalized_designer,
+        category=None,
         status_filter=selected_status,
     )
     normalized_type_expr = func.lower(func.trim(func.coalesce(ParserProduct.product_type, "")))
@@ -1623,21 +1678,21 @@ def get_admin_products_table_facets(
         .order_by(normalized_type_expr.asc())
         .all()
     )
-    local_categories: list[dict[str, Any]] = []
+    categories: list[dict[str, Any]] = []
     for raw_type_key, raw_type_label, raw_type_count in type_rows:
         type_key = str(raw_type_key or "").strip()
         if not type_key:
             continue
         type_label = str(raw_type_label or "").strip() or type_key
-        local_categories.append({
+        categories.append({
             "value": type_key,
             "label": type_label,
             "count": int(raw_type_count or 0),
         })
 
     return {
-        "vendors": vendors,
-        "local_categories": local_categories,
+        "designers": designers,
+        "categories": categories,
         "total": int(filtered_total),
         "overall_total": int(overall_total),
     }
@@ -1825,8 +1880,8 @@ def get_admin_products(
     _: object = Depends(require_permission("control.products.read")),
     search: str | None = Query(default=None),
     source_id: int | None = Query(default=None),
-    vendor: str | None = Query(default=None),
-    product_type: str | None = Query(default=None),
+    designer: str | None = Query(default=None),
+    category: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=_CATALOG_MAX_LIMIT),
     cursor: str | None = Query(default=None),
@@ -1852,8 +1907,8 @@ def get_admin_products(
         base_query,
         search=normalized_search or None,
         source_id=source_id,
-        vendor=(vendor or "").strip() or None,
-        product_type=(product_type or "").strip() or None,
+        designer=(designer or "").strip() or None,
+        category=(category or "").strip() or None,
         status_filter=selected_status,
     )
 
@@ -1946,7 +2001,7 @@ def get_admin_products(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Обнаружен недопустимый статус товара в базе: {exc}",
             ) from exc
-        items.append(enriched)
+        items.append(_strip_legacy_product_contract_fields(enriched))
     _sort_products_for_display(items)
 
     next_cursor = None
@@ -2065,7 +2120,7 @@ def get_pricing_example_product(
                         "id": 120045,
                         "source_id": 12,
                         "title": "Куртка утеплённая",
-                        "vendor": "Stone Island",
+                        "designer": "Stone Island",
                         "url": "https://example.com/products/120045",
                         "price": 18900.0,
                         "currency": "RUB",
@@ -2332,15 +2387,16 @@ async def update_product(
         "handle": str(product.handle),
         "title": str(product.title),
         "description": product.description,
-        "vendor": product.vendor,
-        "vendor_original": product.vendor,
-        "vendor_mapped": product.vendor,
-        "vendor_display": product.vendor,
-        "product_type": product.product_type,
+        "designer": product.vendor,
+        "designer_original": product.vendor,
+        "designer_mapped": product.vendor,
+        "designer_display": product.vendor,
+        "category": product.product_type,
+        "gender": str(getattr(product, "gender", "unisex") or "unisex"),
         "url": str(product.url),
-        "price": product.price,
+        "price": _derive_price_from_variants(variants),
         "currency": derived_currency,
-        "source_price": getattr(product, "source_price", None) if getattr(product, "source_price", None) is not None else product.price,
+        "source_price": getattr(product, "source_price", None) if getattr(product, "source_price", None) is not None else _derive_price_from_variants(variants),
         "source_currency": str(getattr(product, "source_currency", None) or derived_currency),
         "status": effective_status,
         "image_count": int(product.image_count or 0),
@@ -2384,7 +2440,7 @@ async def update_product(
             },
         }
     )
-    return JSONResponse(content=patched_payload)
+    return JSONResponse(content=_strip_legacy_product_contract_fields(patched_payload))
 
 
 @router.post("/products/upload-image")
@@ -2489,10 +2545,11 @@ def preview_product_by_url(
         "title": str(getattr(matched, "title", "") or ""),
         "description": str(getattr(matched, "description", "") or ""),
         "weight_grams": _safe_float(getattr(matched, "weight_grams", None)),
-        "vendor": getattr(matched, "vendor", None),
-        "product_type": getattr(matched, "product_type", None),
-        "product_url": str(getattr(matched, "url", "") or ""),
-        "price": _safe_float(getattr(matched, "price", None)),
+        "designer": getattr(matched, "vendor", None),
+        "category": getattr(matched, "product_type", None),
+        "gender": str(getattr(matched, "gender", "unisex") or "unisex"),
+        "url": str(getattr(matched, "url", "") or ""),
+        "price": _derive_price_from_variants(matched_variants),
         "currency": matched_currency,
         "image_urls": list(getattr(matched, "image_urls", []) or []),
         "variants": matched_variants,
@@ -2510,8 +2567,8 @@ def probe_product_by_url(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректная ссылка")
 
     probe_item = _service_probe_product_by_url(normalized_input)
-    source_product_url = _normalize_url_loose(str(probe_item.get("source_product_url") or probe_item.get("url") or normalized_input))
-    source_host = _norm_host(source_product_url)
+    source_url = _normalize_url_loose(str(probe_item.get("url") or normalized_input))
+    source_host = _norm_host(source_url)
 
     source = None
     if source_host:
@@ -2567,7 +2624,7 @@ def probe_product_by_url(
     image_urls = [str(x).strip() for x in (images or []) if str(x).strip()]
     handle = str(probe_item.get("handle") or "").strip()
     if not handle:
-        parts = [p for p in urlparse(source_product_url).path.split("/") if p]
+        parts = [p for p in urlparse(source_url).path.split("/") if p]
         if len(parts) >= 2 and parts[0].lower() == "products":
             handle = parts[1]
         else:
@@ -2584,9 +2641,10 @@ def probe_product_by_url(
         "title": str(probe_item.get("title") or "").strip(),
         "description": str(probe_item.get("description") or "").strip() or None,
         "weight_grams": _safe_float(probe_item.get("weight_grams")),
-        "vendor": str(probe_item.get("vendor") or "").strip() or None,
-        "product_type": str(probe_item.get("product_type") or "").strip() or None,
-        "product_url": source_product_url,
+        "designer": str(probe_item.get("designer") or "").strip() or None,
+        "category": str(probe_item.get("category") or "").strip() or None,
+        "gender": str(probe_item.get("gender") or "unisex").strip().lower() or "unisex",
+        "url": source_url,
         "price": price,
         "currency": variant_currency or "USD",
         "buyer_total_price": buyer_total_price,
@@ -2623,8 +2681,8 @@ def create_manual_product(
 
     manual_source = _require_manual_source(db)
     description = str(payload.description or "").strip() or None
-    vendor = str(payload.vendor or "").strip() or None
-    product_type = str(payload.product_type or "").strip() or None
+    designer = str(payload.designer or "").strip() or None
+    category = str(payload.category or "").strip() or None
     variants = _normalize_manual_variants(payload.variants)
     if not variants:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нужен хотя бы один вариант с валютой")
@@ -2660,7 +2718,7 @@ def create_manual_product(
                 continue
             manual_image_urls.append(f"/api/v1/products/images/{int(asset.id)}")
 
-    raw_bound_source_url = str(payload.bind_source_product_url or "").strip() if payload.bind_source_product_url is not None else ""
+    raw_bound_source_url = str(payload.bind_source_url or "").strip() if payload.bind_source_url is not None else ""
     bound_source_url = _normalize_url_loose(raw_bound_source_url) if raw_bound_source_url else ""
     bind_sync_enabled = bool(payload.bind_sync) and payload.bind_source_id is not None and bool(bound_source_url)
     product_url_value = bound_source_url if bind_sync_enabled else f"manual://product/{int(datetime.now().timestamp() * 1000)}"
@@ -2670,10 +2728,10 @@ def create_manual_product(
         handle=f"manual-{int(datetime.now().timestamp() * 1000)}-{random.randint(1000, 9999)}",
         title=title,
         description=description,
-        vendor=vendor,
-        product_type=product_type,
+        vendor=designer,
+        product_type=category,
+        gender="unisex",
         url=product_url_value,
-        price=price,
         status=status_value,
         image_count=len(manual_image_urls),
         image_urls=list(manual_image_urls),
@@ -2690,19 +2748,19 @@ def create_manual_product(
         db.flush()
         if bind_sync_enabled:
             source_id = int(payload.bind_source_id)
-            source_product_url = bound_source_url
+            source_url = bound_source_url
             for idx, variant in enumerate(variants, start=1):
                 variant_title = str(variant.get("title") or "").strip() or f"Variant {idx}"
                 variant_price = _safe_float(variant.get("price"))
                 variant_available = bool(variant.get("available"))
                 source_variant_id = f"manual-bound-{int(product.id)}-{idx}"
-                origin_key = f"{source_id}:{source_product_url}:{source_variant_id}"
+                origin_key = f"{source_id}:{source_url}:{source_variant_id}"
                 db.add(
                     ParserProductOriginVariant(
                         origin_key=origin_key,
                         product_id=int(product.id),
                         source_id=source_id,
-                        source_product_url=source_product_url,
+                        source_url=source_url,
                         source_variant_id=source_variant_id,
                         source_variant_title=variant_title,
                         price=variant_price,
@@ -2755,8 +2813,8 @@ def update_manual_product(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Можно редактировать только товары личного каталога")
 
     description = str(payload.description or "").strip() or None
-    vendor = str(payload.vendor or "").strip() or None
-    product_type = str(payload.product_type or "").strip() or None
+    designer = str(payload.designer or "").strip() or None
+    category = str(payload.category or "").strip() or None
     variants = _normalize_manual_variants(payload.variants)
     if not variants:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нужен хотя бы один вариант с валютой")
@@ -2791,7 +2849,7 @@ def update_manual_product(
                 continue
             manual_image_urls.append(f"/api/v1/products/images/{int(asset.id)}")
 
-    raw_bound_source_url = str(payload.bind_source_product_url or "").strip() if payload.bind_source_product_url is not None else ""
+    raw_bound_source_url = str(payload.bind_source_url or "").strip() if payload.bind_source_url is not None else ""
     bound_source_url = _normalize_url_loose(raw_bound_source_url) if raw_bound_source_url else ""
     if bool(payload.bind_sync) and payload.bind_source_id is not None and bound_source_url:
         product.url = bound_source_url
@@ -2800,9 +2858,8 @@ def update_manual_product(
 
     product.title = title
     product.description = description
-    product.vendor = vendor
-    product.product_type = product_type
-    product.price = price
+    product.vendor = designer
+    product.product_type = category
     product.status = status_value
     product.weight_grams = weight_grams
     product.weight_source = "manual" if weight_grams is not None else None
@@ -2831,7 +2888,7 @@ def update_manual_product(
                     origin_key=origin_key,
                     product_id=int(product.id),
                     source_id=source_id,
-                    source_product_url=bound_source_url,
+                    source_url=bound_source_url,
                     source_variant_id=source_variant_id,
                     source_variant_title=variant_title,
                     price=variant_price,

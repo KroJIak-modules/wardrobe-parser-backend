@@ -359,11 +359,12 @@ class ProductResponse(BaseModel):
     source_id: int
     handle: str
     title: str
-    vendor: str | None = None
-    vendor_original: str | None = None
-    vendor_mapped: str | None = None
-    vendor_display: str | None = None
-    product_type: str | None = None
+    designer: str | None = None
+    designer_original: str | None = None
+    designer_mapped: str | None = None
+    designer_display: str | None = None
+    category: str | None = None
+    gender: str = "unisex"
     url: str
     price: float | None = None
     currency: str
@@ -395,10 +396,12 @@ class ShowcaseProductResponse(BaseModel):
     id: int
     source_id: int
     title: str
-    vendor: str | None = None
-    vendor_original: str | None = None
-    vendor_mapped: str | None = None
-    vendor_display: str | None = None
+    designer: str | None = None
+    designer_original: str | None = None
+    designer_mapped: str | None = None
+    designer_display: str | None = None
+    category: str | None = None
+    gender: str = "unisex"
     url: str
     price: float | None = None
     currency: str

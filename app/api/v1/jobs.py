@@ -9,8 +9,6 @@ from time import sleep
 from typing import Any
 from urllib.parse import urlparse
 from collections import defaultdict
-
-import hashlib
 import logging
 import requests
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -51,6 +49,13 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def _normalize_product_gender(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"male", "female", "unisex"}:
+        return normalized
+    return "unisex"
 
 
 def _service_sync_base() -> str:
@@ -190,7 +195,7 @@ def _build_manual_candidate_urls_by_source(*, source_keys: list[str]) -> dict[st
         rows = (
             db.query(
                 ParserProductOriginVariant.source_id,
-                ParserProductOriginVariant.source_product_url,
+                ParserProductOriginVariant.source_url,
             )
             .join(ParserProduct, ParserProduct.id == ParserProductOriginVariant.product_id)
             .filter(ParserProduct.deleted_at.is_(None))
@@ -206,7 +211,7 @@ def _build_manual_candidate_urls_by_source(*, source_keys: list[str]) -> dict[st
             source_key = source_id_to_key.get(source_id)
             if not source_key:
                 continue
-            product_url = str(row.source_product_url or "").strip()
+            product_url = str(row.source_url or "").strip()
             if not product_url:
                 continue
             if product_url in seen_by_key[source_key]:
@@ -745,7 +750,7 @@ def _ensure_backend_source(db, source_key: str, sample_item: dict[str, Any] | No
         return None
     sample_url = ""
     if isinstance(sample_item, dict):
-        sample_url = str(sample_item.get("source_product_url") or sample_item.get("url") or "").strip()
+        sample_url = str(sample_item.get("url") or "").strip()
     base_url = f"https://{normalized_key}/"
     name = normalized_key
     row = ParserSource(
@@ -858,7 +863,7 @@ def _mark_missing_source_products_unavailable(source_key: str, seen_source_urls:
             db.query(
                 ParserProduct.id.label("product_id"),
                 ParserProduct.status.label("status"),
-                ParserProductOriginVariant.source_product_url.label("source_product_url"),
+                ParserProductOriginVariant.source_url.label("source_url"),
             )
             .join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
             .filter(ParserProduct.deleted_at.is_(None))
@@ -875,7 +880,7 @@ def _mark_missing_source_products_unavailable(source_key: str, seen_source_urls:
                     "urls": set(),
                 },
             )
-            source_url = str(row.source_product_url or "").strip()
+            source_url = str(row.source_url or "").strip()
             if source_url:
                 entry["urls"].add(source_url)
 
@@ -912,7 +917,6 @@ def _mark_missing_source_products_unavailable(source_key: str, seen_source_urls:
 def _normalize_variants_with_source_lineage(
     *,
     source_key: str,
-    source_product_url: str,
     variants: Any,
 ) -> list[dict[str, Any]]:
     parsed = variants if isinstance(variants, list) else []
@@ -922,11 +926,13 @@ def _normalize_variants_with_source_lineage(
             continue
         item = dict(raw)
         item["source_key"] = str(item.get("source_key") or source_key).strip() or source_key
-        item["source_product_url"] = str(item.get("source_product_url") or source_product_url).strip() or source_product_url
-        source_variant_id = str(item.get("source_variant_id") or item.get("id") or "").strip()
-        item["source_variant_id"] = source_variant_id or None
-        source_variant_title = str(item.get("source_variant_title") or item.get("title") or "").strip()
-        item["source_variant_title"] = source_variant_title or None
+        source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
+        source_variant_id = str(source_ref.get("id") or "").strip()
+        source_variant_sku = str(source_ref.get("sku") or "").strip()
+        item["source_ref"] = {
+            "id": source_variant_id or None,
+            "sku": source_variant_sku or None,
+        }
         item["currency"] = _variant_currency(item.get("currency"))
         out.append(item)
     return out
@@ -936,29 +942,7 @@ def _normalize_source_key_from_source(source: ParserSource) -> str:
     return str(urlparse(str(source.url or "")).netloc or source.name or "").strip().lower()
 
 
-def _variant_fingerprint_payload(variant: dict[str, Any]) -> str:
-    parts = [
-        str(variant.get("sku") or "").strip().lower(),
-        str(variant.get("title") or "").strip().lower(),
-        str(variant.get("option1") or "").strip().lower(),
-        str(variant.get("option2") or "").strip().lower(),
-        str(variant.get("option3") or "").strip().lower(),
-        str(variant.get("price") or "").strip().lower(),
-        str(variant.get("currency") or "").strip().upper(),
-    ]
-    return "|".join(parts)
-
-
-def _fallback_source_variant_id(variant: dict[str, Any]) -> str:
-    sku = str(variant.get("sku") or "").strip()
-    if sku:
-        return sku
-    raw = _variant_fingerprint_payload(variant)
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-    return f"auto-{digest}"
-
-
-def _fallback_source_variant_title(variant: dict[str, Any], source_variant_id: str) -> str:
+def _fallback_source_variant_title(variant: dict[str, Any], ordinal: int) -> str:
     title = str(variant.get("title") or "").strip()
     if title:
         return title
@@ -970,27 +954,17 @@ def _fallback_source_variant_title(variant: dict[str, Any], source_variant_id: s
     option_title = " / ".join([x for x in options if x])
     if option_title:
         return option_title
-    return source_variant_id
+    return f"Variant {ordinal}"
 
 
-def _origin_key(
-    *,
-    source_id: int,
-    source_product_url: str,
-    source_variant_id: str | None,
-    source_variant_title: str | None,
-) -> str:
-    return "|".join(
-        [
-            str(int(source_id)),
-            str(source_product_url or "").strip(),
-            str(source_variant_id or "").strip(),
-            str(source_variant_title or "").strip().lower(),
-        ]
-    )
+def _origin_key(*, source_id: int, source_url: str, ordinal: int) -> str:
+    return "|".join([str(int(source_id)), str(source_url or "").strip(), str(int(ordinal))])
 
 
 def _materialize_product_variants_from_origins(db, *, product_id: int) -> list[dict[str, Any]]:
+    # SessionLocal uses autoflush=False, so newly upserted origin variants
+    # must be flushed explicitly before we read them back into parser_product.variants.
+    db.flush()
     rows = (
         db.query(ParserProductOriginVariant)
         .filter(ParserProductOriginVariant.product_id == int(product_id))
@@ -1004,25 +978,24 @@ def _materialize_product_variants_from_origins(db, *, product_id: int) -> list[d
         source_key = str(payload.get("source_key") or "").strip()
         if not source_key and source_row is not None:
             source_key = _normalize_source_key_from_source(source_row)
-        source_variant_id = (
-            str(row.source_variant_id or payload.get("source_variant_id") or payload.get("id") or payload.get("sku") or "").strip()
-            or _fallback_source_variant_id(payload)
-        )
+        source_variant_id = str(row.source_variant_id or "").strip() or None
+        source_variant_sku = str(row.sku or "").strip() or None
         source_variant_title = (
-            str(row.source_variant_title or payload.get("source_variant_title") or payload.get("title") or "").strip()
-            or _fallback_source_variant_title(payload, source_variant_id)
+            str(row.source_variant_title or payload.get("title") or "").strip()
+            or _fallback_source_variant_title(payload, int(row.id))
         )
         item = {
             "id": source_variant_id,
             "title": source_variant_title,
-            "sku": str(row.sku or "").strip() or None,
+            "sku": source_variant_sku,
             "price": _safe_float(row.price),
             "currency": str(row.currency or "").strip().upper() or None,
             "available": bool(row.available),
             "source_key": source_key or None,
-            "source_product_url": str(row.source_product_url or "").strip() or None,
-            "source_variant_id": source_variant_id,
-            "source_variant_title": source_variant_title,
+            "source_ref": {
+                "id": source_variant_id,
+                "sku": source_variant_sku,
+            },
         }
         for k, v in payload.items():
             if k not in item:
@@ -1036,94 +1009,48 @@ def _upsert_origin_variants(
     *,
     product: ParserProduct,
     source: ParserSource,
-    source_product_url: str,
+    source_url: str,
     variants: list[dict[str, Any]],
 ) -> None:
     source_id = int(source.id)
     source_key = _normalize_source_key_from_source(source)
     normalized_variants = [v for v in variants if isinstance(v, dict)]
-    incoming_urls: set[str] = set()
-    incoming_keys: set[str] = set()
-    for variant in normalized_variants:
-        source_variant_id = (
-            str(variant.get("source_variant_id") or variant.get("id") or "").strip()
-            or _fallback_source_variant_id(variant)
-        )
+
+    db.query(ParserProductOriginVariant).filter(
+        ParserProductOriginVariant.product_id == int(product.id)
+    ).filter(
+        ParserProductOriginVariant.source_id == source_id
+    ).delete(synchronize_session=False)
+    db.flush()
+
+    for index, variant in enumerate(normalized_variants, start=1):
+        source_ref = variant.get("source_ref") if isinstance(variant.get("source_ref"), dict) else {}
+        source_variant_id = str(source_ref.get("id") or "").strip() or None
+        source_variant_sku = str(source_ref.get("sku") or "").strip() or None
         source_variant_title = (
             str(variant.get("source_variant_title") or variant.get("title") or "").strip()
-            or _fallback_source_variant_title(variant, source_variant_id)
+            or _fallback_source_variant_title(variant, index)
         )
-        candidate_source_url = str(variant.get("source_product_url") or source_product_url or "").strip() or source_product_url
-        incoming_urls.add(candidate_source_url)
-        incoming_keys.add(
-            _origin_key(
-                source_id=source_id,
-                source_product_url=candidate_source_url,
-                source_variant_id=source_variant_id,
-                source_variant_title=source_variant_title,
-            )
-        )
-
-    # Drop stale variants for this product/source/url scope so variant count cannot
-    # silently accumulate across runs when source variant identity changes.
-    if incoming_urls:
-        existing_rows = (
-            db.query(ParserProductOriginVariant)
-            .filter(ParserProductOriginVariant.product_id == int(product.id))
-            .filter(ParserProductOriginVariant.source_id == source_id)
-            .filter(ParserProductOriginVariant.source_product_url.in_(list(incoming_urls)))
-            .all()
-        )
-        for row in existing_rows:
-            if str(row.origin_key or "") not in incoming_keys:
-                db.delete(row)
-
-    for variant in normalized_variants:
-        source_variant_id = (
-            str(variant.get("source_variant_id") or variant.get("id") or "").strip()
-            or _fallback_source_variant_id(variant)
-        )
-        source_variant_title = (
-            str(variant.get("source_variant_title") or variant.get("title") or "").strip()
-            or _fallback_source_variant_title(variant, source_variant_id)
-        )
-        candidate_source_url = str(variant.get("source_product_url") or source_product_url or "").strip() or source_product_url
-        key = _origin_key(
+        row = ParserProductOriginVariant(
+            origin_key=_origin_key(source_id=source_id, source_url=source_url, ordinal=index),
+            product_id=int(product.id),
             source_id=source_id,
-            source_product_url=candidate_source_url,
+            source_url=source_url,
             source_variant_id=source_variant_id,
             source_variant_title=source_variant_title,
+            sku=source_variant_sku,
+            price=_safe_float(variant.get("price")),
+            currency=_variant_currency(variant.get("currency")),
+            available=bool(variant.get("available", True)),
         )
-        row = (
-            db.query(ParserProductOriginVariant)
-            .filter(ParserProductOriginVariant.origin_key == key)
-            .first()
-        )
-        if row is None:
-            row = ParserProductOriginVariant(
-                origin_key=key,
-                product_id=int(product.id),
-                source_id=source_id,
-                source_product_url=candidate_source_url,
-                source_variant_id=source_variant_id,
-                source_variant_title=source_variant_title,
-            )
-            db.add(row)
-        row.product_id = int(product.id)
-        row.source_id = source_id
-        row.source_product_url = candidate_source_url
-        row.source_variant_id = source_variant_id
-        row.source_variant_title = source_variant_title
-        row.sku = str(variant.get("sku") or "").strip() or None
-        row.price = _safe_float(variant.get("price"))
-        row.currency = _variant_currency(variant.get("currency"))
-        row.available = bool(variant.get("available", True))
         payload = dict(variant)
         payload["source_key"] = str(variant.get("source_key") or source_key).strip() or source_key
-        payload["source_product_url"] = candidate_source_url
-        payload["source_variant_id"] = source_variant_id
-        payload["source_variant_title"] = source_variant_title
+        payload["source_ref"] = {
+            "id": source_variant_id,
+            "sku": source_variant_sku,
+        }
         row.payload = payload
+        db.add(row)
 
 
 def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) -> tuple[int, int]:
@@ -1141,60 +1068,61 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
         for item in items:
             if not isinstance(item, dict):
                 continue
-            external_id = str(item.get("external_id") or "").strip() or None
-            canonical_url = str(item.get("canonical_url") or "").strip() or None
-            source_product_url = str(item.get("source_product_url") or item.get("url") or "").strip()
+            product_source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
+            external_id = str(product_source_ref.get("external_id") or "").strip() or None
+            source_url = str(item.get("url") or "").strip()
             handle = str(item.get("handle") or "").strip()
             if not handle:
-                if source_product_url:
-                    handle = source_product_url.rsplit("/", 1)[-1][:200]
+                if source_url:
+                    handle = source_url.rsplit("/", 1)[-1][:200]
             if not handle:
                 continue
             query = db.query(ParserProduct).filter(ParserProduct.deleted_at.is_(None))
             row = None
-            # Multi-source aggregation: match product globally first.
             if external_id:
-                row = query.filter(ParserProduct.source_external_id == external_id).first()
-            if row is None and canonical_url:
-                row = query.filter(ParserProduct.canonical_url == canonical_url).first()
+                row = (
+                    query.filter(ParserProduct.source_id == int(source.id))
+                    .filter(ParserProduct.external_id == external_id)
+                    .first()
+                )
             if row is None:
                 row = (
                     query.join(ParserProductOriginVariant, ParserProductOriginVariant.product_id == ParserProduct.id)
                     .filter(ParserProductOriginVariant.source_id == int(source.id))
-                    .filter(ParserProductOriginVariant.source_product_url == source_product_url)
+                    .filter(ParserProductOriginVariant.source_url == source_url)
                     .first()
                 )
-            if row is None and source_product_url:
-                row = query.filter(ParserProduct.url == source_product_url).first()
+            if row is None and source_url:
+                row = (
+                    query.filter(ParserProduct.source_id == int(source.id))
+                    .filter(ParserProduct.url == source_url)
+                    .first()
+                )
             if row is None:
                 row = ParserProduct(
                     source_id=int(source.id),
-                    source_external_id=external_id,
-                    canonical_url=canonical_url,
+                    external_id=external_id,
                     handle=handle,
                     title=str(item.get("title") or handle),
-                    url=source_product_url,
+                    url=source_url,
                 )
                 db.add(row)
             else:
                 if external_id:
-                    row.source_external_id = external_id
-                if canonical_url:
-                    row.canonical_url = canonical_url
+                    row.external_id = external_id
             incoming_title = str(item.get("title") or row.title or handle)
             incoming_description = item.get("description")
-            row.vendor = str(item.get("vendor") or item.get("brand") or "").strip() or None
-            row.product_type = str(item.get("product_type") or item.get("category") or "").strip() or None
+            row.vendor = str(item.get("designer") or "").strip() or None
+            row.product_type = str(item.get("category") or "").strip() or None
+            row.gender = _normalize_product_gender(item.get("gender"))
             existing_url = str(getattr(row, "url", "") or "").strip()
-            if source_product_url and (not existing_url or existing_url == source_product_url):
-                row.url = source_product_url
-            row.price = _safe_float(item.get("price"))
+            if source_url and (not existing_url or existing_url == source_url):
+                row.url = source_url
             images = item.get("images") if isinstance(item.get("images"), list) else []
             incoming_image_urls = [str(url).strip() for url in images if str(url).strip()]
             row.variants = _normalize_variants_with_source_lineage(
-                source_key=source_key,
-                source_product_url=source_product_url,
-                variants=item.get("variants"),
+                    source_key=source_key,
+                    variants=item.get("variants"),
             )
             incoming_currency = _derive_product_currency_from_variants(row.variants)
             if not incoming_currency and row.id is None:
@@ -1206,10 +1134,10 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
                 db,
                 product=row,
                 source=source,
-                source_product_url=source_product_url,
+                source_url=source_url,
                 variants=row.variants,
             )
-            # Keep legacy JSON field in sync from normalized origin rows for existing UI/API consumers.
+            # Materialize current variant snapshot from normalized origin rows.
             row.variants = _materialize_product_variants_from_origins(db, product_id=int(row.id))
             parsed_weight = _safe_float(item.get("weight_grams"))
             row.weight_grams = parsed_weight if parsed_weight is not None else row.weight_grams
@@ -1219,8 +1147,6 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
                     row.weight_source = incoming_weight_source
                 elif str(getattr(row, "weight_source", "") or "").strip().lower() in {"", "missing"}:
                     row.weight_source = "source"
-            validation = item.get("validation") if isinstance(item.get("validation"), dict) else {}
-            validation_errors = validation.get("errors") if isinstance(validation.get("errors"), list) else []
             current_status = str(getattr(row, "status", "") or "").strip().lower()
             title_sync_locked = bool(getattr(row, "title_sync_locked", False))
             description_sync_locked = bool(getattr(row, "description_sync_locked", False))
@@ -1235,16 +1161,6 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
                 row.image_count = len(incoming_image_urls)
 
             incoming_status = str(item.get("status") or "").strip().lower()
-            unavailable_reason = str(item.get("unavailable_reason") or "").strip().lower()
-            weight_missing_in_payload = parsed_weight is None or (isinstance(parsed_weight, float) and parsed_weight <= 0.0)
-            unavailable_due_weight = (
-                incoming_status == "unavailable"
-                and (
-                    weight_missing_in_payload
-                    or "weight" in unavailable_reason
-                    or "missing_weight" in unavailable_reason
-                )
-            )
 
             # Manual moderation states must survive sync.
             unavailable_locked = False
@@ -1258,20 +1174,10 @@ def _upsert_products_from_items(source_key: str, items: list[dict[str, Any]]) ->
                 pass
             elif current_status == "unavailable" and unavailable_locked:
                 pass
-            elif unavailable_due_weight:
-                row.status = "unavailable"
-            elif validation_errors:
-                row.status = "unavailable"
             elif incoming_status == "unavailable":
                 row.status = "unavailable"
             else:
-                raw_availability = str(item.get("raw_availability") or "").strip().lower()
-                if raw_availability in {"sold_out", "out_of_stock"}:
-                    row.status = "out_of_stock"
-                elif raw_availability in {"unavailable"}:
-                    row.status = "unavailable"
-                else:
-                    row.status = _derive_status(row.variants)
+                row.status = _derive_status(row.variants)
             # Invariant: product with positive weight can not keep missing marker.
             current_weight = _safe_float(getattr(row, "weight_grams", None))
             if current_weight is not None and current_weight > 0 and str(getattr(row, "weight_source", "") or "").strip().lower() == "missing":
@@ -1488,7 +1394,7 @@ def _poll_and_apply(agg_job: AggregateJob) -> None:
             cast_items = [item for item in items if isinstance(item, dict)]
             if source_key:
                 for raw_item in cast_items:
-                    source_url = str(raw_item.get("source_product_url") or raw_item.get("url") or "").strip()
+                    source_url = str(raw_item.get("url") or "").strip()
                     if source_url:
                         source_seen_urls[source_key].add(source_url)
             expected, applied = _upsert_products_from_items(source_key=source_key, items=cast_items)

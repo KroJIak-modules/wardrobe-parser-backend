@@ -55,6 +55,11 @@ class DedupService:
             return None
         return float(price)
 
+    @classmethod
+    def _product_source_price(cls, product: Any) -> float | None:
+        variants = list(getattr(product, "variants", []) or [])
+        return cls._resolve_price_from_variants(variants=variants, fallback_price=None)
+
     @staticmethod
     def _derive_currency_from_variants(variants: Any) -> str | None:
         parsed = variants if isinstance(variants, list) else []
@@ -102,7 +107,7 @@ class DedupService:
             source_profile = source_profile_map.get(int(source_id)) if source_id is not None else None
             variants = product.variants if isinstance(product.variants, list) else []
             source_currency = self._derive_currency_from_variants(variants)
-            source_price = self._normalize_source_price(product.price, source_currency)
+            source_price = self._normalize_source_price(self._product_source_price(product), source_currency)
             pricing = settings_service.calculate_for_product(
                 source_price=source_price,
                 source_currency=source_currency,
@@ -161,7 +166,7 @@ class DedupService:
             vendor=getattr(product, "vendor", None),
             product_type=getattr(product, "product_type", None),
             url=str(getattr(product, "url", "") or ""),
-            price=cls._safe_float(getattr(product, "price", None)),
+            price=cls._product_source_price(product),
             currency=currency,
             status=str(getattr(product, "status", "available") or "available"),
             image_count=int(getattr(product, "image_count", 0) or 0),
@@ -262,10 +267,10 @@ class DedupService:
         seen: set[str] = set()
 
         def variant_key(variant: dict[str, Any]) -> str:
+            source_ref = variant.get("source_ref") if isinstance(variant.get("source_ref"), dict) else {}
             values = [
                 normalize_text(str(variant.get("source_key") or "")),
-                normalize_text(str(variant.get("source_product_url") or "")),
-                normalize_text(str(variant.get("source_variant_id") or "")),
+                normalize_text(str(source_ref.get("id") or variant.get("id") or "")),
                 normalize_text(str(variant.get("id") or "")),
                 normalize_text(str(variant.get("sku") or "")),
                 normalize_text(str(variant.get("title") or "")),
@@ -347,15 +352,14 @@ class DedupService:
         return {
             "id": int(product.id),
             "source_id": int(product.source_id),
-            "source_external_id": str(product.source_external_id or "").strip() or None,
-            "canonical_url": str(product.canonical_url or "").strip() or None,
+            "external_id": str(product.external_id or "").strip() or None,
             "handle": str(product.handle or "").strip(),
             "title": str(product.title or "").strip(),
             "description": product.description,
             "vendor": str(product.vendor or "").strip() or None,
             "product_type": str(product.product_type or "").strip() or None,
+            "gender": str(getattr(product, "gender", "unisex") or "unisex"),
             "url": str(product.url or "").strip(),
-            "price": self._safe_float(product.price),
             "status": str(product.status or "unavailable"),
             "image_count": int(product.image_count or 0),
             "image_urls": list(product.image_urls or []),
@@ -383,15 +387,14 @@ class DedupService:
 
     def _restore_product(self, product: Any, snapshot: dict[str, Any]) -> None:
         product.source_id = int(snapshot.get("source_id") or product.source_id)
-        product.source_external_id = snapshot.get("source_external_id")
-        product.canonical_url = snapshot.get("canonical_url")
+        product.external_id = snapshot.get("external_id")
         product.handle = str(snapshot.get("handle") or product.handle)
         product.title = str(snapshot.get("title") or product.title)
         product.description = snapshot.get("description")
         product.vendor = snapshot.get("vendor")
         product.product_type = snapshot.get("product_type")
+        product.gender = str(snapshot.get("gender") or "unisex")
         product.url = str(snapshot.get("url") or product.url)
-        product.price = self._safe_float(snapshot.get("price"))
         product.status = str(snapshot.get("status") or product.status)
         product.image_count = int(snapshot.get("image_count") or 0)
         product.image_urls = list(snapshot.get("image_urls") or [])
@@ -429,7 +432,7 @@ class DedupService:
     def _variant_sort_key(item: dict[str, Any]) -> tuple[int, str]:
         return (
             0 if bool(item.get("available")) else 1,
-            str(item.get("title") or item.get("source_variant_title") or item.get("id") or "").strip().lower(),
+            str(item.get("title") or item.get("id") or "").strip().lower(),
         )
 
     def _materialize_variants_from_origin_rows(self, origin_rows: list[ParserProductOriginVariant]) -> list[dict[str, Any]]:
@@ -438,16 +441,17 @@ class DedupService:
             payload = dict(row.payload) if isinstance(row.payload, dict) else {}
             payload_currency = str(payload.get("currency") or "").strip().upper()[:3]
             item: dict[str, Any] = {
-                "id": str(row.source_variant_id or "").strip() or str(payload.get("id") or "").strip() or None,
+                "id": str(row.source_variant_id or "").strip() or None,
                 "title": str(row.source_variant_title or "").strip() or str(payload.get("title") or "").strip() or None,
-                "sku": str(row.sku or "").strip() or str(payload.get("sku") or "").strip() or None,
+                "sku": str(row.sku or "").strip() or None,
                 "price": self._safe_float(row.price),
                 "currency": str(row.currency or "").strip().upper() or (payload_currency if len(payload_currency) == 3 else None),
                 "available": bool(row.available),
                 "source_key": str(payload.get("source_key") or "").strip() or None,
-                "source_product_url": str(row.source_product_url or "").strip() or str(payload.get("source_product_url") or "").strip() or None,
-                "source_variant_id": str(row.source_variant_id or "").strip() or None,
-                "source_variant_title": str(row.source_variant_title or "").strip() or None,
+                "source_ref": {
+                    "id": str(row.source_variant_id or "").strip() or None,
+                    "sku": str(row.sku or "").strip() or None,
+                },
             }
             for key, value in payload.items():
                 if key not in item:
@@ -460,7 +464,6 @@ class DedupService:
         rows = self._origin_rows_for_products({int(product.id)})
         variants = self._materialize_variants_from_origin_rows(rows)
         product.variants = variants
-        product.price = self._resolve_price_from_variants(variants=variants, fallback_price=self._safe_float(product.price))
         product.status = self._resolve_status_from_variants(variants, str(product.status or "out_of_stock"))
 
     def _build_created_product(
@@ -475,19 +478,19 @@ class DedupService:
         merged_description = left.description if left.description else right.description
         merged_vendor = left.vendor if left.vendor else right.vendor
         merged_type = left.product_type if left.product_type else right.product_type
+        merged_gender = str(getattr(left, "gender", "") or "").strip().lower() or str(getattr(right, "gender", "") or "").strip().lower() or "unisex"
         merged_images = self._unique_list([*(left.image_urls or []), *(right.image_urls or [])])
         merged_image_ids = self._unique_list([*(left.image_asset_ids or []), *(right.image_asset_ids or [])])
         dedup_product = product_model(
             source_id=int(left.source_id),
-            source_external_id=None,
-            canonical_url=None,
+            external_id=None,
             handle=f"dedup-{pair_key_value}",
             title=merged_title,
             description=merged_description,
             vendor=merged_vendor,
             product_type=merged_type,
+            gender=merged_gender if merged_gender in {"male", "female", "unisex"} else "unisex",
             url=f"dedup://{pair_key_value}",
-            price=None,
             status="out_of_stock",
             image_count=max(len(merged_images), int(left.image_count or 0), int(right.image_count or 0)),
             image_urls=merged_images,
@@ -587,8 +590,8 @@ class DedupService:
             score, reasons = candidate_score(
                 left,
                 right,
-                left_price=self._safe_float(getattr(left, "price", None)),
-                right_price=self._safe_float(getattr(right, "price", None)),
+                left_price=self._product_source_price(left),
+                right_price=self._product_source_price(right),
             )
             if score < settings.dedup_score_threshold:
                 continue
@@ -650,6 +653,10 @@ class DedupService:
             primary.vendor = duplicate.vendor
         if not primary.product_type and duplicate.product_type:
             primary.product_type = duplicate.product_type
+        if str(getattr(primary, "gender", "") or "").strip().lower() not in {"male", "female"}:
+            duplicate_gender = str(getattr(duplicate, "gender", "") or "").strip().lower()
+            if duplicate_gender in {"male", "female"}:
+                primary.gender = duplicate_gender
         if (primary.image_count or 0) < (duplicate.image_count or 0):
             primary.image_count = duplicate.image_count
             if duplicate.image_urls:
@@ -657,11 +664,6 @@ class DedupService:
             if duplicate.image_asset_ids:
                 primary.image_asset_ids = duplicate.image_asset_ids
         primary_variants = primary.variants if isinstance(primary.variants, list) else []
-        primary.price = self._resolve_price_from_variants(
-            variants=primary_variants,
-            fallback_price=self._safe_float(getattr(primary, "price", None)),
-        )
-
         for row in origin_rows:
             row.product_id = int(primary.id)
         self.db.flush()
@@ -670,7 +672,6 @@ class DedupService:
         duplicate.status = "unavailable"
         duplicate.deleted_at = None
         duplicate.variants = []
-        duplicate.price = None
         key = pair_key(primary.id, duplicate.id)
         upsert_merge_decision(
             self.decision_repo,

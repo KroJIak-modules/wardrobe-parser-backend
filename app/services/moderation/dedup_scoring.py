@@ -153,8 +153,8 @@ def candidate_score(
         score += settings.dedup_vendor_match_weight
         reasons.append("vendor_match")
 
-    effective_left_price = left_price if left_price is not None else left.price
-    effective_right_price = right_price if right_price is not None else right.price
+    effective_left_price = left_price
+    effective_right_price = right_price
     if effective_left_price is not None and effective_right_price is not None:
         max_price = max(effective_left_price, effective_right_price)
         diff = abs(effective_left_price - effective_right_price)

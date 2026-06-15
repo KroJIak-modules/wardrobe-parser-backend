@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.models import ParserBrandMapping, ParserCategory, ParserCategoryKeyword, ParserCategoryManualProduct, ParserProduct
 from app.repositories import (
     ParserCategoryCountSnapshotRepository,
@@ -45,96 +44,12 @@ _PRODUCT_WITH_GENDER_CTE = """
 product_with_gender AS (
     SELECT
         p.*,
-        regexp_replace(lower(trim(coalesce(p.product_type, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_product_type,
-        regexp_replace(lower(trim(coalesce(p.title, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_title,
-        regexp_replace(lower(trim(coalesce(p.handle, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_handle,
-        regexp_replace(lower(trim(coalesce(p.url, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_url,
-        regexp_replace(lower(trim(coalesce(p.description, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_description,
-        regexp_replace(lower(trim(coalesce(p.variants::text, ''))), '[^[:alnum:]]+', ' ', 'g') AS norm_variants
+        CASE
+            WHEN lower(trim(coalesce(p.gender, ''))) IN ('male', 'female', 'unisex')
+                THEN lower(trim(coalesce(p.gender, '')))
+            ELSE 'unisex'
+        END AS resolved_gender
     FROM product_with_vendor p
-)
-"""
-
-_GENDER_INFERRED_CTE = """
-gender_inferred AS (
-    WITH gender_scored AS (
-        SELECT
-            g.id,
-            g.source_id,
-            g.norm_product_type,
-            (
-                (CASE WHEN g.norm_product_type ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 10 ELSE 0 END) +
-                (CASE WHEN g.norm_title ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 6 ELSE 0 END) +
-                (CASE WHEN g.norm_handle ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 3 ELSE 0 END) +
-                (CASE WHEN g.norm_url ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 3 ELSE 0 END) +
-                (CASE WHEN g.norm_description ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 4 ELSE 0 END) +
-                (CASE WHEN g.norm_variants ~ '(^| )(men|mens|male|man|homme|uomo|muzh|муж)( |$)' THEN 4 ELSE 0 END)
-            ) AS men_score,
-            (
-                (CASE WHEN g.norm_product_type ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 10 ELSE 0 END) +
-                (CASE WHEN g.norm_title ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 6 ELSE 0 END) +
-                (CASE WHEN g.norm_handle ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 3 ELSE 0 END) +
-                (CASE WHEN g.norm_url ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 3 ELSE 0 END) +
-                (CASE WHEN g.norm_description ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 4 ELSE 0 END) +
-                (CASE WHEN g.norm_variants ~ '(^| )(women|womens|female|woman|femme|donna|zhen|жен)( |$)' THEN 4 ELSE 0 END)
-            ) AS women_score,
-            (
-                g.norm_product_type ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
-                OR g.norm_title ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
-                OR g.norm_handle ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
-                OR g.norm_url ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
-                OR g.norm_description ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
-                OR g.norm_variants ~ '(^| )(unisex|унисекс|ユニセックス)( |$)'
-            ) AS has_unisex
-        FROM product_with_gender g
-    ),
-    direct_gender AS (
-        SELECT
-            s.id,
-            s.source_id,
-            s.norm_product_type,
-            CASE
-                WHEN s.men_score > s.women_score THEN 'male'
-                WHEN s.women_score > s.men_score THEN 'female'
-                WHEN s.has_unisex THEN 'unisex'
-                ELSE NULL
-            END AS direct_gender
-        FROM gender_scored s
-    ),
-    profile_stats AS (
-        SELECT
-            d.source_id,
-            d.norm_product_type,
-            count(*) FILTER (WHERE d.direct_gender = 'male')::int AS male_count,
-            count(*) FILTER (WHERE d.direct_gender = 'female')::int AS female_count,
-            count(*) FILTER (WHERE d.direct_gender IN ('male', 'female'))::int AS known_count
-        FROM direct_gender d
-        WHERE d.norm_product_type IS NOT NULL
-          AND char_length(trim(d.norm_product_type)) > 0
-        GROUP BY d.source_id, d.norm_product_type
-    ),
-    profile_pick AS (
-        SELECT
-            p.source_id,
-            p.norm_product_type,
-            CASE
-                WHEN p.known_count >= {profile_min_samples}
-                     AND p.male_count::float / NULLIF(p.known_count, 0)::float >= {profile_min_confidence}
-                    THEN 'male'
-                WHEN p.known_count >= {profile_min_samples}
-                     AND p.female_count::float / NULLIF(p.known_count, 0)::float >= {profile_min_confidence}
-                    THEN 'female'
-                ELSE NULL
-            END AS profile_gender
-        FROM profile_stats p
-    )
-    SELECT
-        d.id,
-        coalesce(d.direct_gender, p.profile_gender) AS inferred_gender
-    FROM direct_gender d
-    LEFT JOIN profile_pick p
-      ON p.source_id = d.source_id
-     AND p.norm_product_type = d.norm_product_type
 )
 """
 
@@ -187,15 +102,6 @@ OR
 OR
 (k.keyword_scope = 'status' AND lower(trim(p.status::text)) = lower(trim(k.keyword)))
 """
-
-
-def _gender_inferred_cte_sql() -> str:
-    return _GENDER_INFERRED_CTE.format(
-        profile_min_samples=int(settings.category_gender_profile_min_samples),
-        profile_min_confidence=float(settings.category_gender_profile_min_confidence),
-    )
-
-
 class CategoryIndexService:
     MIN_REBUILD_INTERVAL_SEC = 120
 
@@ -340,7 +246,6 @@ class CategoryIndexService:
                 WITH
                 {_PRODUCT_WITH_VENDOR_CTE},
                 {_PRODUCT_WITH_GENDER_CTE},
-                {_gender_inferred_cte_sql()},
                 {_CATEGORY_GENDER_CONSTRAINT_CTE}
                 SELECT
                     p.id AS product_id,
@@ -350,7 +255,7 @@ class CategoryIndexService:
                     now(),
                     now()
                 FROM product_with_vendor p
-                JOIN gender_inferred gi ON gi.id = p.id
+                JOIN product_with_gender pg ON pg.id = p.id
                 JOIN parser_category c ON c.id = :category_id
                 LEFT JOIN category_gender_constraint cgc ON cgc.category_id = c.id
                 LEFT JOIN parser_category_keyword k ON k.category_id = c.id
@@ -366,8 +271,8 @@ class CategoryIndexService:
                   )
                   AND (
                     cgc.required_gender IS NULL
-                    OR cgc.required_gender = gi.inferred_gender
-                    OR gi.inferred_gender = 'unisex'
+                    OR cgc.required_gender = pg.resolved_gender
+                    OR pg.resolved_gender = 'unisex'
                   )
                   AND (
                     (
@@ -477,7 +382,6 @@ class CategoryIndexService:
                 {_CATEGORY_GENDER_CONSTRAINT_CTE},
                 {_PRODUCT_WITH_VENDOR_CTE},
                 {_PRODUCT_WITH_GENDER_CTE},
-                {_gender_inferred_cte_sql()},
                 auto_matches AS (
                     SELECT
                         p.id AS product_id,
@@ -485,7 +389,7 @@ class CategoryIndexService:
                         'auto' AS match_source,
                         SUM(char_length(k.keyword))::int AS score
                     FROM product_with_vendor p
-                    JOIN gender_inferred gi ON gi.id = p.id
+                    JOIN product_with_gender pg ON pg.id = p.id
                     JOIN parser_category_keyword k ON TRUE
                     JOIN parser_category c ON c.id = k.category_id
                     LEFT JOIN category_gender_constraint cgc ON cgc.category_id = c.id
@@ -501,8 +405,8 @@ class CategoryIndexService:
                       )
                       AND (
                         cgc.required_gender IS NULL
-                        OR cgc.required_gender = gi.inferred_gender
-                        OR gi.inferred_gender = 'unisex'
+                        OR cgc.required_gender = pg.resolved_gender
+                        OR pg.resolved_gender = 'unisex'
                       )
                       AND char_length(trim(k.keyword)) > 0
                       AND (

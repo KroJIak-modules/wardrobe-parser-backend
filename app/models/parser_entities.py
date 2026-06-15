@@ -43,15 +43,14 @@ class ParserProduct(Base):
 
     id = Column(Integer, primary_key=True)
     source_id = Column(Integer, ForeignKey("parser_source.id"), nullable=False)
-    source_external_id = Column(String(255), nullable=True)
-    canonical_url = Column(String(2048), nullable=True)
+    external_id = Column(String(255), nullable=True)
     handle = Column(String(1024), nullable=False)
     title = Column(String(2048), nullable=False)
     description = Column(Text, nullable=True)
     vendor = Column(String(255), nullable=True)
     product_type = Column(String(255), nullable=True)
+    gender = Column(String(16), nullable=False, default="unisex", server_default="unisex")
     url = Column(String(2048), nullable=False)
-    price = Column(Float, nullable=True)
     status = Column(
         PGEnum(
             "available",
@@ -96,8 +95,7 @@ class ParserProduct(Base):
     )
 
     __table_args__ = (
-        Index("idx_parser_product_source_external_id", "source_id", "source_external_id"),
-        Index("idx_parser_product_source_canonical_url", "source_id", "canonical_url"),
+        Index("idx_parser_product_external_id", "source_id", "external_id"),
     )
 
 
@@ -167,7 +165,7 @@ class ParserProductOriginVariant(Base):
     origin_key = Column(String(512), nullable=False, unique=True)
     product_id = Column(Integer, ForeignKey("parser_product.id", ondelete="CASCADE"), nullable=False)
     source_id = Column(Integer, ForeignKey("parser_source.id", ondelete="RESTRICT"), nullable=False)
-    source_product_url = Column(String(2048), nullable=False)
+    source_url = Column(String(2048), nullable=False)
     source_variant_id = Column(String(255), nullable=True)
     source_variant_title = Column(String(1024), nullable=True)
     sku = Column(String(255), nullable=True)
