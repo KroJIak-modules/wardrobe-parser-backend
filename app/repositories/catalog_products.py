@@ -4,6 +4,7 @@ from collections.abc import Iterable
 
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.source_identity import normalize_host, normalize_listing_url
 from app.models import (
     Product,
     ProductListing,
@@ -81,7 +82,8 @@ class CatalogProductRepository:
             listing = query.filter(ProductListing.external_id == normalized_external_id).one_or_none()
             if listing is not None:
                 return listing
-        return query.filter(ProductListing.url == str(url or "").strip()).one_or_none()
+        normalized_url = normalize_listing_url(url)
+        return query.filter(ProductListing.url_normalized == normalized_url).one_or_none()
 
     def create_product(self, **kwargs) -> Product:
         entity = Product(**kwargs)
@@ -90,6 +92,9 @@ class CatalogProductRepository:
         return entity
 
     def create_listing(self, **kwargs) -> ProductListing:
+        raw_url = str(kwargs.get("url") or "").strip()
+        kwargs.setdefault("url_normalized", normalize_listing_url(raw_url))
+        kwargs.setdefault("host_normalized", normalize_host(raw_url))
         entity = ProductListing(**kwargs)
         self.session.add(entity)
         self.session.flush()

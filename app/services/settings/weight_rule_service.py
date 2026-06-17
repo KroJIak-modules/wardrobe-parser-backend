@@ -422,9 +422,9 @@ class WeightRuleService:
             WeightMissingProductResponse(
                 id=int(product.id),
                 title=str(listing.source_title or f"Product {int(product.id)}"),
-                url=str(listing.url),
-                source_id=int(source.id),
-                source_name=str(source.name),
+                url=(str(listing.url) if str(listing.ingest_mode or "") != "manual" else ""),
+                source_id=(int(source.id) if str(listing.ingest_mode or "") != "manual" else None),
+                source_name=(str(source.name) if str(listing.ingest_mode or "") != "manual" else None),
             )
             for product, listing, source in rows
         ]

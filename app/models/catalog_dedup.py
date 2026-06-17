@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, String, func
+from sqlalchemy import BigInteger, CheckConstraint, Column, DateTime, ForeignKey, String, func
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -16,6 +16,13 @@ class ProductDedupDecision(Base):
 
     created_product = relationship("Product")
     members = relationship("ProductDedupDecisionMember", back_populates="decision", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        CheckConstraint(
+            "(decision_kind = 'merge' AND created_product_id IS NOT NULL) OR (decision_kind <> 'merge' AND created_product_id IS NULL)",
+            name="ck_product_dedup_decisions_created_product_merge_only",
+        ),
+    )
 
 
 class ProductDedupDecisionMember(Base):

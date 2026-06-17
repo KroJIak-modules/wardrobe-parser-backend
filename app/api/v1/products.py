@@ -36,6 +36,9 @@ class ProductPatchRequest(BaseModel):
     manual_weight_grams: int | None = None
     price_override: dict | None = None
     images: dict | None = None
+    gallery_listing_id: int | None = None
+    filter_slugs: list[str] | None = None
+    custom_catalog_slugs: list[str] | None = None
     reset_to_default: list[str] = Field(default_factory=list)
 
 
@@ -61,6 +64,30 @@ class ManualProductRequest(BaseModel):
     manual_image_asset_ids: list[int] = Field(default_factory=list)
     manual_weight_grams: int | None = None
     price_override: dict | None = None
+    filter_slugs: list[str] = Field(default_factory=list)
+    custom_catalog_slugs: list[str] = Field(default_factory=list)
+    bind_source_url: str | None = None
+    bind_source_as_primary: bool = False
+
+
+class ManualProductPatchRequest(BaseModel):
+    title: str | None = None
+    description_text: str | None = None
+    description_html: str | None = None
+    designer_id: int | None = None
+    designer_name: str | None = None
+    source_category_name: str | None = None
+    gender: str | None = None
+    availability_mode: str | None = None
+    visibility_status: str | None = None
+    orderability_status: str | None = None
+    variants: list[ManualVariantRequest] | None = None
+    manual_image_asset_ids: list[int] | None = None
+    gallery_listing_id: int | None = None
+    manual_weight_grams: int | None = None
+    price_override: dict | None = None
+    filter_slugs: list[str] | None = None
+    custom_catalog_slugs: list[str] | None = None
 
 
 class ProductUrlRequest(BaseModel):
@@ -156,6 +183,9 @@ def list_products(
     offset: int = Query(default=0, ge=0),
     source_id: int | None = Query(default=None),
     designer_id: int | None = Query(default=None),
+    category_slug: str | None = Query(default=None),
+    filter_slug: str | None = Query(default=None),
+    custom_catalog_slug: str | None = Query(default=None),
     visibility_status: str | None = Query(default=None),
     availability_mode: str | None = Query(default=None),
     orderability_status: str | None = Query(default=None),
@@ -167,6 +197,9 @@ def list_products(
         query=q,
         source_id=source_id,
         designer_id=designer_id,
+        category_slug=category_slug,
+        filter_slug=filter_slug,
+        custom_catalog_slug=custom_catalog_slug,
         visibility_status=visibility_status,
         availability_mode=availability_mode,
         orderability_status=orderability_status,
@@ -180,6 +213,9 @@ def admin_products_table(
     offset: int = Query(default=0, ge=0),
     source_id: int | None = Query(default=None),
     designer_id: int | None = Query(default=None),
+    category_slug: str | None = Query(default=None),
+    filter_slug: str | None = Query(default=None),
+    custom_catalog_slug: str | None = Query(default=None),
     visibility_status: str | None = Query(default=None),
     availability_mode: str | None = Query(default=None),
     orderability_status: str | None = Query(default=None),
@@ -191,6 +227,9 @@ def admin_products_table(
         offset=offset,
         source_id=source_id,
         designer_id=designer_id,
+        category_slug=category_slug,
+        filter_slug=filter_slug,
+        custom_catalog_slug=custom_catalog_slug,
         visibility_status=visibility_status,
         availability_mode=availability_mode,
         orderability_status=orderability_status,
@@ -266,13 +305,22 @@ def patch_product(product_id: int, payload: ProductPatchRequest, db: Session = D
 @router.post("/products/manual", dependencies=[Depends(require_permission("control.products.edit"))])
 def create_manual_product(payload: ManualProductRequest, db: Session = Depends(get_db)) -> dict:
     product_id = ProductWriteService(db).create_manual_product(payload.model_dump())
+    if payload.bind_source_url:
+        service_item = _probe_service_product(payload.bind_source_url)
+        source_id = _resolve_source_id(db, payload.bind_source_url)
+        ProductIngestService(db).apply_batch(
+            source_id=source_id,
+            items=[service_item],
+            target_product_id=product_id,
+            force_primary_listing=bool(payload.bind_source_as_primary),
+        )
     db.commit()
     return {"ok": True, "id": product_id}
 
 
 @router.patch("/products/manual/{product_id}", dependencies=[Depends(require_permission("control.products.edit"))])
-def update_manual_product(product_id: int, payload: ManualProductRequest, db: Session = Depends(get_db)) -> dict:
-    ProductWriteService(db).update_manual_product(product_id=product_id, payload=payload.model_dump())
+def update_manual_product(product_id: int, payload: ManualProductPatchRequest, db: Session = Depends(get_db)) -> dict:
+    ProductWriteService(db).update_manual_product(product_id=product_id, payload=payload.model_dump(exclude_unset=True))
     db.commit()
     return {"ok": True, "id": product_id}
 
@@ -340,3 +388,17 @@ def bind_source_by_url(product_id: int, payload: BindSourceByUrlRequest, db: Ses
     if refreshed is None:
         raise NotFoundError("Товар не найден")
     return refreshed
+
+
+@router.delete("/products/{product_id}/listings/{listing_id}", dependencies=[Depends(require_permission("control.products.edit"))])
+def unbind_listing(product_id: int, listing_id: int, db: Session = Depends(get_db)) -> dict:
+    detached_product_id = ProductWriteService(db).unbind_listing(product_id=product_id, listing_id=listing_id)
+    db.commit()
+    refreshed = ProductQueryService(db).get_product_payload(product_id)
+    if refreshed is None:
+        raise NotFoundError("Товар не найден")
+    return {
+        "ok": True,
+        "product": refreshed,
+        "detached_product_id": detached_product_id,
+    }

@@ -7,6 +7,7 @@ import re
 
 from sqlalchemy.orm import Session
 
+from app.core.source_identity import normalize_host, normalize_listing_url
 from app.core.exceptions import ValidationError
 from app.models import Product, ProductListing, WeightRule, WeightRuleKeyword
 from app.repositories.catalog_products import CatalogProductRepository
@@ -234,6 +235,8 @@ class ProductIngestService:
                     source_id=int(source_id),
                     external_id=external_id,
                     url=url,
+                    url_normalized=normalize_listing_url(url),
+                    host_normalized=normalize_host(url),
                     handle=str(item.get("handle") or "").strip() or None,
                     source_title=str(item.get("title") or "").strip() or url,
                     source_description_html=str(item.get("description_html") or "").strip() or None,
@@ -248,6 +251,8 @@ class ProductIngestService:
             else:
                 listing.external_id = external_id
                 listing.url = url
+                listing.url_normalized = normalize_listing_url(url)
+                listing.host_normalized = normalize_host(url)
                 listing.handle = str(item.get("handle") or "").strip() or None
                 listing.source_title = str(item.get("title") or "").strip() or url
                 listing.source_description_html = str(item.get("description_html") or "").strip() or None

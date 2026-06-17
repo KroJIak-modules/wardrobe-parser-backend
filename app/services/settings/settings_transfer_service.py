@@ -16,7 +16,6 @@ from app.models import (
     Designer,
     DesignerSourceName,
     PricingSetting,
-    ShowcaseCarouselImage,
     Source,
     Supplier,
     SupplierShippingRate,
@@ -29,7 +28,6 @@ from app.repositories import (
     CatalogSupplierRepository,
     CatalogWeightRuleRepository,
 )
-from app.services.catalog.showcase_service import ShowcaseService
 from app.services.catalog.source_registry_service import SourceRegistryService
 from app.services.settings.pricing_service import PricingSettingsService
 from app.schemas.parser import (
@@ -49,29 +47,20 @@ _PROJECT_NAME = "wardrobe-parser-platform"
 _PRICING_EXPORT_FIELDS = [
     "markup_multiplier",
     "weight_tolerance",
-    "promo_factor",
     "customs_threshold_eur",
-    "customs_threshold_currency",
     "customs_duty_rate",
-    "bybit_extra_rub",
-    "eur_to_usd_rate",
-    "gbp_to_usd_rate",
-    "jpy_to_usd_rate",
+    "eur_to_rub_rate",
+    "usd_to_rub_rate",
+    "usdt_to_rub_rate",
+    "usdt_extra_rub",
     "final_rounding_mode",
     "payment_fee_rate",
     "customs_processing_rate",
     "customs_fixed_rub",
-    "shipping_alt_threshold_eur",
     "tax_rate",
-    "dedup_only_available_products",
-    "show_product_description",
-    "svc_rules",
-    "insurance_rules",
-    "service_fee_rules",
 ]
 
 _PRICING_IMPORT_FIELDS = set(_PRICING_EXPORT_FIELDS)
-_DEFAULT_CURRENCY_PRIORITY = ["USD", "EUR", "GBP"]
 
 
 def _normalize_currency(raw: str | None, *, default: str = "RUB") -> str:
@@ -89,14 +78,6 @@ def _normalize_supplier_key(raw_key: str, fallback_name: str, index: int) -> str
     if not source:
         source = f"supplier-{index}"
     return source[:64]
-
-
-def _norm_host(raw: str) -> str:
-    value = str(raw or "").strip().lower()
-    if not value:
-        return ""
-    value = re.sub(r"^https?://", "", value)
-    return value.split("/", 1)[0]
 
 
 def _slugify_name(raw: str) -> str:
@@ -136,25 +117,10 @@ class SettingsTransferService:
         except requests.RequestException as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Service API unavailable: {exc}") from exc
 
-    @staticmethod
-    def _supplier_alt_position(supplier: Supplier) -> int:
-        parent = getattr(supplier, "parent_supplier", None)
-        if parent is None:
-            return 0
-        ordered_children = sorted(
-            [child for child in getattr(parent, "children", []) if child is not None],
-            key=lambda child: int(getattr(child, "id", 0)),
-        )
-        for index, child in enumerate(ordered_children, start=1):
-            if int(getattr(child, "id", 0)) == int(supplier.id):
-                return index
-        return 0
-
     def export_payload(self) -> SettingsTransferPayload:
         pricing_row, _ = self.pricing_repo.get_or_create_default()
-        PricingSettingsService._sync_legacy_pricing_aliases(pricing_row)
         suppliers = self.supplier_repo.list_all_with_rates()
-        sources = self.source_repo.list_all()
+        sources = SourceRegistryService(self.db).refresh_from_service()
         weight_rules = self.weight_rule_repo.list_active()
 
         supplier_by_id = {int(supplier.id): supplier for supplier in suppliers}
@@ -166,28 +132,25 @@ class SettingsTransferService:
             }
         )
         ui_row = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
-        showcase_state = ShowcaseService(self.db).state()
         admin_ui = SettingsTransferAdminUiSettings(
             designers_min_products=max(1, int(getattr(ui_row, "designers_min_products", 1) or 1)),
             designers_exclude_store_vendors=bool(getattr(ui_row, "designers_exclude_store_vendors", False)),
             auto_sync_period_minutes=max(60, int(getattr(ui_row, "auto_sync_period_minutes", 60) or 60)),
-            hero_image_asset_id=showcase_state["hero_image_asset_id"],
-            carousel_image_asset_ids=showcase_state["carousel_image_asset_ids"],
         )
 
         supplier_entries = [
             SettingsTransferSupplierEntry(
                 key=str(supplier.key),
                 name=str(supplier.name),
-                category=str(getattr(supplier, "provider_kind", "main") or "main"),
+                provider_kind=str(getattr(supplier, "provider_kind", "main") or "main"),
                 parent_supplier_key=(
                     str(supplier_by_id[int(supplier.parent_supplier_id)].key)
                     if getattr(supplier, "parent_supplier_id", None) is not None
                     and int(supplier.parent_supplier_id) in supplier_by_id
                     else None
                 ),
-                alt_position=self._supplier_alt_position(supplier),
                 rate_currency=str(supplier.rate_currency),
+                is_enabled=bool(getattr(supplier, "is_enabled", True)),
                 rates=[
                     {
                         "min_kg": float(rate.min_weight_kg),
@@ -206,36 +169,14 @@ class SettingsTransferService:
             for supplier in suppliers
         ]
 
-        service_sources = self._service_list()
-        service_by_host: dict[str, dict[str, Any]] = {}
-        for item in service_sources:
-            host = _norm_host(item.get("url"))
-            if host and host not in service_by_host:
-                service_by_host[host] = item
-
         source_entries: list[SettingsTransferSourceEntry] = []
         for source in sources:
+            if str(source.key) == SourceRegistryService.MANUAL_SOURCE_KEY:
+                continue
             setting = self.source_repo.ensure_setting(source)
-            service_item = service_by_host.get(_norm_host(source.base_url))
-            cfg = service_item.get("config") if isinstance(service_item, dict) and isinstance(service_item.get("config"), dict) else {}
-            currency_cfg = cfg.get("shopify_currency") if isinstance(cfg.get("shopify_currency"), dict) else {}
-            currency_priority_raw = currency_cfg.get("requested_currency_priority")
-            currency_priority = [
-                str(x).strip().upper()
-                for x in (currency_priority_raw if isinstance(currency_priority_raw, list) else _DEFAULT_CURRENCY_PRIORITY)
-                if str(x).strip()
-            ] or list(_DEFAULT_CURRENCY_PRIORITY)
-            currency_method = str(currency_cfg.get("method") or "priority_list").strip().lower()
-            if currency_method not in {"priority_list", "locked_param_currency", "locked_no_currency"}:
-                currency_method = "priority_list"
-            locked_currency = str(currency_cfg.get("locked_currency") or "").strip().upper() or None
-            if locked_currency == "GBR":
-                locked_currency = "GBP"
-            if locked_currency not in {"USD", "EUR", "GBP", "JPY"}:
-                locked_currency = None
-
             source_entries.append(
                 SettingsTransferSourceEntry(
+                    key=str(source.key),
                     name=str(source.name),
                     url=str(source.base_url),
                     enabled=bool(getattr(setting, "is_enabled", True)),
@@ -243,9 +184,6 @@ class SettingsTransferService:
                     hide_auto_added_products=bool(getattr(setting, "hide_auto_added_products", False)),
                     description_mode=str(getattr(setting, "description_mode", "text") or "text"),
                     show_images=bool(getattr(setting, "show_images", True)),
-                    currency_priority=currency_priority,
-                    currency_method=currency_method,  # type: ignore[arg-type]
-                    locked_currency=locked_currency,
                     supplier_key=(
                         str(supplier_by_id[int(setting.supplier_id)].key)
                         if getattr(setting, "supplier_id", None) is not None and int(setting.supplier_id) in supplier_by_id
@@ -253,8 +191,16 @@ class SettingsTransferService:
                     ),
                     promo_factor=float(getattr(setting, "promo_factor", 1.0) or 1.0),
                     promo_only_no_discount=bool(getattr(setting, "promo_only_no_discount", False)),
-                    buyout_surcharge_value=float(getattr(setting, "buyout_surcharge_value", 0.0) or 0.0),
-                    buyout_surcharge_currency=_normalize_currency(getattr(setting, "buyout_surcharge_currency", None), default="RUB"),
+                    buyout_surcharge_value=(
+                        float(setting.buyout_surcharge_value)
+                        if getattr(setting, "buyout_surcharge_value", None) is not None
+                        else None
+                    ),
+                    buyout_surcharge_currency=(
+                        _normalize_currency(getattr(setting, "buyout_surcharge_currency", None), default="RUB")
+                        if getattr(setting, "buyout_surcharge_currency", None)
+                        else None
+                    ),
                 )
             )
 
@@ -337,6 +283,8 @@ class SettingsTransferService:
         # 2) Reset sources to neutral defaults.
         sources_reset = 0
         for source in self.source_repo.list_all():
+            if str(source.key) == SourceRegistryService.MANUAL_SOURCE_KEY:
+                continue
             setting = self.source_repo.ensure_setting(source)
             setting.is_enabled = True
             setting.is_sync_enabled = True
@@ -345,8 +293,8 @@ class SettingsTransferService:
             setting.show_images = True
             setting.promo_factor = 1.0
             setting.promo_only_no_discount = False
-            setting.buyout_surcharge_value = 0.0
-            setting.buyout_surcharge_currency = "RUB"
+            setting.buyout_surcharge_value = None
+            setting.buyout_surcharge_currency = None
             if fallback_supplier is not None:
                 setting.supplier_id = int(fallback_supplier.id)
             sources_reset += 1
@@ -382,12 +330,10 @@ class SettingsTransferService:
             "weight_tolerance": float(values["weight_tolerance"]),
             "customs_threshold_eur": float(values["customs_threshold_eur"]),
             "customs_duty_rate": float(values["customs_duty_rate"]),
-            "usdt_extra_rub": float(values["bybit_extra_rub"]),
-            "usd_to_rub_rate": float(getattr(row, "usd_to_rub_rate", getattr(row, "usdt_to_rub_rate", 95.0)) or 95.0),
-            "usdt_to_rub_rate": float(getattr(row, "usdt_to_rub_rate", 95.0) or 95.0),
-            "eur_to_rub_rate": float(values["eur_to_usd_rate"]) * float(
-                getattr(row, "usd_to_rub_rate", getattr(row, "usdt_to_rub_rate", 95.0)) or 95.0
-            ),
+            "eur_to_rub_rate": float(values["eur_to_rub_rate"]),
+            "usd_to_rub_rate": float(values["usd_to_rub_rate"]),
+            "usdt_to_rub_rate": float(values["usdt_to_rub_rate"]),
+            "usdt_extra_rub": float(values["usdt_extra_rub"]),
             "final_rounding_mode": str(values["final_rounding_mode"]),
             "payment_fee_rate": float(values["payment_fee_rate"]),
             "customs_processing_rate": float(values["customs_processing_rate"]),
@@ -398,7 +344,6 @@ class SettingsTransferService:
             if getattr(row, key) != raw_value:
                 setattr(row, key, raw_value)
                 updated_fields += 1
-        PricingSettingsService._sync_legacy_pricing_aliases(row)
         return updated_fields
 
     def _import_admin_ui(self, payload: SettingsTransferAdminUiSettings) -> int:
@@ -418,25 +363,6 @@ class SettingsTransferService:
             if getattr(row, key) != raw_value:
                 setattr(row, key, raw_value)
                 updated_fields += 1
-        showcase_settings = ShowcaseService(self.db).ensure_settings()
-        hero_image_asset_id = int(values["hero_image_asset_id"]) if isinstance(values.get("hero_image_asset_id"), int) and int(values.get("hero_image_asset_id")) > 0 else None
-        if showcase_settings.hero_image_asset_id != hero_image_asset_id:
-            showcase_settings.hero_image_asset_id = hero_image_asset_id
-            updated_fields += 1
-        desired_carousel_ids = PricingSettingsService._normalize_image_asset_ids(values.get("carousel_image_asset_ids"), limit=20)
-        current_rows = (
-            self.db.query(ShowcaseCarouselImage)
-            .order_by(ShowcaseCarouselImage.position.asc(), ShowcaseCarouselImage.id.asc())
-            .all()
-        )
-        current_ids = [int(row.image_asset_id) for row in current_rows]
-        if current_ids != desired_carousel_ids:
-            for row in current_rows:
-                self.db.delete(row)
-            self.db.flush()
-            for position, image_asset_id in enumerate(desired_carousel_ids, start=1):
-                self.db.add(ShowcaseCarouselImage(image_asset_id=int(image_asset_id), position=position))
-            updated_fields += 1
         return updated_fields
 
     def _import_suppliers(self, suppliers: list[SettingsTransferSupplierEntry]) -> dict[str, Supplier]:
@@ -452,14 +378,16 @@ class SettingsTransferService:
                 current = self.supplier_repo.create(
                     key=key,
                     name=incoming.name,
-                    provider_kind=incoming.category if incoming.category in {"main", "alt"} else "main",
+                    provider_kind="alternate" if incoming.provider_kind in {"alternate", "alt"} else "main",
                     rate_currency=_normalize_currency(incoming.rate_currency, default="RUB"),
+                    is_enabled=bool(incoming.is_enabled),
                 )
                 self.db.flush()
             else:
                 current.name = incoming.name
-                current.provider_kind = incoming.category if incoming.category in {"main", "alt"} else "main"
+                current.provider_kind = "alternate" if incoming.provider_kind in {"alternate", "alt"} else "main"
                 current.rate_currency = _normalize_currency(incoming.rate_currency, default="RUB")
+                current.is_enabled = bool(incoming.is_enabled)
             self.supplier_repo.replace_ranges(
                 supplier_id=int(current.id),
                 ranges=[
@@ -485,7 +413,7 @@ class SettingsTransferService:
             ) if incoming.parent_supplier_key else None
             parent_supplier = result.get(parent_key) if parent_key else None
             supplier.parent_supplier_id = int(parent_supplier.id) if parent_supplier is not None else None
-            supplier.provider_kind = "alt" if supplier.parent_supplier_id is not None else "main"
+            supplier.provider_kind = "alternate" if supplier.parent_supplier_id is not None else "main"
         return result
 
     def _import_sources(
@@ -498,34 +426,30 @@ class SettingsTransferService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет тарифов для назначения источникам")
         updated = 0
         SourceRegistryService(self.db).refresh_from_service()
-        service_sources = self._service_list()
-        service_by_host: dict[str, dict[str, Any]] = {}
-        for item in service_sources:
-            host = _norm_host(item.get("url"))
-            if host and host not in service_by_host:
-                service_by_host[host] = item
-
         for item in sources:
-            source_key = SourceRegistryService.normalize_source_key(item.url)
-            existing = self.source_repo.get_by_key(source_key) if source_key else None
+            source_key = SourceRegistryService.normalize_source_key(item.key)
+            if not source_key or source_key == SourceRegistryService.MANUAL_SOURCE_KEY:
+                continue
+            existing = self.source_repo.get_by_key(source_key)
             if existing is None:
-                existing = self.db.query(Source).filter(Source.base_url == item.url).one_or_none()
+                existing = self.db.query(Source).filter(Source.key == source_key).one_or_none()
             supplier = supplier_map.get(item.supplier_key) if item.supplier_key else None
-            if supplier is None:
+            if item.supplier_key and supplier is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Для источника '{item.name}' не найден назначенный тариф",
                 )
-            supplier_id = int(supplier.id)
+            supplier_id = int(supplier.id) if supplier is not None else None
             if existing is None:
                 existing = self.source_repo.create(
-                    key=source_key or SourceRegistryService.normalize_source_key(item.name) or f"source-{updated+1}",
+                    key=source_key,
                     name=item.name,
                     base_url=item.url,
                 )
             else:
                 existing.name = item.name
                 existing.base_url = item.url
+                existing.host_normalized = SourceRegistryService.normalize_source_key(item.url)
             setting = self.source_repo.ensure_setting(existing)
             setting.is_enabled = bool(item.enabled)
             setting.is_sync_enabled = bool(item.sync_enabled)
@@ -535,27 +459,19 @@ class SettingsTransferService:
             setting.supplier_id = supplier_id
             setting.promo_factor = float(item.promo_factor)
             setting.promo_only_no_discount = bool(item.promo_only_no_discount)
-            setting.buyout_surcharge_value = float(item.buyout_surcharge_value)
-            setting.buyout_surcharge_currency = _normalize_currency(item.buyout_surcharge_currency, default="RUB")
+            setting.buyout_surcharge_value = (
+                float(item.buyout_surcharge_value)
+                if item.buyout_surcharge_value is not None
+                else None
+            )
+            setting.buyout_surcharge_currency = (
+                _normalize_currency(item.buyout_surcharge_currency, default="RUB")
+                if item.buyout_surcharge_currency is not None
+                else None
+            )
             updated += 1
 
-            service_item = service_by_host.get(_norm_host(item.url))
-            if isinstance(service_item, dict):
-                source_key = str(service_item.get("key") or "").strip()
-                if source_key:
-                    self._service_patch(source_key, {"sync_enabled": bool(item.sync_enabled)})
-                    self._service_patch(
-                        source_key,
-                        {
-                            "requested_currency_priority": [
-                                str(x).strip().upper()
-                                for x in (item.currency_priority or _DEFAULT_CURRENCY_PRIORITY)
-                                if str(x).strip()
-                            ] or list(_DEFAULT_CURRENCY_PRIORITY),
-                            "currency_method": str(item.currency_method),
-                            "locked_currency": str(item.locked_currency or "").strip().upper(),
-                        },
-                    )
+            self._service_patch(source_key, {"sync_enabled": bool(item.sync_enabled), "enabled": bool(item.enabled)})
         return updated
 
     def _import_weight_rules(self, rules: list[SettingsTransferWeightRuleEntry]) -> int:

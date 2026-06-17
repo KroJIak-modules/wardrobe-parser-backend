@@ -2,10 +2,22 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
-from app.models import Product, ProductListing, ProductListingMember, ProductPresentation
+from app.models import (
+    CustomCatalog,
+    CustomCatalogProduct,
+    Filter,
+    FilterManualProduct,
+    FilterNode,
+    Product,
+    ProductListing,
+    ProductListingMember,
+    ProductPresentation,
+    ShowcaseCategory,
+    ShowcaseCategoryAttachment,
+)
 from app.repositories.catalog_products import CatalogProductRepository
 from app.services.settings.pricing_service import PricingSettingsService
 
@@ -15,6 +27,120 @@ class ProductQueryService:
         self.db = db
         self.products = CatalogProductRepository(db)
         self.pricing = PricingSettingsService(db)
+        self._filters_cache: list[Filter] | None = None
+        self._showcase_cache: list[ShowcaseCategory] | None = None
+
+    def _taxonomy_filters(self) -> list[Filter]:
+        if self._filters_cache is None:
+            self._filters_cache = (
+                self.db.query(Filter)
+                .order_by(Filter.slug.asc(), Filter.id.asc())
+                .all()
+            )
+        return self._filters_cache
+
+    def _showcase_categories(self) -> list[ShowcaseCategory]:
+        if self._showcase_cache is None:
+            self._showcase_cache = (
+                self.db.query(ShowcaseCategory)
+                .order_by(ShowcaseCategory.code.asc(), ShowcaseCategory.id.asc())
+                .all()
+            )
+        return self._showcase_cache
+
+    @staticmethod
+    def _normalized_listing_texts(product: Product) -> tuple[list[str], list[str]]:
+        title_texts: list[str] = []
+        category_texts: list[str] = []
+        for membership in product.memberships:
+            listing = membership.listing
+            if listing is None:
+                continue
+            title_texts.append(str(listing.source_title or "").strip().lower())
+            category_texts.append(str(listing.source_category_raw or "").strip().lower())
+        return title_texts, category_texts
+
+    def _matched_filter_slugs(self, product: Product) -> list[str]:
+        title_texts, category_texts = self._normalized_listing_texts(product)
+        matched: list[str] = []
+        for entity in self._taxonomy_filters():
+            slug = str(entity.slug or "").strip()
+            if not slug:
+                continue
+            manual_match = any(int(link.product_id) == int(product.id) for link in entity.manual_products)
+            local_match = any(
+                keyword in text
+                for keyword in [str(row.keyword or "").strip().lower() for row in entity.local_category_keywords if str(row.keyword or "").strip()]
+                for text in category_texts
+            )
+            title_match = any(
+                keyword in text
+                for keyword in [str(row.keyword or "").strip().lower() for row in entity.title_keywords if str(row.keyword or "").strip()]
+                for text in title_texts
+            )
+            if manual_match or local_match or title_match:
+                matched.append(slug)
+        return matched
+
+    def _custom_catalog_slugs(self, product_id: int) -> list[str]:
+        rows = (
+            self.db.query(CustomCatalog.slug)
+            .join(CustomCatalogProduct, CustomCatalogProduct.catalog_id == CustomCatalog.id)
+            .filter(CustomCatalogProduct.product_id == int(product_id))
+            .order_by(CustomCatalog.slug.asc(), CustomCatalog.id.asc())
+            .all()
+        )
+        return [str(row.slug) for row in rows if str(row.slug or "").strip()]
+
+    def _showcase_category_codes_for_product(self, *, matched_filter_slugs: list[str], custom_catalog_slugs: list[str]) -> list[str]:
+        filter_slug_set = set(matched_filter_slugs)
+        custom_catalog_slug_set = set(custom_catalog_slugs)
+        result: list[str] = []
+        for category in self._showcase_categories():
+            for attachment in sorted(category.attachments, key=lambda item: (int(item.position), int(item.id))):
+                if attachment.attachment_kind == "filter" and attachment.filter is not None and str(attachment.filter.slug) in filter_slug_set:
+                    result.append(str(category.code))
+                    break
+                if attachment.attachment_kind == "custom_catalog" and attachment.custom_catalog is not None and str(attachment.custom_catalog.slug) in custom_catalog_slug_set:
+                    result.append(str(category.code))
+                    break
+        return result
+
+    def _apply_filter_slug_query(self, base_query, slug: str):
+        entity = (
+            self.db.query(Filter)
+            .filter(Filter.slug == str(slug).strip())
+            .one_or_none()
+        )
+        if entity is None:
+            return base_query.filter(False)
+        title_patterns = [
+            f"%{str(row.keyword or '').strip().lower()}%"
+            for row in entity.title_keywords
+            if str(row.keyword or "").strip()
+        ]
+        category_patterns = [
+            f"%{str(row.keyword or '').strip().lower()}%"
+            for row in entity.local_category_keywords
+            if str(row.keyword or "").strip()
+        ]
+        predicates = [FilterManualProduct.product_id.is_not(None)]
+        predicates.extend(func.lower(func.coalesce(ProductListing.source_title, "")).like(pattern) for pattern in title_patterns)
+        predicates.extend(func.lower(func.coalesce(ProductListing.source_category_raw, "")).like(pattern) for pattern in category_patterns)
+        return (
+            base_query.outerjoin(
+                FilterManualProduct,
+                and_(
+                    FilterManualProduct.product_id == Product.id,
+                    FilterManualProduct.filter_id == int(entity.id),
+                ),
+            )
+            .filter(or_(*predicates))
+        )
+
+    @staticmethod
+    def _is_business_source_listing(listing: ProductListing | None) -> bool:
+        return listing is not None and str(listing.ingest_mode or "") != "manual"
 
     @staticmethod
     def _resolved_primary_listing(product: Product) -> ProductListing | None:
@@ -167,14 +293,19 @@ class ProductQueryService:
     @staticmethod
     def _listing_payload(product: Product, listing: ProductListing) -> dict:
         gallery = ProductQueryService._gallery_state(product, listing)
+        is_business_source = ProductQueryService._is_business_source_listing(listing)
         return {
             "id": int(listing.id),
-            "source_id": int(listing.source_id),
-            "source_name": str(getattr(getattr(listing, "source", None), "name", "") or "") or None,
+            "source_id": (int(listing.source_id) if is_business_source else None),
+            "source_name": (
+                str(getattr(getattr(listing, "source", None), "name", "") or "") or None
+                if is_business_source
+                else None
+            ),
             "ingest_mode": str(listing.ingest_mode),
             "external_id": str(listing.external_id) if listing.external_id else None,
-            "url": str(listing.url),
-            "handle": str(listing.handle) if listing.handle else None,
+            "url": (str(listing.url) if is_business_source else None),
+            "handle": (str(listing.handle) if is_business_source and listing.handle else None),
             "source_title": str(listing.source_title),
             "source_description_text": str(listing.source_description_text) if listing.source_description_text else None,
             "source_description_html": str(listing.source_description_html) if listing.source_description_html else None,
@@ -204,6 +335,7 @@ class ProductQueryService:
     def _listing_variants(self, listing: ProductListing | None) -> list[dict]:
         if listing is None:
             return []
+        is_business_source = self._is_business_source_listing(listing)
         return [
             {
                 "id": int(variant.id),
@@ -214,8 +346,8 @@ class ProductQueryService:
                 "sku": variant.sku,
                 "currency": str(variant.currency_code or "").upper() or None,
                 "compare_at_price": self._decimal_to_float(variant.compare_at_price_amount),
-                "source_id": int(listing.source_id),
-                "source_name": str(getattr(listing.source, "name", "") or "") or None,
+                "source_id": (int(listing.source_id) if is_business_source else None),
+                "source_name": (str(getattr(listing.source, "name", "") or "") or None if is_business_source else None),
                 "listing_id": int(listing.id),
                 "source_ref_id": str(variant.source_ref_id) if variant.source_ref_id else None,
             }
@@ -279,6 +411,7 @@ class ProductQueryService:
 
     def build_product_payload(self, product: Product) -> dict:
         primary_listing = self._resolved_primary_listing(product)
+        primary_is_business_source = self._is_business_source_listing(primary_listing)
         title = self._effective_title(product, primary_listing)
         description = self._description_state(product, primary_listing)
         gallery = self._gallery_state(product, primary_listing)
@@ -288,6 +421,12 @@ class ProductQueryService:
         final_price, pricing_components = self._compute_pricing(product, primary_listing, primary_listing_variants, effective_weight_grams)
         source_price = next((variant.get("price") for variant in primary_listing_variants if variant.get("price") is not None), None)
         source_currency = next((variant.get("currency") for variant in primary_listing_variants if variant.get("currency")), None)
+        matched_filter_slugs = self._matched_filter_slugs(product)
+        custom_catalog_slugs = self._custom_catalog_slugs(int(product.id))
+        showcase_category_codes = self._showcase_category_codes_for_product(
+            matched_filter_slugs=matched_filter_slugs,
+            custom_catalog_slugs=custom_catalog_slugs,
+        )
         listings = [
             self._listing_payload(product, listing)
             for listing in self.products.list_product_listings(int(product.id))
@@ -306,10 +445,26 @@ class ProductQueryService:
             "weight_rule_id": int(product.weight_rule_id) if product.weight_rule_id is not None else None,
             "effective_weight_grams": effective_weight_grams,
             "title": title,
-            "url": str(primary_listing.url) if primary_listing is not None else "",
-            "handle": str(primary_listing.handle) if primary_listing is not None and primary_listing.handle else None,
-            "source_id": int(primary_listing.source_id) if primary_listing is not None else None,
-            "source_name": str(getattr(getattr(primary_listing, "source", None), "name", "") or "") or None,
+            "url": (
+                str(primary_listing.url)
+                if primary_listing is not None and primary_is_business_source
+                else None
+            ),
+            "handle": (
+                str(primary_listing.handle)
+                if primary_listing is not None and primary_is_business_source and primary_listing.handle
+                else None
+            ),
+            "source_id": (
+                int(primary_listing.source_id)
+                if primary_listing is not None and primary_is_business_source
+                else None
+            ),
+            "source_name": (
+                str(getattr(getattr(primary_listing, "source", None), "name", "") or "") or None
+                if primary_listing is not None and primary_is_business_source
+                else None
+            ),
             "source_category_name": str(primary_listing.source_category_raw) if primary_listing is not None and primary_listing.source_category_raw else None,
             "source_designer_name": str(primary_listing.source_designer_raw) if primary_listing is not None and primary_listing.source_designer_raw else None,
             "orderability_status": str(primary_listing.orderability_status) if primary_listing is not None else "unavailable",
@@ -347,6 +502,11 @@ class ProductQueryService:
                 "description_html": getattr(product.presentation, "description_html", None) if product.presentation is not None else None,
                 "description_visibility": getattr(product.presentation, "description_visibility", None) if product.presentation is not None else None,
             },
+            "taxonomy": {
+                "filter_slugs": matched_filter_slugs,
+                "custom_catalog_slugs": custom_catalog_slugs,
+                "showcase_category_codes": showcase_category_codes,
+            },
             "listings": listings,
             "created_at": product.created_at.isoformat() if product.created_at else None,
             "updated_at": product.updated_at.isoformat() if product.updated_at else None,
@@ -358,6 +518,9 @@ class ProductQueryService:
         query: str = "",
         source_id: int | None = None,
         designer_id: int | None = None,
+        category_slug: str | None = None,
+        filter_slug: str | None = None,
+        custom_catalog_slug: str | None = None,
         visibility_status: str | None = None,
         availability_mode: str | None = None,
         orderability_status: str | None = None,
@@ -379,6 +542,25 @@ class ProductQueryService:
             base_query = base_query.filter(Product.availability_mode == str(availability_mode).strip().lower())
         if orderability_status:
             base_query = base_query.filter(ProductListing.orderability_status == str(orderability_status).strip().lower())
+        effective_filter_slug = str(filter_slug or "").strip() or None
+        effective_custom_catalog_slug = str(custom_catalog_slug or "").strip() or None
+        if effective_filter_slug is None and effective_custom_catalog_slug is None and category_slug:
+            candidate_slug = str(category_slug).strip()
+            if candidate_slug:
+                if self.db.query(Filter.id).filter(Filter.slug == candidate_slug).one_or_none() is not None:
+                    effective_filter_slug = candidate_slug
+                elif self.db.query(CustomCatalog.id).filter(CustomCatalog.slug == candidate_slug).one_or_none() is not None:
+                    effective_custom_catalog_slug = candidate_slug
+                else:
+                    base_query = base_query.filter(False)
+        if effective_filter_slug is not None:
+            base_query = self._apply_filter_slug_query(base_query, effective_filter_slug)
+        if effective_custom_catalog_slug is not None:
+            base_query = (
+                base_query.join(CustomCatalogProduct, CustomCatalogProduct.product_id == Product.id)
+                .join(CustomCatalog, CustomCatalog.id == CustomCatalogProduct.catalog_id)
+                .filter(CustomCatalog.slug == effective_custom_catalog_slug)
+            )
 
         normalized_query = " ".join(str(query or "").strip().lower().split())
         if normalized_query:
@@ -407,6 +589,9 @@ class ProductQueryService:
         query: str = "",
         source_id: int | None = None,
         designer_id: int | None = None,
+        category_slug: str | None = None,
+        filter_slug: str | None = None,
+        custom_catalog_slug: str | None = None,
         visibility_status: str | None = None,
         availability_mode: str | None = None,
         orderability_status: str | None = None,
@@ -415,6 +600,9 @@ class ProductQueryService:
             query=query,
             source_id=source_id,
             designer_id=designer_id,
+            category_slug=category_slug,
+            filter_slug=filter_slug,
+            custom_catalog_slug=custom_catalog_slug,
             visibility_status=visibility_status,
             availability_mode=availability_mode,
             orderability_status=orderability_status,

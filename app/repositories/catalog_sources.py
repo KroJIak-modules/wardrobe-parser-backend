@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.source_identity import normalize_host
 from app.models import Source, SourceSetting, SourceSyncState
 
 
@@ -37,7 +38,7 @@ class CatalogSourceRepository:
         )
 
     def create(self, *, key: str, name: str, base_url: str) -> Source:
-        entity = Source(key=key, name=name, base_url=base_url)
+        entity = Source(key=key, name=name, base_url=base_url, host_normalized=normalize_host(base_url))
         self.session.add(entity)
         self.session.flush()
         return entity

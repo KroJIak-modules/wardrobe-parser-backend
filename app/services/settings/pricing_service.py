@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings as app_settings
-from app.models import AdminUiSettings, ShowcaseCarouselImage, Supplier
+from app.models import AdminUiSettings, Supplier
 from app.repositories import CatalogPricingSettingsRepository, CatalogSourceRepository, CatalogSupplierRepository
 from app.schemas.parser import (
     AdminUiSettingsResponse,
@@ -26,7 +26,6 @@ from app.schemas.parser import (
     PricingSupplierUpdateRequest,
 )
 from app.services.settings.bybit_rate_provider import BybitP2PRateProvider
-from app.services.catalog.showcase_service import ShowcaseService
 
 _FORMULA_LINES = [
     "BFX = BBR + BEX",
@@ -88,15 +87,9 @@ _DEFAULT_INSURANCE_RULES: list[dict[str, Any]] = [
     {"min_eur": 520.0, "max_eur": None, "mode": "fixed_rub", "value": 1300.0},
 ]
 
-_DEFAULT_SERVICE_FEE_RULES: list[dict[str, Any]] = [
-    {"min_rub": 0.0, "max_rub": 7000.0, "mode": "percent", "value": 0.25},
-    {"min_rub": 7000.0, "max_rub": 10000.0, "mode": "fixed_rub", "value": 2500.0},
-    {"min_rub": 10000.0, "max_rub": 17000.0, "mode": "fixed_rub", "value": 3000.0},
-    {"min_rub": 17000.0, "max_rub": 20000.0, "mode": "fixed_rub", "value": 3500.0},
-    {"min_rub": 20000.0, "max_rub": 30000.0, "mode": "percent", "value": 0.20},
-    {"min_rub": 30000.0, "max_rub": 40000.0, "mode": "fixed_rub", "value": 6000.0},
-    {"min_rub": 40000.0, "max_rub": None, "mode": "percent", "value": 0.15},
-]
+_DEFAULT_GBP_TO_USD_RATE = 1.27
+_DEFAULT_JPY_TO_USD_RATE = 0.0065
+_DEFAULT_SHIPPING_ALT_THRESHOLD_EUR = 300.0
 
 @dataclass(slots=True)
 class ProductPricingComputation:
@@ -140,9 +133,11 @@ class PricingSettingsService:
         return value
 
     @staticmethod
-    def _normalize_supplier_category(raw: str | None, *, default: str = "main") -> str:
+    def _normalize_supplier_provider_kind(raw: str | None, *, default: str = "main") -> str:
         value = (raw or default).strip().lower()
-        if value not in {"main", "alt"}:
+        if value == "alt":
+            value = "alternate"
+        if value not in {"main", "alternate"}:
             return default
         return value
 
@@ -173,13 +168,6 @@ class PricingSettingsService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="У базового тарифа может быть только 1 альтернатива")
 
     @staticmethod
-    def _normalize_svc_rule_mode(raw: str | None, *, default: str = "fixed_rub") -> str:
-        value = (raw or default).strip().lower()
-        if value not in {"fixed_rub", "percent"}:
-            return default
-        return value
-
-    @staticmethod
     def _normalize_final_rounding_mode(raw: str | None, *, default: str = "unit") -> str:
         value = (raw or default).strip().lower()
         if value not in {"none", "unit", "ten", "hundred", "thousand"}:
@@ -202,83 +190,6 @@ class PricingSettingsService:
         step = float(step_map.get(normalized_mode, 1.0))
         return float(math.ceil(safe_value / step) * step)
 
-    @classmethod
-    def _normalize_svc_rules(cls, raw_rules: Any) -> list[dict[str, float | str]]:
-        if not isinstance(raw_rules, list):
-            return []
-        normalized: list[dict[str, float | str]] = []
-        for row in raw_rules:
-            if not isinstance(row, dict):
-                continue
-            min_rub = cls._safe_float(row.get("min_rub"))
-            max_rub = cls._safe_float(row.get("max_rub"))
-            value = cls._safe_float(row.get("value"))
-            if min_rub is None or value is None:
-                continue
-            min_rub = max(0.0, float(min_rub))
-            max_rub_value = None if max_rub is None else max(0.0, float(max_rub))
-            if max_rub_value is not None and max_rub_value <= min_rub:
-                continue
-            normalized.append(
-                {
-                    "min_rub": min_rub,
-                    "max_rub": max_rub_value,
-                    "mode": cls._normalize_svc_rule_mode(str(row.get("mode") or "fixed_rub")),
-                    "value": max(0.0, float(value)),
-                }
-            )
-        normalized.sort(
-            key=lambda item: (
-                float(item["min_rub"]),
-                float(item["max_rub"]) if item.get("max_rub") is not None else float("inf"),
-            )
-        )
-        return normalized
-
-    @staticmethod
-    def _validate_svc_rules_no_overlap(rules: list[dict[str, float | str]]) -> None:
-        previous_max: float | None = None
-        for item in rules:
-            min_rub = float(item["min_rub"])
-            max_raw = item.get("max_rub")
-            max_rub = None if max_raw is None else float(max_raw)
-            if max_rub is not None and max_rub <= min_rub:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="SVC: конец диапазона должен быть больше начала",
-                )
-            if previous_max is not None and min_rub < previous_max:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="SVC: диапазоны пересекаются, укажи непересекающиеся интервалы",
-                )
-            previous_max = max_rub
-
-    @staticmethod
-    def _sanitize_svc_rule_boundaries(rules: list[dict[str, float | str]]) -> list[dict[str, float | str]]:
-        sanitized: list[dict[str, float | str]] = []
-        for item in sorted(
-            rules,
-            key=lambda row: (
-                float(row["min_rub"]),
-                float(row["max_rub"]) if row.get("max_rub") is not None else float("inf"),
-            ),
-        ):
-            min_rub = max(0.0, float(item["min_rub"]))
-            max_raw = item.get("max_rub")
-            max_rub = None if max_raw is None else max(0.0, float(max_raw))
-            if max_rub is not None and max_rub <= min_rub:
-                continue
-            sanitized.append(
-                {
-                    "min_rub": min_rub,
-                    "max_rub": max_rub,
-                    "mode": PricingSettingsService._normalize_svc_rule_mode(str(item.get("mode") or "fixed_rub")),
-                    "value": max(0.0, float(item.get("value") or 0.0)),
-                }
-            )
-        return sanitized
-
     @staticmethod
     def _to_rub(value: float, currency: str, *, usd_to_rub: float, eur_to_rub: float) -> float:
         normalized = PricingSettingsService._normalize_currency(currency)
@@ -300,66 +211,25 @@ class PricingSettingsService:
     @staticmethod
     def _effective_fx_rates(
         *,
-        bybit_usdt_to_rub: float,
-        bybit_extra_rub: float,
-        eur_to_usd_rate: float,
+        usd_to_rub_rate: float,
+        eur_to_rub_rate: float,
     ) -> tuple[float, float]:
-        usd_to_rub = max(0.0, float(bybit_usdt_to_rub) + float(bybit_extra_rub))
-        eur_to_rub = max(0.0, float(eur_to_usd_rate) * usd_to_rub)
+        usd_to_rub = max(0.0, float(usd_to_rub_rate))
+        eur_to_rub = max(0.0, float(eur_to_rub_rate))
         return usd_to_rub, eur_to_rub
 
     @classmethod
-    def _sync_legacy_pricing_aliases(cls, entity) -> None:
-        usdt_rate = float(getattr(entity, "usdt_to_rub_rate", 95.0) or 95.0)
-        usdt_extra = float(getattr(entity, "usdt_extra_rub", 1.0) or 1.0)
-        usd_rate = float(getattr(entity, "usd_to_rub_rate", usdt_rate) or usdt_rate)
-        eur_rate = float(getattr(entity, "eur_to_rub_rate", usd_rate * 1.18) or (usd_rate * 1.18))
-        eur_to_usd = eur_rate / usd_rate if usd_rate > 0 else 1.18
-
-        entity.bybit_usdt_to_rub = usdt_rate
-        entity.bybit_extra_rub = usdt_extra
-        entity.eur_to_usd_rate = eur_to_usd
-        if getattr(entity, "gbp_to_usd_rate", None) is None:
-            entity.gbp_to_usd_rate = 1.27
-        if getattr(entity, "jpy_to_usd_rate", None) is None or float(getattr(entity, "jpy_to_usd_rate", 0.0) or 0.0) <= 0:
-            entity.jpy_to_usd_rate = cls._fetch_jpy_to_usd_rate()
-        if getattr(entity, "promo_factor", None) is None:
-            entity.promo_factor = 1.0
-        if getattr(entity, "customs_threshold_currency", None) is None:
-            entity.customs_threshold_currency = "EUR"
-        if getattr(entity, "shipping_alt_threshold_eur", None) is None:
-            entity.shipping_alt_threshold_eur = 300.0
-        if getattr(entity, "dedup_only_available_products", None) is None:
-            entity.dedup_only_available_products = False
-        if getattr(entity, "show_product_description", None) is None:
-            entity.show_product_description = True
-        if not isinstance(getattr(entity, "insurance_rules", None), list):
-            entity.insurance_rules = [dict(item) for item in _DEFAULT_INSURANCE_RULES]
-        if not isinstance(getattr(entity, "service_fee_rules", None), list):
-            entity.service_fee_rules = [dict(item) for item in _DEFAULT_SERVICE_FEE_RULES]
-        if not isinstance(getattr(entity, "svc_rules", None), list):
-            entity.svc_rules = []
-        if not isinstance(getattr(entity, "bybit_bucket_rates", None), list):
-            entity.bybit_bucket_rates = []
-
-    @classmethod
     def _effective_rates_from_entity(cls, entity) -> tuple[float, float]:
-        cls._sync_legacy_pricing_aliases(entity)
-        bybit = float(getattr(entity, "bybit_usdt_to_rub", 95.0) or 95.0)
-        extra = float(getattr(entity, "bybit_extra_rub", 1.0) or 1.0)
-        eur_to_usd = float(getattr(entity, "eur_to_usd_rate", 1.18) or 1.18)
         return cls._effective_fx_rates(
-            bybit_usdt_to_rub=bybit,
-            bybit_extra_rub=extra,
-            eur_to_usd_rate=eur_to_usd,
+            usd_to_rub_rate=float(getattr(entity, "usd_to_rub_rate", 95.0) or 95.0),
+            eur_to_rub_rate=float(getattr(entity, "eur_to_rub_rate", 105.0) or 105.0),
         )
 
     @classmethod
     def _effective_rates_from_settings(cls, settings: PricingSettingsResponse) -> tuple[float, float]:
         return cls._effective_fx_rates(
-            bybit_usdt_to_rub=float(settings.bybit_usdt_to_rub),
-            bybit_extra_rub=float(settings.bybit_extra_rub),
-            eur_to_usd_rate=float(settings.eur_to_usd_rate),
+            usd_to_rub_rate=float(settings.usd_to_rub_rate),
+            eur_to_rub_rate=float(settings.eur_to_rub_rate),
         )
 
     @staticmethod
@@ -495,7 +365,8 @@ class PricingSettingsService:
         if getattr(entity, "tax_rate", None) is None:
             entity.tax_rate = 0.06
             changed = True
-        cls._sync_legacy_pricing_aliases(entity)
+        if not isinstance(getattr(entity, "bybit_bucket_rates", None), list):
+            entity.bybit_bucket_rates = []
 
         return changed
 
@@ -555,7 +426,8 @@ class PricingSettingsService:
         if current_updated_at is None or abs((refreshed_at - current_updated_at).total_seconds()) > 0.5:
             entity.bybit_last_updated_at = refreshed_at
             changed = True
-        PricingSettingsService._sync_legacy_pricing_aliases(entity)
+        if not isinstance(getattr(entity, "bybit_bucket_rates", None), list):
+            entity.bybit_bucket_rates = []
         if not changed:
             return False, "live_cached", snapshot, None
         return True, "live_updated", snapshot, None
@@ -563,7 +435,6 @@ class PricingSettingsService:
     def get_settings(self, *, refresh_bybit: bool = True) -> PricingSettingsResponse:
         entity, created = self.repo.get_or_create_default()
         defaults_changed = self._coerce_settings_defaults(entity)
-        self._sync_legacy_pricing_aliases(entity)
         bybit_status = "skipped"
         bybit_warning = None
         bybit_snapshot = None
@@ -596,36 +467,6 @@ class PricingSettingsService:
     def update_settings(self, payload: PricingSettingsUpdateRequest) -> PricingSettingsResponse:
         entity, created = self.repo.get_or_create_default()
         patch = payload.model_dump(exclude_none=True)
-        for forbidden_key in ("usd_to_rub", "eur_to_rub", "bybit_usdt_to_rub"):
-            patch.pop(forbidden_key, None)
-        if "bybit_extra_rub" in patch:
-            patch["usdt_extra_rub"] = max(0.0, float(patch.pop("bybit_extra_rub") or 0.0))
-        if "eur_to_usd_rate" in patch:
-            next_usd_to_rub = float(getattr(entity, "usd_to_rub_rate", getattr(entity, "usdt_to_rub_rate", 95.0)) or 95.0)
-            patch["eur_to_rub_rate"] = max(0.01, float(patch.pop("eur_to_usd_rate") or 1.18)) * next_usd_to_rub
-        for ignored_key in (
-            "promo_factor",
-            "customs_threshold_currency",
-            "gbp_to_usd_rate",
-            "jpy_to_usd_rate",
-            "shipping_alt_threshold_eur",
-            "dedup_only_available_products",
-            "show_product_description",
-            "insurance_rules",
-            "service_fee_rules",
-            "svc_rules",
-        ):
-            patch.pop(ignored_key, None)
-        if "customs_threshold_currency" in patch:
-            patch["customs_threshold_currency"] = self._normalize_currency(
-                patch.get("customs_threshold_currency"),
-                default=self._normalize_currency(
-                    getattr(entity, "customs_threshold_currency", None),
-                    default="EUR",
-                    allowed={"EUR", "GBP"},
-                ),
-                allowed={"EUR", "GBP"},
-            )
         if "final_rounding_mode" in patch:
             patch["final_rounding_mode"] = self._normalize_final_rounding_mode(
                 patch.get("final_rounding_mode"),
@@ -650,21 +491,6 @@ class PricingSettingsService:
         bybit_snapshot: Any | None = None,
         bybit_last_error: str | None = None,
     ) -> PricingSettingsResponse:
-        PricingSettingsService._sync_legacy_pricing_aliases(entity)
-        normalized_insurance = PricingSettingsService._normalize_range_rules(
-            getattr(entity, "insurance_rules", None),
-            min_key="min_eur",
-            max_key="max_eur",
-            default_rules=_DEFAULT_INSURANCE_RULES,
-        )
-        normalized_service_fee = PricingSettingsService._normalize_range_rules(
-            getattr(entity, "service_fee_rules", None),
-            min_key="min_rub",
-            max_key="max_rub",
-            default_rules=_DEFAULT_SERVICE_FEE_RULES,
-        )
-        normalized_svc_rules = PricingSettingsService._normalize_svc_rules(getattr(entity, "svc_rules", None))
-        PricingSettingsService._validate_svc_rules_no_overlap(normalized_svc_rules)
         bybit_bucket_rates = PricingSettingsService._normalize_bybit_bucket_rates(
             getattr(entity, "bybit_bucket_rates", None),
             step_usdt=int(app_settings.pricing_bybit_bucket_step_usdt),
@@ -689,19 +515,12 @@ class PricingSettingsService:
         return PricingSettingsResponse(
             markup_multiplier=float(entity.markup_multiplier),
             weight_tolerance=float(entity.weight_tolerance),
-            promo_factor=float(entity.promo_factor),
             customs_threshold_eur=float(entity.customs_threshold_eur),
-            customs_threshold_currency=PricingSettingsService._normalize_currency(
-                getattr(entity, "customs_threshold_currency", None),
-                default="EUR",
-                allowed={"EUR", "GBP"},
-            ),
             customs_duty_rate=float(entity.customs_duty_rate),
-            bybit_usdt_to_rub=float(getattr(entity, "bybit_usdt_to_rub", 95.0) or 95.0),
-            bybit_extra_rub=float(getattr(entity, "bybit_extra_rub", 1.0)),
-            eur_to_usd_rate=float(getattr(entity, "eur_to_usd_rate", 1.18)),
-            gbp_to_usd_rate=float(getattr(entity, "gbp_to_usd_rate", 1.4)),
-            jpy_to_usd_rate=float(getattr(entity, "jpy_to_usd_rate")),
+            eur_to_rub_rate=float(getattr(entity, "eur_to_rub_rate", 105.0) or 105.0),
+            usd_to_rub_rate=float(getattr(entity, "usd_to_rub_rate", 95.0) or 95.0),
+            usdt_to_rub_rate=float(getattr(entity, "usdt_to_rub_rate", 95.0) or 95.0),
+            usdt_extra_rub=float(getattr(entity, "usdt_extra_rub", 1.0) or 1.0),
             final_rounding_mode=PricingSettingsService._normalize_final_rounding_mode(
                 getattr(entity, "final_rounding_mode", None),
                 default="unit",
@@ -709,13 +528,7 @@ class PricingSettingsService:
             payment_fee_rate=float(getattr(entity, "payment_fee_rate", 0.02)),
             customs_processing_rate=float(getattr(entity, "customs_processing_rate", 0.08)),
             customs_fixed_rub=float(getattr(entity, "customs_fixed_rub", 540.0)),
-            shipping_alt_threshold_eur=float(getattr(entity, "shipping_alt_threshold_eur", 300.0)),
             tax_rate=float(getattr(entity, "tax_rate", 0.06)),
-            dedup_only_available_products=bool(getattr(entity, "dedup_only_available_products", False)),
-            show_product_description=bool(getattr(entity, "show_product_description", True)),
-            svc_rules=normalized_svc_rules,
-            insurance_rules=normalized_insurance,
-            service_fee_rules=normalized_service_fee,
             bybit_rate_status=bybit_rate_status,
             bybit_rate_warning=bybit_rate_warning,
             bybit_bucket_step_usdt=int(app_settings.pricing_bybit_bucket_step_usdt),
@@ -745,7 +558,6 @@ class PricingSettingsService:
             self.db.add(entity)
             self.db.commit()
             self.db.refresh(entity)
-        showcase_state = ShowcaseService(self.db).state()
         return AdminUiSettingsResponse(
             designers_min_products=max(1, int(getattr(entity, "designers_min_products", 1) or 1)),
             designers_exclude_store_vendors=bool(getattr(entity, "designers_exclude_store_vendors", False)),
@@ -767,8 +579,6 @@ class PricingSettingsService:
             ),
             auto_sync_last_status=(str(getattr(entity, "auto_sync_last_status", "") or "").strip() or None),
             auto_sync_last_error=(str(getattr(entity, "auto_sync_last_error", "") or "").strip() or None),
-            hero_image_asset_id=showcase_state["hero_image_asset_id"],
-            carousel_image_asset_ids=showcase_state["carousel_image_asset_ids"],
         )
 
     def update_admin_ui_settings(self, payload: AdminUiSettingsUpdateRequest) -> AdminUiSettingsResponse:
@@ -780,27 +590,6 @@ class PricingSettingsService:
             patch["designers_exclude_store_vendors"] = bool(patch.get("designers_exclude_store_vendors"))
         if "auto_sync_period_minutes" in patch:
             patch["auto_sync_period_minutes"] = max(60, int(patch.get("auto_sync_period_minutes") or 60))
-        if "hero_image_asset_id" in patch or "carousel_image_asset_ids" in patch:
-            showcase_service = ShowcaseService(self.db)
-            showcase_settings = showcase_service.ensure_settings()
-            if "hero_image_asset_id" in patch:
-                raw_hero = patch.pop("hero_image_asset_id")
-                showcase_settings.hero_image_asset_id = int(raw_hero) if isinstance(raw_hero, int) and raw_hero > 0 else None
-            if "carousel_image_asset_ids" in patch:
-                desired_ids = self._normalize_image_asset_ids(
-                    patch.pop("carousel_image_asset_ids"),
-                    limit=20,
-                )
-                current_rows = (
-                    self.db.query(ShowcaseCarouselImage)
-                    .order_by(ShowcaseCarouselImage.position.asc(), ShowcaseCarouselImage.id.asc())
-                    .all()
-                )
-                for row in current_rows:
-                    self.db.delete(row)
-                self.db.flush()
-                for position, image_asset_id in enumerate(desired_ids, start=1):
-                    self.db.add(ShowcaseCarouselImage(image_asset_id=int(image_asset_id), position=position))
         entity = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
         if entity is None:
             entity = AdminUiSettings(id=1)
@@ -842,28 +631,14 @@ class PricingSettingsService:
             ]
         )
         parent_supplier_id = getattr(supplier, "parent_supplier_id", None)
-        alt_position = 0
-        if parent_supplier_id is not None and getattr(supplier, "parent_supplier", None) is not None:
-            ordered_children = sorted(
-                [child for child in getattr(supplier.parent_supplier, "children", []) if child is not None],
-                key=lambda child: int(getattr(child, "id", 0)),
-            )
-            for index, child in enumerate(ordered_children, start=1):
-                if int(getattr(child, "id", 0)) == int(supplier.id):
-                    alt_position = index
-                    break
         return PricingSupplierResponse(
             id=int(supplier.id),
             key=supplier.key,
             name=supplier.name,
-            category=PricingSettingsService._normalize_supplier_category(getattr(supplier, "provider_kind", None)),
-            parent_supplier_id=(
-                int(parent_supplier_id)
-                if parent_supplier_id is not None
-                else None
-            ),
-            alt_position=alt_position,
+            provider_kind=PricingSettingsService._normalize_supplier_provider_kind(getattr(supplier, "provider_kind", None)),
+            parent_supplier_id=(int(parent_supplier_id) if parent_supplier_id is not None else None),
             rate_currency=rate_currency,
+            is_enabled=bool(getattr(supplier, "is_enabled", True)),
             rates=[
                 {
                     "min_kg": float(item["min_kg"]),
@@ -885,13 +660,15 @@ class PricingSettingsService:
         for key in ("name",):
             if key in patch:
                 setattr(supplier, key, patch[key])
-        if "category" in patch and getattr(supplier, "parent_supplier_id", None) is None:
-            supplier.provider_kind = self._normalize_supplier_category(
-                patch.get("category"),
+        if "provider_kind" in patch and getattr(supplier, "parent_supplier_id", None) is None:
+            supplier.provider_kind = self._normalize_supplier_provider_kind(
+                patch.get("provider_kind"),
                 default=getattr(supplier, "provider_kind", "main"),
             )
         if "rate_currency" in patch:
             supplier.rate_currency = self._normalize_currency(patch.get("rate_currency"), default=supplier.rate_currency)
+        if "is_enabled" in patch:
+            supplier.is_enabled = bool(patch.get("is_enabled"))
         if "rates" in patch:
             normalized = self._normalize_shipping_rows(patch.get("rates"))
             self.supplier_repo.replace_ranges(supplier_id=int(supplier.id), ranges=normalized)
@@ -918,12 +695,13 @@ class PricingSettingsService:
             key=f"pending-{uuid4().hex}",
             name=payload.name.strip(),
             provider_kind=(
-                "alt"
+                "alternate"
                 if parent_supplier is not None
-                else self._normalize_supplier_category(payload.category, default="main")
+                else self._normalize_supplier_provider_kind(payload.provider_kind, default="main")
             ),
             parent_supplier_id=(int(parent_supplier.id) if parent_supplier is not None else None),
             rate_currency=self._normalize_currency(payload.rate_currency, default="RUB"),
+            is_enabled=bool(payload.is_enabled),
         )
         supplier.key = self._build_supplier_key(int(supplier.id))
         settings_entity, _ = self.repo.get_or_create_default()
@@ -998,7 +776,7 @@ class PricingSettingsService:
                 for item in suppliers
                 if getattr(item, "parent_supplier_id", None) == int(selected.id)
             ]
-            alternatives.sort(key=lambda item: (int(getattr(item, "alt_position", 0) or 0), int(item.id)))
+            alternatives.sort(key=lambda item: int(item.id))
             candidates = alternatives if alternatives else [selected]
 
         selected_candidate = candidates[0] if candidates else selected
@@ -1247,7 +1025,7 @@ class PricingSettingsService:
         target_usdt: float,
         settings: PricingSettingsResponse,
     ) -> tuple[float, dict[str, Any]]:
-        base_rate = max(0.0, float(settings.bybit_usdt_to_rub))
+        base_rate = max(0.0, float(settings.usdt_to_rub_rate))
         return base_rate, {
             "bybit_bucket_target_usdt": round(max(1.0, float(target_usdt)), 4),
             "bybit_bucket_selected_usdt": None,
@@ -1297,12 +1075,14 @@ class PricingSettingsService:
                 {"source_price": float(source_price), "source_currency": currency or None},
             )
 
-        base_usdt_to_rub = max(0.0, float(settings.bybit_usdt_to_rub))
-        bybit_extra_rub = max(0.0, float(settings.bybit_extra_rub))
-        eur_to_usd_rate = max(0.0001, float(settings.eur_to_usd_rate))
-        gbp_to_usd_rate = max(0.0001, float(settings.gbp_to_usd_rate))
-        jpy_to_usd_rate = max(0.000001, float(settings.jpy_to_usd_rate))
-        if base_usdt_to_rub <= 0:
+        base_usdt_to_rub = max(0.0, float(settings.usdt_to_rub_rate))
+        usdt_extra_rub = max(0.0, float(settings.usdt_extra_rub))
+        usd_to_rub_rate = max(0.0001, float(settings.usd_to_rub_rate))
+        eur_to_rub_rate = max(0.0001, float(settings.eur_to_rub_rate))
+        eur_to_usd_rate = max(0.0001, eur_to_rub_rate / usd_to_rub_rate)
+        gbp_to_usd_rate = _DEFAULT_GBP_TO_USD_RATE
+        jpy_to_usd_rate = _DEFAULT_JPY_TO_USD_RATE
+        if base_usdt_to_rub <= 0 or usd_to_rub_rate <= 0 or eur_to_rub_rate <= 0:
             return ProductPricingComputation(
                 None,
                 True,
@@ -1319,7 +1099,7 @@ class PricingSettingsService:
         elif currency == "JPY":
             sp_usd = float(source_price) * jpy_to_usd_rate
         elif currency == "RUB":
-            sp_usd = float(source_price) / base_usdt_to_rub
+            sp_usd = float(source_price) / usd_to_rub_rate
         else:
             return ProductPricingComputation(
                 None,
@@ -1334,8 +1114,8 @@ class PricingSettingsService:
         )
         if bybit_bucket_rate <= 0:
             bybit_bucket_rate = base_usdt_to_rub
-        effective_usdt_to_rub = bybit_bucket_rate + bybit_extra_rub
-        eur_to_rub_effective = eur_to_usd_rate * effective_usdt_to_rub
+        effective_usdt_to_rub = bybit_bucket_rate + usdt_extra_rub
+        eur_to_rub_effective = eur_to_rub_rate
         if effective_usdt_to_rub <= 0 or eur_to_rub_effective <= 0:
             return ProductPricingComputation(
                 None,
@@ -1344,9 +1124,9 @@ class PricingSettingsService:
                 {"source_price": float(source_price), "source_currency": currency or None},
             )
         if currency == "RUB":
-            sp_usd = float(source_price) / effective_usdt_to_rub
+            sp_usd = float(source_price) / usd_to_rub_rate
 
-        sp_rub = sp_usd * effective_usdt_to_rub
+        sp_rub = sp_usd * usd_to_rub_rate
         sp_eur = sp_usd / eur_to_usd_rate
 
         effective_weight_grams = max(1.0, float(weight_grams) * settings.weight_tolerance)
@@ -1369,7 +1149,7 @@ class PricingSettingsService:
                 eur_to_rub=eur_to_rub_effective,
             )
         buyout_surcharge_eur = buyout_surcharge_rub / eur_to_rub_effective if eur_to_rub_effective > 0 else 0.0
-        effective_promo_factor = max(0.0, float(settings.promo_factor if promo_factor is None else promo_factor))
+        effective_promo_factor = max(0.0, float(1.0 if promo_factor is None else promo_factor))
         promo_only_no_discount_enabled = bool(promo_only_no_discount)
         has_source_discount = PricingSettingsService._has_discount_in_variants(variants)
         promo_applied_factor = 1.0 if promo_only_no_discount_enabled and has_source_discount else effective_promo_factor
@@ -1382,7 +1162,7 @@ class PricingSettingsService:
 
         insurance_rule = PricingSettingsService._pick_range_rule(
             value=sp_after_promo_eur,
-            rules=settings.insurance_rules,
+            rules=[dict(item) for item in _DEFAULT_INSURANCE_RULES],
             min_key="min_eur",
             max_key="max_eur",
         )
@@ -1395,7 +1175,7 @@ class PricingSettingsService:
         customs_fixed_rub = max(0.0, float(settings.customs_fixed_rub)) if customs_duty_eur > 0 else 0.0
         customs_rub = customs_base_rub + customs_fixed_rub
 
-        use_alt_shipping = sp_after_promo_eur > max(0.0, float(settings.shipping_alt_threshold_eur))
+        use_alt_shipping = sp_after_promo_eur > _DEFAULT_SHIPPING_ALT_THRESHOLD_EUR
         supplier_shipping_rub, supplier_meta = PricingSettingsService._resolve_supplier_rate(
             supplier_id=supplier_id,
             billable_kg=billable_kg,
@@ -1424,7 +1204,7 @@ class PricingSettingsService:
 
         svc_rule = PricingSettingsService._pick_range_rule(
             value=buyout_rub,
-            rules=getattr(settings, "svc_rules", []) or [],
+            rules=[],
             min_key="min_rub",
             max_key="max_rub",
         )
@@ -1469,7 +1249,6 @@ class PricingSettingsService:
                 "insurance_mode": insurance_meta.get("mode"),
                 "insurance_value": insurance_meta.get("value"),
                 "customs_threshold_eur": round(settings.customs_threshold_eur, 4),
-                "customs_threshold_currency": settings.customs_threshold_currency,
                 "customs_duty_rate": round(settings.customs_duty_rate, 6),
                 "customs_processing_rate": round(float(settings.customs_processing_rate), 6),
                 "customs_duty_eur": round(customs_duty_eur, 4),
@@ -1497,15 +1276,17 @@ class PricingSettingsService:
                 "tp_rub": round(subtotal_rub, 4),
                 "markup_multiplier": round(markup_multiplier, 6),
                 "markup_rate": round(max(0.0, markup_multiplier - 1.0), 6),
-                "bybit_usdt_to_rub": round(float(settings.bybit_usdt_to_rub), 6),
-                "bybit_extra_rub": round(float(settings.bybit_extra_rub), 6),
+                "usdt_to_rub_rate": round(float(settings.usdt_to_rub_rate), 6),
+                "usdt_extra_rub": round(float(settings.usdt_extra_rub), 6),
                 "bybit_bucket_rate_rub": round(float(bybit_bucket_rate), 6),
                 "bybit_bucket_step_usdt": int(settings.bybit_bucket_step_usdt),
                 "bybit_bucket_max_usdt": int(settings.bybit_bucket_max_usdt),
                 "effective_usdt_to_rub": round(effective_usdt_to_rub, 6),
-                "eur_to_usd_rate": round(float(settings.eur_to_usd_rate), 6),
-                "gbp_to_usd_rate": round(float(settings.gbp_to_usd_rate), 6),
-                "jpy_to_usd_rate": round(float(settings.jpy_to_usd_rate), 8),
+                "usd_to_rub_rate": round(float(settings.usd_to_rub_rate), 6),
+                "eur_to_rub_rate": round(float(settings.eur_to_rub_rate), 6),
+                "derived_eur_to_usd_rate": round(float(eur_to_usd_rate), 6),
+                "derived_gbp_to_usd_rate": round(float(gbp_to_usd_rate), 6),
+                "derived_jpy_to_usd_rate": round(float(jpy_to_usd_rate), 8),
                 "eur_to_rub_effective": round(eur_to_rub_effective, 6),
                 "final_rounding_mode": final_rounding_mode,
                 "raw_final_price_rub": round(raw_final_price_rub, 4),

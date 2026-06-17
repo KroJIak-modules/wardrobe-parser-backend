@@ -53,6 +53,7 @@ class Source(Base):
     key = Column(String(255), nullable=False, unique=True)
     name = Column(String(255), nullable=False)
     base_url = Column(String(2048), nullable=False)
+    host_normalized = Column(String(255), nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 

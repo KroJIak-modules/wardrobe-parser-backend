@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from urllib.parse import urlparse
 import requests
 
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.source_identity import normalize_host
 from app.models import Source
 from app.repositories.catalog_sources import CatalogSourceRepository
 
@@ -21,17 +21,7 @@ class SourceRegistryService:
 
     @staticmethod
     def normalize_source_key(base_url: str) -> str:
-        raw = str(base_url or "").strip()
-        if not raw:
-            return ""
-        try:
-            parsed = urlparse(raw if "://" in raw else f"https://{raw}")
-            host = str(parsed.hostname or parsed.netloc or parsed.path or "").strip().lower()
-        except Exception:
-            host = raw.strip().lower()
-        if host.startswith("www."):
-            host = host[4:]
-        return host
+        return normalize_host(base_url)
 
     def ensure_manual_source(self) -> Source:
         source = self.repo.get_by_key(self.MANUAL_SOURCE_KEY)
@@ -41,6 +31,7 @@ class SourceRegistryService:
                 name=self.MANUAL_SOURCE_NAME,
                 base_url=self.MANUAL_SOURCE_URL,
             )
+        source.host_normalized = normalize_host(self.MANUAL_SOURCE_URL)
         self.repo.ensure_setting(source)
         self.repo.ensure_sync_state(source)
         self.db.flush()
@@ -62,7 +53,8 @@ class SourceRegistryService:
             if not isinstance(item, dict):
                 continue
             base_url = str(item.get("url") or "").strip()
-            key = self.normalize_source_key(str(item.get("key") or "").strip() or base_url)
+            raw_key = str(item.get("key") or "").strip()
+            key = self.normalize_source_key(raw_key) if raw_key else self.normalize_source_key(base_url)
             if not key or key in seen_keys:
                 continue
             seen_keys.add(key)
@@ -70,13 +62,14 @@ class SourceRegistryService:
             if source is None:
                 source = self.repo.create(
                     key=key,
-                    name=str(item.get("key") or key).strip() or key,
+                    name=str(item.get("name") or item.get("key") or key).strip() or key,
                     base_url=base_url or f"https://{key}",
                 )
             else:
-                source.name = str(item.get("key") or source.name or key).strip() or key
+                source.name = str(item.get("name") or source.name or key).strip() or key
                 if base_url:
                     source.base_url = base_url
+            source.host_normalized = normalize_host(source.base_url)
             setting = self.repo.ensure_setting(source)
             sync_state = self.repo.ensure_sync_state(source)
             if setting.is_sync_enabled is None:

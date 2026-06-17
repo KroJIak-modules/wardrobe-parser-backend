@@ -38,11 +38,53 @@ class SyncJobService:
     def _service_url(path: str) -> str:
         return f"{settings.service_base_url.rstrip('/')}/api/v1/sync{path}"
 
+    @staticmethod
+    def _normalize_job_status(raw: str | None) -> str:
+        value = str(raw or "").strip().lower()
+        if value in {"queued", "completed", "failed"}:
+            return value
+        if value in {"in_progress", "running"}:
+            return "running"
+        if value in {"cancelled", "canceled"}:
+            return "canceled"
+        return "queued"
+
+    @staticmethod
+    def _normalize_source_run_status(raw: str | None) -> str:
+        value = str(raw or "").strip().lower()
+        if value in {"queued", "completed", "failed", "skipped"}:
+            return value
+        if value == "success":
+            return "completed"
+        if value == "partial":
+            return "completed"
+        if value in {"in_progress", "running"}:
+            return "running"
+        if value in {"cancelled", "canceled"}:
+            return "failed"
+        return "queued"
+
+    @staticmethod
+    def _normalize_source_state_status(raw: str | None) -> str | None:
+        value = str(raw or "").strip().lower()
+        if value in {"success", "partial", "failed"}:
+            return value
+        if value == "completed":
+            return "success"
+        return None
+
+    @staticmethod
+    def _derive_error_code(error_message: str | None) -> str | None:
+        value = str(error_message or "").strip()
+        if not value:
+            return None
+        return value.split(":", 1)[0].strip().lower().replace(" ", "_")[:255] or "sync_failed"
+
     @classmethod
     def mark_interrupted_jobs_on_startup(cls) -> None:
         db = SessionLocal()
         try:
-            for job in db.query(SyncJob).filter(SyncJob.status.in_(["queued", "in_progress"])).all():
+            for job in db.query(SyncJob).filter(SyncJob.status.in_(["queued", "running"])).all():
                 job.status = "failed"
                 job.finished_at = cls._utcnow()
                 job.error_message = "backend_restarted"
@@ -116,11 +158,11 @@ class SyncJobService:
             source_run = sync_repo.create_source_run(
                 sync_job_id=backend_job_id,
                 source_id=int(source.id),
-                status="in_progress",
+                status="running",
                 started_at=cls._utcnow(),
             )
         else:
-            source_run.status = "in_progress"
+            source_run.status = "running"
             source_run.started_at = source_run.started_at or cls._utcnow()
         db.flush()
 
@@ -144,7 +186,7 @@ class SyncJobService:
             source_run = sync_repo.create_source_run(
                 sync_job_id=backend_job_id,
                 source_id=int(source.id),
-                status="in_progress",
+                status="running",
                 started_at=cls._utcnow(),
             )
         if sync_repo.has_applied_batch(source_run_id=int(source_run.id), batch_key=batch_key):
@@ -166,7 +208,16 @@ class SyncJobService:
         db.flush()
 
     @classmethod
-    def _process_source_finished(cls, db: Session, *, backend_job_id: int, source_key: str, status_value: str) -> None:
+    def _process_source_finished(
+        cls,
+        db: Session,
+        *,
+        backend_job_id: int,
+        source_key: str,
+        status_value: str,
+        error_message: str | None = None,
+        unavailable_products: int = 0,
+    ) -> None:
         source_repo = CatalogSourceRepository(db)
         source = source_repo.get_by_key(source_key)
         if source is None:
@@ -183,14 +234,32 @@ class SyncJobService:
                 finished_at=now,
             )
         else:
-            source_run.status = status_value
+            source_run.status = cls._normalize_source_run_status(status_value)
             source_run.finished_at = now
+        failed_products = max(
+            int(source_run.failed_products or 0),
+            max(0, int(unavailable_products or 0)),
+            max(0, int(source_run.products_received or 0) - int(source_run.products_applied or 0)),
+        )
+        source_run.failed_products = failed_products
+        if cls._normalize_source_state_status(status_value) == "failed":
+            source_run.error_message = str(error_message or "").strip() or None
+            source_run.error_code = cls._derive_error_code(source_run.error_message)
+        else:
+            source_run.error_message = None
+            source_run.error_code = None
 
         sync_state = source_repo.ensure_sync_state(source)
         sync_state.last_sync_at = now
-        sync_state.last_sync_status = status_value
+        sync_state.last_sync_status = cls._normalize_source_state_status(status_value)
         if source_run.started_at is not None:
             sync_state.last_sync_duration_sec = max(0, int((now - source_run.started_at).total_seconds()))
+        if sync_state.last_sync_status == "failed":
+            sync_state.last_error_message = source_run.error_message
+            sync_state.last_error_code = source_run.error_code
+        else:
+            sync_state.last_error_message = None
+            sync_state.last_error_code = None
         job = sync_repo.get_job(backend_job_id)
         if job is not None:
             job.processed_sources = int(job.processed_sources or 0) + 1
@@ -207,7 +276,7 @@ class SyncJobService:
             job = sync_repo.get_job(backend_job_id)
             if job is None:
                 return
-            job.status = "in_progress"
+            job.status = "running"
             job.started_at = cls._utcnow()
             db.commit()
 
@@ -256,20 +325,22 @@ class SyncJobService:
                             backend_job_id=backend_job_id,
                             source_key=source_key,
                             status_value=str(payload.get("status") or "completed").strip().lower(),
+                            error_message=(str(payload.get("error") or "").strip() or None),
+                            unavailable_products=int(payload.get("unavailable_products") or 0),
                         )
                     db.commit()
 
                 cursor = next_cursor
                 service_status = str(status_payload.get("status") or "").strip().lower()
                 if service_status in {"completed", "failed", "cancelled"}:
-                    final_status = service_status
+                    final_status = cls._normalize_job_status(service_status)
                     error_message = str(status_payload.get("error") or "").strip() or None
                     break
                 time.sleep(2.0)
 
             job = sync_repo.get_job(backend_job_id)
             if job is not None:
-                job.status = final_status
+                job.status = cls._normalize_job_status(final_status)
                 job.finished_at = cls._utcnow()
                 job.error_message = error_message
             db.commit()
@@ -299,24 +370,19 @@ class SyncJobService:
         product_progress = (processed_products / expected_products * 100.0) if expected_products > 0 else 0.0
         return {
             "job_id": str(job.id),
-            "status": str(job.status or "queued"),
+            "status": self._normalize_job_status(getattr(job, "status", "queued")),
             "created_at": job.created_at.isoformat() if job.created_at else None,
             "started_at": job.started_at.isoformat() if job.started_at else None,
-            "completed_at": job.finished_at.isoformat() if job.finished_at else None,
-            "next_scheduled_at": None,
-            "total_products": expected_products or None,
-            "new_products": processed_products,
-            "updated_products": 0,
-            "new_images": 0,
+            "finished_at": job.finished_at.isoformat() if job.finished_at else None,
             "total_sources": total_sources,
             "processed_sources": processed_sources,
-            "progress_percent": round(source_progress if str(job.status) not in {"completed", "failed", "cancelled"} else 100.0, 2),
-            "processed_products": processed_products,
-            "expected_products": expected_products,
+            "progress_percent": round(source_progress if self._normalize_job_status(getattr(job, "status", "queued")) not in {"completed", "failed", "canceled"} else 100.0, 2),
+            "products_seen": expected_products,
+            "products_applied": processed_products,
             "failed_products": max(0, expected_products - processed_products),
             "products_progress_percent": round(product_progress if expected_products > 0 else 0.0, 2),
             "error": job.error_message,
-            "can_cancel": str(job.status or "") in {"queued", "in_progress"},
+            "can_cancel": self._normalize_job_status(getattr(job, "status", "")) in {"queued", "running"},
         }
 
     def latest(self) -> dict | None:
@@ -333,7 +399,7 @@ class SyncJobService:
         if service_job_id:
             response = requests.post(self._service_url(f"/jobs/{service_job_id}/cancel"), timeout=(5, 20))
             response.raise_for_status()
-        backend_job.status = "cancelled"
+        backend_job.status = "canceled"
         backend_job.finished_at = self._utcnow()
         self.db.commit()
         return self.serialize_job(int(job_id))

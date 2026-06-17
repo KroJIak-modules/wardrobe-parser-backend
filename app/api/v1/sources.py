@@ -102,13 +102,23 @@ def _source_payload(db: Session, source: Source, service_item: dict | None) -> d
         "last_sync_at": sync_state.last_sync_at.isoformat() if getattr(sync_state, "last_sync_at", None) else None,
         "last_sync_duration_sec": getattr(sync_state, "last_sync_duration_sec", None),
         "last_sync_status": getattr(sync_state, "last_sync_status", None),
+        "last_error_code": getattr(sync_state, "last_error_code", None),
+        "last_error_message": getattr(sync_state, "last_error_message", None),
         "supplier_id": int(getattr(setting, "supplier_id", 0) or 0) or None,
         "supplier_key": getattr(supplier, "key", None),
         "supplier_name": getattr(supplier, "name", None),
         "promo_factor": float(getattr(setting, "promo_factor", 1) or 1),
         "promo_only_no_discount": bool(getattr(setting, "promo_only_no_discount", False)),
-        "buyout_surcharge_value": float(getattr(setting, "buyout_surcharge_value", 0) or 0),
-        "buyout_surcharge_currency": str(getattr(setting, "buyout_surcharge_currency", "RUB") or "RUB"),
+        "buyout_surcharge_value": (
+            float(setting.buyout_surcharge_value)
+            if getattr(setting, "buyout_surcharge_value", None) is not None
+            else None
+        ),
+        "buyout_surcharge_currency": (
+            str(setting.buyout_surcharge_currency)
+            if getattr(setting, "buyout_surcharge_currency", None)
+            else None
+        ),
     }
 
 
@@ -117,7 +127,11 @@ def list_sources(db: Session = Depends(get_db)) -> list[dict]:
     registry = SourceRegistryService(db)
     sources = registry.refresh_from_service()
     service_items = _service_sources_payload()
-    return [_source_payload(db, source, service_items.get(source.key)) for source in sources]
+    return [
+        _source_payload(db, source, service_items.get(source.key))
+        for source in sources
+        if str(source.key) != SourceRegistryService.MANUAL_SOURCE_KEY
+    ]
 
 
 @router.patch("/sources/{source_key}/enabled", dependencies=[Depends(require_permission("control.sources.edit"))])

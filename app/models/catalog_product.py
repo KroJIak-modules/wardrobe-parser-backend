@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -50,6 +51,8 @@ class ProductListing(Base):
     source_id = Column(BigInteger, ForeignKey("sources.id", ondelete="RESTRICT"), nullable=False, index=True)
     external_id = Column(String(255), nullable=True)
     url = Column(String(2048), nullable=False)
+    url_normalized = Column(String(2048), nullable=False)
+    host_normalized = Column(String(255), nullable=False)
     handle = Column(String(1024), nullable=True)
     source_title = Column(String(2048), nullable=False)
     source_description_html = Column(Text, nullable=True)
@@ -76,6 +79,8 @@ class ProductListing(Base):
         UniqueConstraint("source_id", "url", name="uq_product_listings_source_url"),
         Index("idx_product_listings_last_seen_at", "last_seen_at"),
         Index("idx_product_listings_last_synced_at", "last_synced_at"),
+        Index("idx_product_listings_url_normalized", "url_normalized"),
+        Index("idx_product_listings_host_handle", "host_normalized", "handle"),
     )
 
 
@@ -158,6 +163,14 @@ class ProductPriceOverride(Base):
 
     product = relationship("Product", back_populates="price_override")
 
+    __table_args__ = (
+        CheckConstraint("manual_price_rub > 0", name="ck_product_price_overrides_manual_price_positive"),
+        CheckConstraint(
+            "manual_compare_at_price_rub IS NULL OR manual_compare_at_price_rub > manual_price_rub",
+            name="ck_product_price_overrides_compare_at_gt_price",
+        ),
+    )
+
 
 class ProductListingGalleryImage(Base):
     __tablename__ = "product_listing_gallery_images"
@@ -180,4 +193,12 @@ class ProductListingGalleryImage(Base):
 
     __table_args__ = (
         UniqueConstraint("product_id", "listing_id", "position", name="uq_product_listing_gallery_images_scope_position"),
+        CheckConstraint(
+            """
+            (origin_kind = 'source_image' AND listing_image_id IS NOT NULL AND image_asset_id IS NULL)
+            OR
+            (origin_kind = 'uploaded_asset' AND listing_image_id IS NULL AND image_asset_id IS NOT NULL)
+            """,
+            name="ck_product_listing_gallery_images_origin_target",
+        ),
     )

@@ -41,7 +41,6 @@ from app.models.catalog_taxonomy import (
     ShowcaseCategoryAttachment,
     ShowcaseCategoryAttachmentHiddenNode,
 )
-from app.models.sync_job_runtime import SyncJobRuntime
 
 __all__ = [
     "AdminUiSettings",
@@ -81,7 +80,6 @@ __all__ = [
     "SyncAppliedBatch",
     "SyncJob",
     "SyncJobSourceRun",
-    "SyncJobRuntime",
     "WeightRule",
     "WeightRuleKeyword",
 ]
