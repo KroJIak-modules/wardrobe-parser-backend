@@ -10,13 +10,12 @@ from uuid import uuid4
 import requests
 
 from fastapi import HTTPException, status
-from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings as app_settings
-from app.models import AdminUiSettings, ParserSupplier
-from app.repositories import ParserPricingSettingsRepository, ParserSourceRepository, ParserSupplierRepository
+from app.models import AdminUiSettings, Supplier
+from app.repositories import CatalogPricingSettingsRepository, CatalogSourceRepository, CatalogSupplierRepository
 from app.schemas.parser import (
     AdminUiSettingsResponse,
     AdminUiSettingsUpdateRequest,
@@ -112,9 +111,9 @@ class PricingSettingsService:
 
     def __init__(self, db: Session):
         self.db = db
-        self.repo = ParserPricingSettingsRepository(db)
-        self.supplier_repo = ParserSupplierRepository(db)
-        self.source_repo = ParserSourceRepository(db)
+        self.repo = CatalogPricingSettingsRepository(db)
+        self.supplier_repo = CatalogSupplierRepository(db)
+        self.source_repo = CatalogSourceRepository(db)
 
     @staticmethod
     def _normalize_currency(raw: str | None, *, default: str = "RUB", allowed: set[str] | None = None) -> str:
@@ -157,7 +156,7 @@ class PricingSettingsService:
         return getattr(row, key, None)
 
     @staticmethod
-    def _validate_alt_parent(parent: ParserSupplier | None) -> ParserSupplier:
+    def _validate_alt_parent(parent: Supplier | None) -> Supplier:
         if parent is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Базовый тариф не найден")
         if getattr(parent, "parent_supplier_id", None) is not None:
@@ -165,9 +164,9 @@ class PricingSettingsService:
         return parent
 
     def _validate_alt_limit(self, parent_supplier_id: int, *, ignore_supplier_id: int | None = None) -> None:
-        query = self.supplier_repo.query().filter(ParserSupplier.parent_supplier_id == int(parent_supplier_id))
+        query = self.supplier_repo.query().filter(Supplier.parent_supplier_id == int(parent_supplier_id))
         if ignore_supplier_id is not None:
-            query = query.filter(ParserSupplier.id != int(ignore_supplier_id))
+            query = query.filter(Supplier.id != int(ignore_supplier_id))
         count = int(query.count())
         if count >= 1:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="У базового тарифа может быть только 1 альтернатива")
@@ -309,7 +308,42 @@ class PricingSettingsService:
         return usd_to_rub, eur_to_rub
 
     @classmethod
+    def _sync_legacy_pricing_aliases(cls, entity) -> None:
+        usdt_rate = float(getattr(entity, "usdt_to_rub_rate", 95.0) or 95.0)
+        usdt_extra = float(getattr(entity, "usdt_extra_rub", 1.0) or 1.0)
+        usd_rate = float(getattr(entity, "usd_to_rub_rate", usdt_rate) or usdt_rate)
+        eur_rate = float(getattr(entity, "eur_to_rub_rate", usd_rate * 1.18) or (usd_rate * 1.18))
+        eur_to_usd = eur_rate / usd_rate if usd_rate > 0 else 1.18
+
+        entity.bybit_usdt_to_rub = usdt_rate
+        entity.bybit_extra_rub = usdt_extra
+        entity.eur_to_usd_rate = eur_to_usd
+        if getattr(entity, "gbp_to_usd_rate", None) is None:
+            entity.gbp_to_usd_rate = 1.27
+        if getattr(entity, "jpy_to_usd_rate", None) is None or float(getattr(entity, "jpy_to_usd_rate", 0.0) or 0.0) <= 0:
+            entity.jpy_to_usd_rate = cls._fetch_jpy_to_usd_rate()
+        if getattr(entity, "promo_factor", None) is None:
+            entity.promo_factor = 1.0
+        if getattr(entity, "customs_threshold_currency", None) is None:
+            entity.customs_threshold_currency = "EUR"
+        if getattr(entity, "shipping_alt_threshold_eur", None) is None:
+            entity.shipping_alt_threshold_eur = 300.0
+        if getattr(entity, "dedup_only_available_products", None) is None:
+            entity.dedup_only_available_products = False
+        if getattr(entity, "show_product_description", None) is None:
+            entity.show_product_description = True
+        if not isinstance(getattr(entity, "insurance_rules", None), list):
+            entity.insurance_rules = [dict(item) for item in _DEFAULT_INSURANCE_RULES]
+        if not isinstance(getattr(entity, "service_fee_rules", None), list):
+            entity.service_fee_rules = [dict(item) for item in _DEFAULT_SERVICE_FEE_RULES]
+        if not isinstance(getattr(entity, "svc_rules", None), list):
+            entity.svc_rules = []
+        if not isinstance(getattr(entity, "bybit_bucket_rates", None), list):
+            entity.bybit_bucket_rates = []
+
+    @classmethod
     def _effective_rates_from_entity(cls, entity) -> tuple[float, float]:
+        cls._sync_legacy_pricing_aliases(entity)
         bybit = float(getattr(entity, "bybit_usdt_to_rub", 95.0) or 95.0)
         extra = float(getattr(entity, "bybit_extra_rub", 1.0) or 1.0)
         eur_to_usd = float(getattr(entity, "eur_to_usd_rate", 1.18) or 1.18)
@@ -429,11 +463,17 @@ class PricingSettingsService:
     def _coerce_settings_defaults(cls, entity) -> bool:
         changed = False
 
-        if getattr(entity, "bybit_usdt_to_rub", None) is None:
-            entity.bybit_usdt_to_rub = 95.0
+        if getattr(entity, "usdt_to_rub_rate", None) is None:
+            entity.usdt_to_rub_rate = 95.0
             changed = True
-        if getattr(entity, "bybit_extra_rub", None) is None:
-            entity.bybit_extra_rub = 1.0
+        if getattr(entity, "usdt_extra_rub", None) is None:
+            entity.usdt_extra_rub = 1.0
+            changed = True
+        if getattr(entity, "usd_to_rub_rate", None) is None:
+            entity.usd_to_rub_rate = float(getattr(entity, "usdt_to_rub_rate", 95.0) or 95.0)
+            changed = True
+        if getattr(entity, "eur_to_rub_rate", None) is None:
+            entity.eur_to_rub_rate = float(getattr(entity, "usd_to_rub_rate", 95.0) or 95.0) * 1.18
             changed = True
         normalized_rounding_mode = cls._normalize_final_rounding_mode(
             getattr(entity, "final_rounding_mode", None),
@@ -441,18 +481,6 @@ class PricingSettingsService:
         )
         if normalized_rounding_mode != getattr(entity, "final_rounding_mode", None):
             entity.final_rounding_mode = normalized_rounding_mode
-            changed = True
-        if not isinstance(getattr(entity, "bybit_bucket_rates", None), list):
-            entity.bybit_bucket_rates = []
-            changed = True
-        if getattr(entity, "eur_to_usd_rate", None) is None:
-            entity.eur_to_usd_rate = 1.18
-            changed = True
-        if getattr(entity, "gbp_to_usd_rate", None) is None:
-            entity.gbp_to_usd_rate = 1.4
-            changed = True
-        if getattr(entity, "jpy_to_usd_rate", None) is None or float(getattr(entity, "jpy_to_usd_rate", 0.0) or 0.0) <= 0:
-            entity.jpy_to_usd_rate = PricingSettingsService._fetch_jpy_to_usd_rate()
             changed = True
         if getattr(entity, "payment_fee_rate", None) is None:
             entity.payment_fee_rate = 0.02
@@ -463,45 +491,10 @@ class PricingSettingsService:
         if getattr(entity, "customs_fixed_rub", None) is None:
             entity.customs_fixed_rub = 540.0
             changed = True
-        if getattr(entity, "shipping_alt_threshold_eur", None) is None:
-            entity.shipping_alt_threshold_eur = 300.0
-            changed = True
         if getattr(entity, "tax_rate", None) is None:
             entity.tax_rate = 0.06
             changed = True
-        if getattr(entity, "dedup_only_available_products", None) is None:
-            entity.dedup_only_available_products = False
-            changed = True
-        if getattr(entity, "show_product_description", None) is None:
-            entity.show_product_description = True
-            changed = True
-        normalized_insurance = cls._normalize_range_rules(
-            getattr(entity, "insurance_rules", None),
-            min_key="min_eur",
-            max_key="max_eur",
-            default_rules=_DEFAULT_INSURANCE_RULES,
-        )
-        if normalized_insurance != (getattr(entity, "insurance_rules", None) or []):
-            entity.insurance_rules = normalized_insurance
-            changed = True
-
-        normalized_fee = cls._normalize_range_rules(
-            getattr(entity, "service_fee_rules", None),
-            min_key="min_rub",
-            max_key="max_rub",
-            default_rules=_DEFAULT_SERVICE_FEE_RULES,
-        )
-        if normalized_fee != (getattr(entity, "service_fee_rules", None) or []):
-            entity.service_fee_rules = normalized_fee
-            changed = True
-
-        raw_svc_rules = getattr(entity, "svc_rules", None)
-        normalized_svc_rules = cls._normalize_svc_rules(raw_svc_rules)
-        normalized_svc_rules = cls._sanitize_svc_rule_boundaries(normalized_svc_rules)
-        cls._validate_svc_rules_no_overlap(normalized_svc_rules)
-        if normalized_svc_rules != (raw_svc_rules or []):
-            entity.svc_rules = normalized_svc_rules
-            changed = True
+        cls._sync_legacy_pricing_aliases(entity)
 
         return changed
 
@@ -538,14 +531,14 @@ class PricingSettingsService:
             step_usdt=int(app_settings.pricing_bybit_bucket_step_usdt),
             max_usdt=int(app_settings.pricing_bybit_bucket_max_usdt),
         )
-        current = float(getattr(entity, "bybit_usdt_to_rub", 0.0) or 0.0)
+        current = float(getattr(entity, "usdt_to_rub_rate", 0.0) or 0.0)
         changed = False
         if abs(current - rate) > 1e-6:
-            entity.bybit_usdt_to_rub = float(rate)
+            entity.usdt_to_rub_rate = float(rate)
+            entity.usd_to_rub_rate = float(rate)
             changed = True
         if (getattr(entity, "bybit_bucket_rates", None) or []) != bucket_rates:
             entity.bybit_bucket_rates = bucket_rates
-            changed = True
         if getattr(entity, "bybit_last_error", None):
             entity.bybit_last_error = None
             changed = True
@@ -561,6 +554,7 @@ class PricingSettingsService:
         if current_updated_at is None or abs((refreshed_at - current_updated_at).total_seconds()) > 0.5:
             entity.bybit_last_updated_at = refreshed_at
             changed = True
+        PricingSettingsService._sync_legacy_pricing_aliases(entity)
         if not changed:
             return False, "live_cached", snapshot, None
         return True, "live_updated", snapshot, None
@@ -568,6 +562,7 @@ class PricingSettingsService:
     def get_settings(self, *, refresh_bybit: bool = True) -> PricingSettingsResponse:
         entity, created = self.repo.get_or_create_default()
         defaults_changed = self._coerce_settings_defaults(entity)
+        self._sync_legacy_pricing_aliases(entity)
         bybit_status = "skipped"
         bybit_warning = None
         bybit_snapshot = None
@@ -602,6 +597,24 @@ class PricingSettingsService:
         patch = payload.model_dump(exclude_none=True)
         for forbidden_key in ("usd_to_rub", "eur_to_rub", "bybit_usdt_to_rub"):
             patch.pop(forbidden_key, None)
+        if "bybit_extra_rub" in patch:
+            patch["usdt_extra_rub"] = max(0.0, float(patch.pop("bybit_extra_rub") or 0.0))
+        if "eur_to_usd_rate" in patch:
+            next_usd_to_rub = float(getattr(entity, "usd_to_rub_rate", getattr(entity, "usdt_to_rub_rate", 95.0)) or 95.0)
+            patch["eur_to_rub_rate"] = max(0.01, float(patch.pop("eur_to_usd_rate") or 1.18)) * next_usd_to_rub
+        for ignored_key in (
+            "promo_factor",
+            "customs_threshold_currency",
+            "gbp_to_usd_rate",
+            "jpy_to_usd_rate",
+            "shipping_alt_threshold_eur",
+            "dedup_only_available_products",
+            "show_product_description",
+            "insurance_rules",
+            "service_fee_rules",
+            "svc_rules",
+        ):
+            patch.pop(ignored_key, None)
         if "customs_threshold_currency" in patch:
             patch["customs_threshold_currency"] = self._normalize_currency(
                 patch.get("customs_threshold_currency"),
@@ -617,27 +630,6 @@ class PricingSettingsService:
                 patch.get("final_rounding_mode"),
                 default=self._normalize_final_rounding_mode(getattr(entity, "final_rounding_mode", None), default="unit"),
             )
-        if "insurance_rules" in patch:
-            patch["insurance_rules"] = self._normalize_range_rules(
-                patch.get("insurance_rules"),
-                min_key="min_eur",
-                max_key="max_eur",
-                default_rules=_DEFAULT_INSURANCE_RULES,
-            )
-        if "service_fee_rules" in patch:
-            patch["service_fee_rules"] = self._normalize_range_rules(
-                patch.get("service_fee_rules"),
-                min_key="min_rub",
-                max_key="max_rub",
-                default_rules=_DEFAULT_SERVICE_FEE_RULES,
-            )
-        if "svc_rules" in patch:
-            patch["svc_rules"] = self._normalize_svc_rules(patch.get("svc_rules"))
-            self._validate_svc_rules_no_overlap(patch["svc_rules"])
-        if "dedup_only_available_products" in patch:
-            patch["dedup_only_available_products"] = bool(patch.get("dedup_only_available_products"))
-        if "show_product_description" in patch:
-            patch["show_product_description"] = bool(patch.get("show_product_description"))
         for key, value in patch.items():
             setattr(entity, key, value)
         defaults_changed = self._coerce_settings_defaults(entity)
@@ -651,12 +643,13 @@ class PricingSettingsService:
     def _to_response(
         entity,
         *,
-        suppliers: list[ParserSupplier],
+        suppliers: list[Supplier],
         bybit_rate_status: str = "unknown",
         bybit_rate_warning: str | None = None,
         bybit_snapshot: Any | None = None,
         bybit_last_error: str | None = None,
     ) -> PricingSettingsResponse:
+        PricingSettingsService._sync_legacy_pricing_aliases(entity)
         normalized_insurance = PricingSettingsService._normalize_range_rules(
             getattr(entity, "insurance_rules", None),
             min_key="min_eur",
@@ -819,7 +812,7 @@ class PricingSettingsService:
 
     @staticmethod
     def _supplier_to_response(
-        supplier: ParserSupplier,
+        supplier: Supplier,
         *,
         usd_to_rub: float,
         eur_to_rub: float,
@@ -828,27 +821,41 @@ class PricingSettingsService:
         rates = PricingSettingsService._normalize_shipping_rows(
             [
                 {
-                    "min_kg": getattr(item, "min_kg", 0.0),
-                    "max_kg": getattr(item, "max_kg", None),
-                    "rub": getattr(item, "rate_rub", 0.0),
+                    "min_kg": getattr(item, "min_weight_kg", 0.0),
+                    "max_kg": getattr(item, "max_weight_kg", None),
+                    "rub": getattr(item, "price_rub", 0.0),
                 }
                 for item in sorted(
                     supplier.shipping_rates,
-                    key=lambda row: (float(getattr(row, "min_kg", 0.0) or 0.0), float(getattr(row, "max_kg", float("inf")) or float("inf"))),
+                    key=lambda row: (
+                        float(getattr(row, "min_weight_kg", 0.0) or 0.0),
+                        float(getattr(row, "max_weight_kg", float("inf")) or float("inf")),
+                    ),
                 )
             ]
         )
+        parent_supplier_id = getattr(supplier, "parent_supplier_id", None)
+        alt_position = 0
+        if parent_supplier_id is not None and getattr(supplier, "parent_supplier", None) is not None:
+            ordered_children = sorted(
+                [child for child in getattr(supplier.parent_supplier, "children", []) if child is not None],
+                key=lambda child: int(getattr(child, "id", 0)),
+            )
+            for index, child in enumerate(ordered_children, start=1):
+                if int(getattr(child, "id", 0)) == int(supplier.id):
+                    alt_position = index
+                    break
         return PricingSupplierResponse(
             id=int(supplier.id),
             key=supplier.key,
             name=supplier.name,
-            category=PricingSettingsService._normalize_supplier_category(getattr(supplier, "category", None)),
+            category=PricingSettingsService._normalize_supplier_category(getattr(supplier, "provider_kind", None)),
             parent_supplier_id=(
-                int(getattr(supplier, "parent_supplier_id", 0))
-                if getattr(supplier, "parent_supplier_id", None) is not None
+                int(parent_supplier_id)
+                if parent_supplier_id is not None
                 else None
             ),
-            alt_position=max(0, int(getattr(supplier, "alt_position", 0) or 0)),
+            alt_position=alt_position,
             rate_currency=rate_currency,
             rates=[
                 {
@@ -872,9 +879,10 @@ class PricingSettingsService:
             if key in patch:
                 setattr(supplier, key, patch[key])
         if "category" in patch and getattr(supplier, "parent_supplier_id", None) is None:
-            supplier.category = self._normalize_supplier_category(patch.get("category"), default=supplier.category)
-        if "alt_position" in patch:
-            supplier.alt_position = max(0, int(patch.get("alt_position") or 0))
+            supplier.provider_kind = self._normalize_supplier_category(
+                patch.get("category"),
+                default=getattr(supplier, "provider_kind", "main"),
+            )
         if "rate_currency" in patch:
             supplier.rate_currency = self._normalize_currency(patch.get("rate_currency"), default=supplier.rate_currency)
         if "rates" in patch:
@@ -899,27 +907,15 @@ class PricingSettingsService:
             parent_supplier = self._validate_alt_parent(self.supplier_repo.get_by_id(int(parent_supplier_id)))
             self._validate_alt_limit(int(parent_supplier.id))
 
-        self.db.execute(
-            text(
-                """
-                SELECT setval(
-                    pg_get_serial_sequence('parser_supplier', 'id'),
-                    COALESCE((SELECT MAX(id) FROM parser_supplier), 1),
-                    true
-                )
-                """
-            )
-        )
         supplier = self.supplier_repo.create(
             key=f"pending-{uuid4().hex}",
             name=payload.name.strip(),
-            category=(
+            provider_kind=(
                 "alt"
                 if parent_supplier is not None
                 else self._normalize_supplier_category(payload.category, default="main")
             ),
             parent_supplier_id=(int(parent_supplier.id) if parent_supplier is not None else None),
-            alt_position=max(0, int(payload.alt_position or 0)),
             rate_currency=self._normalize_currency(payload.rate_currency, default="RUB"),
         )
         self.supplier_repo.flush()
@@ -951,7 +947,7 @@ class PricingSettingsService:
         if getattr(supplier, "parent_supplier_id", None) is None:
             alt_count = (
                 self.supplier_repo.query()
-                .filter(ParserSupplier.parent_supplier_id == int(supplier.id))
+                .filter(Supplier.parent_supplier_id == int(supplier.id))
                 .count()
             )
             if alt_count > 0:

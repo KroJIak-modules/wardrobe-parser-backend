@@ -14,32 +14,23 @@ from app.core.config import settings
 from app.models import (
     AdminUiSettings,
     ParserBrandMapping,
-    ParserCategory,
-    ParserCategoryCountSnapshot,
-    ParserCategoryIndexState,
-    ParserCategoryKeyword,
-    ParserCategoryManualProduct,
-    ParserProductCategoryMatch,
-    ParserSource,
-    ParserPricingSettings,
-    ParserSupplier,
-    ParserSupplierShippingRate,
-    ParserWeightKeyword,
-    ParserWeightRule,
+    PricingSetting,
+    Source,
+    Supplier,
+    SupplierShippingRate,
+    WeightRule,
+    WeightRuleKeyword,
 )
 from app.repositories import (
-    ParserCategoryKeywordRepository,
-    ParserCategoryRepository,
-    ParserPricingSettingsRepository,
-    ParserSupplierRepository,
-    ParserWeightKeywordRepository,
-    ParserWeightRuleRepository,
+    CatalogPricingSettingsRepository,
+    CatalogSourceRepository,
+    CatalogSupplierRepository,
+    CatalogWeightRuleRepository,
 )
+from app.services.catalog.source_registry_service import SourceRegistryService
 from app.services.settings.pricing_service import PricingSettingsService
 from app.schemas.parser import (
     SettingsTransferBrandMappingEntry,
-    SettingsTransferCategoryEntry,
-    SettingsTransferCategoryKeywordEntry,
     SettingsTransferAdminUiSettings,
     SettingsTransferPayload,
     SettingsTransferPricingSettings,
@@ -110,12 +101,10 @@ class SettingsTransferService:
 
     def __init__(self, db: Session):
         self.db = db
-        self.pricing_repo = ParserPricingSettingsRepository(db)
-        self.supplier_repo = ParserSupplierRepository(db)
-        self.weight_rule_repo = ParserWeightRuleRepository(db)
-        self.weight_keyword_repo = ParserWeightKeywordRepository(db)
-        self.category_repo = ParserCategoryRepository(db)
-        self.category_keyword_repo = ParserCategoryKeywordRepository(db)
+        self.pricing_repo = CatalogPricingSettingsRepository(db)
+        self.supplier_repo = CatalogSupplierRepository(db)
+        self.source_repo = CatalogSourceRepository(db)
+        self.weight_rule_repo = CatalogWeightRuleRepository(db)
 
     @staticmethod
     def _service_sources_base() -> str:
@@ -139,20 +128,28 @@ class SettingsTransferService:
         except requests.RequestException as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Service API unavailable: {exc}") from exc
 
+    @staticmethod
+    def _supplier_alt_position(supplier: Supplier) -> int:
+        parent = getattr(supplier, "parent_supplier", None)
+        if parent is None:
+            return 0
+        ordered_children = sorted(
+            [child for child in getattr(parent, "children", []) if child is not None],
+            key=lambda child: int(getattr(child, "id", 0)),
+        )
+        for index, child in enumerate(ordered_children, start=1):
+            if int(getattr(child, "id", 0)) == int(supplier.id):
+                return index
+        return 0
+
     def export_payload(self) -> SettingsTransferPayload:
         pricing_row, _ = self.pricing_repo.get_or_create_default()
+        PricingSettingsService._sync_legacy_pricing_aliases(pricing_row)
         suppliers = self.supplier_repo.list_all_with_rates()
-        sources = (
-            self.db.query(ParserSource)
-            .filter(ParserSource.deleted_at.is_(None))
-            .order_by(ParserSource.id.asc())
-            .all()
-        )
-        weight_rules = self.weight_rule_repo.get_all_active()
-        categories = self.category_repo.get_all_active()
+        sources = self.source_repo.list_all()
+        weight_rules = self.weight_rule_repo.list_active()
 
         supplier_by_id = {int(supplier.id): supplier for supplier in suppliers}
-        category_slug_by_id = {int(item.id): item.slug for item in categories}
 
         pricing = SettingsTransferPricingSettings(
             **{
@@ -181,24 +178,27 @@ class SettingsTransferService:
             SettingsTransferSupplierEntry(
                 key=str(supplier.key),
                 name=str(supplier.name),
-                category=str(supplier.category),
+                category=str(getattr(supplier, "provider_kind", "main") or "main"),
                 parent_supplier_key=(
                     str(supplier_by_id[int(supplier.parent_supplier_id)].key)
                     if getattr(supplier, "parent_supplier_id", None) is not None
                     and int(supplier.parent_supplier_id) in supplier_by_id
                     else None
                 ),
-                alt_position=max(0, int(getattr(supplier, "alt_position", 0) or 0)),
+                alt_position=self._supplier_alt_position(supplier),
                 rate_currency=str(supplier.rate_currency),
                 rates=[
                     {
-                        "min_kg": float(rate.min_kg),
-                        "max_kg": (float(rate.max_kg) if rate.max_kg is not None else None),
-                        "rub": float(rate.rate_rub),
+                        "min_kg": float(rate.min_weight_kg),
+                        "max_kg": (float(rate.max_weight_kg) if rate.max_weight_kg is not None else None),
+                        "rub": float(rate.price_rub),
                     }
                     for rate in sorted(
                         supplier.shipping_rates,
-                        key=lambda item: (float(item.min_kg or 0.0), float(item.max_kg) if item.max_kg is not None else float("inf")),
+                        key=lambda item: (
+                            float(item.min_weight_kg or 0.0),
+                            float(item.max_weight_kg) if item.max_weight_kg is not None else float("inf"),
+                        ),
                     )
                 ],
             )
@@ -214,7 +214,8 @@ class SettingsTransferService:
 
         source_entries: list[SettingsTransferSourceEntry] = []
         for source in sources:
-            service_item = service_by_host.get(_norm_host(source.url))
+            setting = self.source_repo.ensure_setting(source)
+            service_item = service_by_host.get(_norm_host(source.base_url))
             cfg = service_item.get("config") if isinstance(service_item, dict) and isinstance(service_item.get("config"), dict) else {}
             currency_cfg = cfg.get("shopify_currency") if isinstance(cfg.get("shopify_currency"), dict) else {}
             currency_priority_raw = currency_cfg.get("requested_currency_priority")
@@ -235,64 +236,38 @@ class SettingsTransferService:
             source_entries.append(
                 SettingsTransferSourceEntry(
                     name=str(source.name),
-                    url=str(source.url),
-                    enabled=bool(source.enabled),
-                    sync_enabled=bool(service_item.get("sync_enabled", True)) if isinstance(service_item, dict) else True,
-                    hide_auto_added_products=bool(getattr(source, "hide_auto_added_products", False)),
-                    show_description=bool(getattr(source, "show_description", True)),
-                    show_images=bool(getattr(source, "show_images", True)),
+                    url=str(source.base_url),
+                    enabled=bool(getattr(setting, "is_enabled", True)),
+                    sync_enabled=bool(getattr(setting, "is_sync_enabled", True)),
+                    hide_auto_added_products=bool(getattr(setting, "hide_auto_added_products", False)),
+                    show_description=str(getattr(setting, "description_mode", "text") or "text") != "hidden",
+                    show_images=bool(getattr(setting, "show_images", True)),
                     currency_priority=currency_priority,
                     currency_method=currency_method,  # type: ignore[arg-type]
                     locked_currency=locked_currency,
                     supplier_key=(
-                        str(supplier_by_id[int(source.supplier_id)].key)
-                        if source.supplier_id is not None and int(source.supplier_id) in supplier_by_id
+                        str(supplier_by_id[int(setting.supplier_id)].key)
+                        if getattr(setting, "supplier_id", None) is not None and int(setting.supplier_id) in supplier_by_id
                         else None
                     ),
-                    promo_factor=float(source.promo_factor),
-                    promo_only_no_discount=bool(source.promo_only_no_discount),
-                    buyout_surcharge_value=float(source.buyout_surcharge_value),
-                    buyout_surcharge_currency=_normalize_currency(source.buyout_surcharge_currency, default="RUB"),
+                    promo_factor=float(getattr(setting, "promo_factor", 1.0) or 1.0),
+                    promo_only_no_discount=bool(getattr(setting, "promo_only_no_discount", False)),
+                    buyout_surcharge_value=float(getattr(setting, "buyout_surcharge_value", 0.0) or 0.0),
+                    buyout_surcharge_currency=_normalize_currency(getattr(setting, "buyout_surcharge_currency", None), default="RUB"),
                 )
             )
 
         weight_entries = [
             SettingsTransferWeightRuleEntry(
                 weight_grams=int(rule.weight_grams),
-                sort_order=int(rule.sort_order),
+                sort_order=index,
                 keywords=[
                     str(item.keyword)
-                    for item in self.weight_keyword_repo.get_by_rule(int(rule.id))
+                    for item in self.weight_rule_repo.list_keywords(int(rule.id))
                 ],
             )
-            for rule in weight_rules
+            for index, rule in enumerate(weight_rules)
         ]
-
-        category_entries = [
-            SettingsTransferCategoryEntry(
-                slug=str(category.slug),
-                name=str(category.name),
-                parent_slug=(
-                    str(category_slug_by_id[int(category.parent_id)])
-                    if category.parent_id is not None and int(category.parent_id) in category_slug_by_id
-                    else None
-                ),
-                is_fallback=bool(category.is_fallback),
-                is_favorite=bool(category.is_favorite),
-                is_enabled=bool(category.is_enabled),
-            )
-            for category in categories
-        ]
-        category_keyword_entries: list[SettingsTransferCategoryKeywordEntry] = []
-        for category in categories:
-            for keyword in self.category_keyword_repo.get_by_category(int(category.id)):
-                category_keyword_entries.append(
-                    SettingsTransferCategoryKeywordEntry(
-                        category_slug=str(category.slug),
-                        keyword=str(keyword.keyword),
-                        scope=str(keyword.keyword_scope),
-                    )
-                )
 
         return SettingsTransferPayload(
             schema_version=_SCHEMA_VERSION,
@@ -303,8 +278,8 @@ class SettingsTransferService:
             suppliers=supplier_entries,
             sources=source_entries,
             weight_rules=weight_entries,
-            categories=category_entries,
-            category_keywords=category_keyword_entries,
+            categories=[],
+            category_keywords=[],
             brand_mappings=[
                 SettingsTransferBrandMappingEntry(
                     source_brand=str(row.source_brand),
@@ -328,7 +303,6 @@ class SettingsTransferService:
         admin_ui_updated = self._import_admin_ui(payload.admin_ui_settings)
         source_count = self._import_sources(payload.sources, supplier_map=supplier_map)
         weight_count = self._import_weight_rules(payload.weight_rules)
-        categories_updated, keywords_updated = self._import_categories(payload.categories, payload.category_keywords)
         brand_mappings_updated = self._import_brand_mappings(payload.brand_mappings)
 
         self.db.commit()
@@ -343,55 +317,47 @@ class SettingsTransferService:
                 "suppliers_upserted": len(supplier_map),
                 "sources_upserted": source_count,
                 "weight_rules_replaced": weight_count,
-                "categories_upserted": categories_updated,
-                "category_keywords_replaced": keywords_updated,
+                "categories_upserted": 0,
+                "category_keywords_replaced": 0,
                 "brand_mappings_replaced": brand_mappings_updated,
             },
         )
 
     def reset_all(self) -> SettingsTransferResponse:
         # 1) Reset pricing settings/suppliers to service defaults.
-        self.db.query(ParserSupplierShippingRate).delete(synchronize_session=False)
-        self.db.query(ParserSupplier).delete(synchronize_session=False)
-        self.db.query(ParserPricingSettings).delete(synchronize_session=False)
+        self.db.query(SupplierShippingRate).delete(synchronize_session=False)
+        self.db.query(Supplier).delete(synchronize_session=False)
+        self.db.query(PricingSetting).delete(synchronize_session=False)
         self.db.query(AdminUiSettings).delete(synchronize_session=False)
         self.db.flush()
 
         pricing_service = PricingSettingsService(self.db)
         pricing_service.get_settings(refresh_bybit=False)
         suppliers = self.supplier_repo.list_all_with_rates()
-        fallback_supplier = next((s for s in suppliers if str(getattr(s, "category", "")) == "main"), suppliers[0] if suppliers else None)
+        fallback_supplier = next((s for s in suppliers if str(getattr(s, "provider_kind", "")) == "main"), suppliers[0] if suppliers else None)
 
         # 2) Reset sources to neutral defaults.
         sources_reset = 0
-        for source in self.db.query(ParserSource).filter(ParserSource.deleted_at.is_(None)).all():
-            source.enabled = True
-            source.hide_auto_added_products = False
-            source.promo_factor = 1.0
-            source.promo_only_no_discount = False
-            source.buyout_surcharge_value = 0.0
-            source.buyout_surcharge_currency = "RUB"
+        for source in self.source_repo.list_all():
+            setting = self.source_repo.ensure_setting(source)
+            setting.is_enabled = True
+            setting.is_sync_enabled = True
+            setting.hide_auto_added_products = False
+            setting.description_mode = "text"
+            setting.show_images = True
+            setting.promo_factor = 1.0
+            setting.promo_only_no_discount = False
+            setting.buyout_surcharge_value = 0.0
+            setting.buyout_surcharge_currency = "RUB"
             if fallback_supplier is not None:
-                source.supplier_id = int(fallback_supplier.id)
+                setting.supplier_id = int(fallback_supplier.id)
             sources_reset += 1
 
         # 3) Reset weight rules.
-        self.db.query(ParserWeightKeyword).delete(synchronize_session=False)
-        self.db.query(ParserWeightRule).delete(synchronize_session=False)
+        self.db.query(WeightRuleKeyword).delete(synchronize_session=False)
+        self.db.query(WeightRule).delete(synchronize_session=False)
 
-        # 4) Reset categories customizations.
-        self.db.query(ParserCategoryKeyword).delete(synchronize_session=False)
-        self.db.query(ParserCategoryManualProduct).delete(synchronize_session=False)
-        self.db.query(ParserProductCategoryMatch).delete(synchronize_session=False)
-        self.db.query(ParserCategoryCountSnapshot).delete(synchronize_session=False)
-        self.db.query(ParserCategoryIndexState).delete(synchronize_session=False)
-        categories_reset = 0
-        for category in self.db.query(ParserCategory).filter(ParserCategory.deleted_at.is_(None)).all():
-            category.is_favorite = False
-            category.is_enabled = True
-            categories_reset += 1
-
-        # 5) Reset designers remapping.
+        # 4) Reset designers remapping.
         self.db.query(ParserBrandMapping).delete(synchronize_session=False)
 
         self.db.commit()
@@ -406,7 +372,7 @@ class SettingsTransferService:
                 "suppliers_upserted": len(suppliers),
                 "sources_upserted": sources_reset,
                 "weight_rules_replaced": 0,
-                "categories_upserted": categories_reset,
+                "categories_upserted": 0,
                 "category_keywords_replaced": 0,
             },
         )
@@ -415,12 +381,28 @@ class SettingsTransferService:
         row, _ = self.pricing_repo.get_or_create_default()
         values = payload.model_dump()
         updated_fields = 0
-        for key, raw_value in values.items():
-            if key not in _PRICING_IMPORT_FIELDS:
-                continue
+        mapped_values = {
+            "markup_multiplier": float(values["markup_multiplier"]),
+            "weight_tolerance": float(values["weight_tolerance"]),
+            "customs_threshold_eur": float(values["customs_threshold_eur"]),
+            "customs_duty_rate": float(values["customs_duty_rate"]),
+            "usdt_extra_rub": float(values["bybit_extra_rub"]),
+            "usd_to_rub_rate": float(getattr(row, "usd_to_rub_rate", getattr(row, "usdt_to_rub_rate", 95.0)) or 95.0),
+            "usdt_to_rub_rate": float(getattr(row, "usdt_to_rub_rate", 95.0) or 95.0),
+            "eur_to_rub_rate": float(values["eur_to_usd_rate"]) * float(
+                getattr(row, "usd_to_rub_rate", getattr(row, "usdt_to_rub_rate", 95.0)) or 95.0
+            ),
+            "final_rounding_mode": str(values["final_rounding_mode"]),
+            "payment_fee_rate": float(values["payment_fee_rate"]),
+            "customs_processing_rate": float(values["customs_processing_rate"]),
+            "customs_fixed_rub": float(values["customs_fixed_rub"]),
+            "tax_rate": float(values["tax_rate"]),
+        }
+        for key, raw_value in mapped_values.items():
             if getattr(row, key) != raw_value:
                 setattr(row, key, raw_value)
                 updated_fields += 1
+        PricingSettingsService._sync_legacy_pricing_aliases(row)
         return updated_fields
 
     def _import_admin_ui(self, payload: SettingsTransferAdminUiSettings) -> int:
@@ -444,9 +426,9 @@ class SettingsTransferService:
                 updated_fields += 1
         return updated_fields
 
-    def _import_suppliers(self, suppliers: list[SettingsTransferSupplierEntry]) -> dict[str, ParserSupplier]:
+    def _import_suppliers(self, suppliers: list[SettingsTransferSupplierEntry]) -> dict[str, Supplier]:
         existing = {str(item.key): item for item in self.supplier_repo.list_all_with_rates()}
-        result: dict[str, ParserSupplier] = {}
+        result: dict[str, Supplier] = {}
         incoming_by_key: dict[str, SettingsTransferSupplierEntry] = {}
 
         for index, incoming in enumerate(suppliers, start=1):
@@ -457,30 +439,25 @@ class SettingsTransferService:
                 current = self.supplier_repo.create(
                     key=key,
                     name=incoming.name,
-                    category=incoming.category if incoming.category in {"main", "alt"} else "main",
+                    provider_kind=incoming.category if incoming.category in {"main", "alt"} else "main",
                     rate_currency=_normalize_currency(incoming.rate_currency, default="RUB"),
                 )
                 self.db.flush()
             else:
                 current.name = incoming.name
-                current.category = incoming.category if incoming.category in {"main", "alt"} else "main"
+                current.provider_kind = incoming.category if incoming.category in {"main", "alt"} else "main"
                 current.rate_currency = _normalize_currency(incoming.rate_currency, default="RUB")
-
-            self.db.query(ParserSupplierShippingRate).filter(ParserSupplierShippingRate.supplier_id == current.id).delete(
-                synchronize_session=False
+            self.supplier_repo.replace_ranges(
+                supplier_id=int(current.id),
+                ranges=[
+                    {
+                        "min_kg": max(0.0, float(getattr(rate, "min_kg", 0.0))),
+                        "max_kg": getattr(rate, "max_kg", None),
+                        "rub": max(0.0, float(getattr(rate, "rub", 0.0))),
+                    }
+                    for rate in incoming.rates
+                ],
             )
-            for rate in incoming.rates:
-                min_kg = max(0.0, float(getattr(rate, "min_kg", 0.0)))
-                max_raw = getattr(rate, "max_kg", None)
-                max_kg = None if max_raw is None else max(min_kg + 0.000001, float(max_raw))
-                self.db.add(
-                    ParserSupplierShippingRate(
-                        supplier_id=int(current.id),
-                        min_kg=min_kg,
-                        max_kg=max_kg,
-                        rate_rub=max(0.0, float(getattr(rate, "rub", 0.0))),
-                    )
-                )
             result[key] = current
 
         # Apply parent/alt linkage after all suppliers exist.
@@ -495,24 +472,19 @@ class SettingsTransferService:
             ) if incoming.parent_supplier_key else None
             parent_supplier = result.get(parent_key) if parent_key else None
             supplier.parent_supplier_id = int(parent_supplier.id) if parent_supplier is not None else None
-            if supplier.parent_supplier_id is not None:
-                supplier.alt_position = max(1, int(getattr(incoming, "alt_position", 1) or 1))
-                supplier.category = "alt"
-            else:
-                supplier.alt_position = 0
-                if supplier.category not in {"main", "alt"}:
-                    supplier.category = "main"
+            supplier.provider_kind = "alt" if supplier.parent_supplier_id is not None else "main"
         return result
 
     def _import_sources(
         self,
         sources: list[SettingsTransferSourceEntry],
         *,
-        supplier_map: dict[str, ParserSupplier],
+        supplier_map: dict[str, Supplier],
     ) -> int:
         if not supplier_map:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет тарифов для назначения источникам")
         updated = 0
+        SourceRegistryService(self.db).refresh_from_service()
         service_sources = self._service_list()
         service_by_host: dict[str, dict[str, Any]] = {}
         for item in service_sources:
@@ -521,12 +493,10 @@ class SettingsTransferService:
                 service_by_host[host] = item
 
         for item in sources:
-            existing = (
-                self.db.query(ParserSource)
-                .filter(ParserSource.deleted_at.is_(None))
-                .filter(ParserSource.url == item.url)
-                .first()
-            )
+            source_key = SourceRegistryService.normalize_source_key(item.url)
+            existing = self.source_repo.get_by_key(source_key) if source_key else None
+            if existing is None:
+                existing = self.db.query(Source).filter(Source.base_url == item.url).one_or_none()
             supplier = supplier_map.get(item.supplier_key) if item.supplier_key else None
             if supplier is None:
                 raise HTTPException(
@@ -535,32 +505,25 @@ class SettingsTransferService:
                 )
             supplier_id = int(supplier.id)
             if existing is None:
-                self.db.add(
-                    ParserSource(
-                        name=item.name,
-                        url=item.url,
-                        enabled=bool(item.enabled),
-                        hide_auto_added_products=bool(item.hide_auto_added_products),
-                        show_description=bool(item.show_description),
-                        show_images=bool(item.show_images),
-                        supplier_id=supplier_id,
-                        promo_factor=float(item.promo_factor),
-                        promo_only_no_discount=bool(item.promo_only_no_discount),
-                        buyout_surcharge_value=float(item.buyout_surcharge_value),
-                        buyout_surcharge_currency=_normalize_currency(item.buyout_surcharge_currency, default="RUB"),
-                    )
+                existing = self.source_repo.create(
+                    key=source_key or SourceRegistryService.normalize_source_key(item.name) or f"source-{updated+1}",
+                    name=item.name,
+                    base_url=item.url,
                 )
             else:
                 existing.name = item.name
-                existing.enabled = bool(item.enabled)
-                existing.hide_auto_added_products = bool(item.hide_auto_added_products)
-                existing.show_description = bool(item.show_description)
-                existing.show_images = bool(item.show_images)
-                existing.supplier_id = supplier_id
-                existing.promo_factor = float(item.promo_factor)
-                existing.promo_only_no_discount = bool(item.promo_only_no_discount)
-                existing.buyout_surcharge_value = float(item.buyout_surcharge_value)
-                existing.buyout_surcharge_currency = _normalize_currency(item.buyout_surcharge_currency, default="RUB")
+                existing.base_url = item.url
+            setting = self.source_repo.ensure_setting(existing)
+            setting.is_enabled = bool(item.enabled)
+            setting.is_sync_enabled = bool(item.sync_enabled)
+            setting.hide_auto_added_products = bool(item.hide_auto_added_products)
+            setting.description_mode = "text" if bool(item.show_description) else "hidden"
+            setting.show_images = bool(item.show_images)
+            setting.supplier_id = supplier_id
+            setting.promo_factor = float(item.promo_factor)
+            setting.promo_only_no_discount = bool(item.promo_only_no_discount)
+            setting.buyout_surcharge_value = float(item.buyout_surcharge_value)
+            setting.buyout_surcharge_currency = _normalize_currency(item.buyout_surcharge_currency, default="RUB")
             updated += 1
 
             service_item = service_by_host.get(_norm_host(item.url))
@@ -583,105 +546,28 @@ class SettingsTransferService:
         return updated
 
     def _import_weight_rules(self, rules: list[SettingsTransferWeightRuleEntry]) -> int:
-        self.db.query(ParserWeightKeyword).delete(synchronize_session=False)
-        self.db.query(ParserWeightRule).delete(synchronize_session=False)
+        self.db.query(WeightRuleKeyword).delete(synchronize_session=False)
+        self.db.query(WeightRule).delete(synchronize_session=False)
         self.db.flush()
 
         count = 0
-        for index, item in enumerate(rules):
-            created = ParserWeightRule(
+        for item in rules:
+            created = WeightRule(
                 weight_grams=max(1, int(item.weight_grams)),
-                sort_order=int(item.sort_order if item.sort_order >= 0 else index),
+                is_enabled=True,
             )
             self.db.add(created)
             self.db.flush()
             unique_keywords = sorted({keyword.strip().lower() for keyword in item.keywords if keyword and keyword.strip()})
             for keyword in unique_keywords:
                 self.db.add(
-                    ParserWeightKeyword(
+                    WeightRuleKeyword(
                         rule_id=int(created.id),
                         keyword=keyword,
                     )
                 )
             count += 1
         return count
-
-    def _import_categories(
-        self,
-        categories: list[SettingsTransferCategoryEntry],
-        keywords: list[SettingsTransferCategoryKeywordEntry],
-    ) -> tuple[int, int]:
-        existing_categories = {str(item.slug): item for item in self.category_repo.get_all_active()}
-        upserted: dict[str, ParserCategory] = {}
-        pending_parent: dict[str, str | None] = {}
-
-        ordered = sorted(
-            categories,
-            key=lambda item: (
-                0 if item.parent_slug in (None, "") else 1,
-                str(item.parent_slug or ""),
-                str(item.slug),
-            ),
-        )
-        for item in ordered:
-            slug = item.slug.strip()
-            if not slug:
-                continue
-            current = existing_categories.get(slug)
-            if current is None:
-                current = self.category_repo.create(
-                    slug=slug,
-                    name=item.name.strip() or slug,
-                    is_fallback=bool(item.is_fallback),
-                    is_favorite=bool(item.is_favorite),
-                    is_enabled=bool(item.is_enabled),
-                    parent_id=None,
-                )
-                self.db.flush()
-            else:
-                current.name = item.name.strip() or slug
-                current.is_fallback = bool(item.is_fallback)
-                current.is_favorite = bool(item.is_favorite)
-                current.is_enabled = bool(item.is_enabled)
-
-            upserted[slug] = current
-            pending_parent[slug] = item.parent_slug
-
-        for slug, parent_slug in pending_parent.items():
-            current = upserted[slug]
-            parent = upserted.get(parent_slug or "")
-            current.parent_id = int(parent.id) if parent is not None and parent.id != current.id else None
-
-        category_ids = [int(item.id) for item in upserted.values()]
-        if category_ids:
-            self.db.query(ParserCategoryKeyword).filter(ParserCategoryKeyword.category_id.in_(category_ids)).delete(
-                synchronize_session=False
-            )
-        keyword_count = 0
-        seen: set[tuple[int, str, str]] = set()
-        for item in keywords:
-            category = upserted.get(item.category_slug)
-            if category is None:
-                continue
-            keyword = item.keyword.strip().lower()
-            if not keyword:
-                continue
-            scope = str(item.scope or "local").strip().lower()
-            if scope not in {"local", "title", "status"}:
-                scope = "local"
-            dedupe_key = (int(category.id), keyword, scope)
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            self.db.add(
-                ParserCategoryKeyword(
-                    category_id=int(category.id),
-                    keyword=keyword,
-                    keyword_scope=scope,
-                )
-            )
-            keyword_count += 1
-        return len(upserted), keyword_count
 
     def _import_brand_mappings(self, rows: list[SettingsTransferBrandMappingEntry]) -> int:
         self.db.query(ParserBrandMapping).delete(synchronize_session=False)

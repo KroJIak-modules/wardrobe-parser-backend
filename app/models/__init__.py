@@ -1,13 +1,45 @@
-from app.models.image_asset import ImageAsset
 from app.models.admin_ui_settings import AdminUiSettings
 from app.models.admin_auth import AdminRole, AdminUser
-from app.models.category import (
-    ParserCategory,
-    ParserCategoryCountSnapshot,
-    ParserCategoryIndexState,
-    ParserCategoryKeyword,
-    ParserCategoryManualProduct,
-    ParserProductCategoryMatch,
+from app.models.catalog_dedup import ProductDedupDecision, ProductDedupDecisionMember
+from app.models.catalog_product import (
+    Product,
+    ProductListing,
+    ProductListingGalleryImage,
+    ProductListingImage,
+    ProductListingMember,
+    ProductListingVariant,
+    ProductPresentation,
+    ProductPriceOverride,
+)
+from app.models.catalog_support import (
+    Designer,
+    DesignerSourceName,
+    ImageAsset,
+    PricingSetting,
+    ShowcaseCarouselImage,
+    ShowcaseSetting,
+    Source,
+    SourceSetting,
+    SourceSyncState,
+    Supplier,
+    SupplierShippingRate,
+    SyncAppliedBatch,
+    SyncJob,
+    SyncJobSourceRun,
+    WeightRule,
+    WeightRuleKeyword,
+)
+from app.models.catalog_taxonomy import (
+    CustomCatalog,
+    CustomCatalogProduct,
+    Filter,
+    FilterLocalCategoryKeyword,
+    FilterManualProduct,
+    FilterNode,
+    FilterTitleKeyword,
+    ShowcaseCategory,
+    ShowcaseCategoryAttachment,
+    ShowcaseCategoryAttachmentHiddenNode,
 )
 from app.models.parser_entities import (
     ParserBrandMapping,
@@ -18,24 +50,34 @@ from app.models.parser_entities import (
     ParserSource,
 )
 from app.models.pricing import ParserPricingSettings, ParserSupplier, ParserSupplierShippingRate
-from app.models.product import Product
-from app.models.product_image import ProductImage
-from app.models.site import Site
-from app.models.sync_runtime import SyncAppliedBatch
 from app.models.sync_job_runtime import SyncJobRuntime
 from app.models.weight import ParserWeightKeyword, ParserWeightRule
 
 __all__ = [
-    "ImageAsset",
     "AdminUiSettings",
     "AdminRole",
     "AdminUser",
-    "ParserCategory",
-    "ParserCategoryCountSnapshot",
-    "ParserCategoryIndexState",
-    "ParserCategoryKeyword",
-    "ParserCategoryManualProduct",
-    "ParserProductCategoryMatch",
+    "CustomCatalog",
+    "CustomCatalogProduct",
+    "Designer",
+    "DesignerSourceName",
+    "Filter",
+    "FilterLocalCategoryKeyword",
+    "FilterManualProduct",
+    "FilterNode",
+    "FilterTitleKeyword",
+    "ImageAsset",
+    "PricingSetting",
+    "Product",
+    "ProductDedupDecision",
+    "ProductDedupDecisionMember",
+    "ProductListing",
+    "ProductListingGalleryImage",
+    "ProductListingImage",
+    "ProductListingMember",
+    "ProductListingVariant",
+    "ProductPresentation",
+    "ProductPriceOverride",
     "ParserBrandMapping",
     "ParserDedupDecision",
     "ParserFavoriteProduct",
@@ -47,9 +89,20 @@ __all__ = [
     "ParserSupplierShippingRate",
     "ParserWeightKeyword",
     "ParserWeightRule",
-    "Product",
-    "ProductImage",
-    "Site",
+    "ShowcaseCarouselImage",
+    "ShowcaseCategory",
+    "ShowcaseCategoryAttachment",
+    "ShowcaseCategoryAttachmentHiddenNode",
+    "ShowcaseSetting",
+    "Source",
+    "SourceSetting",
+    "SourceSyncState",
+    "Supplier",
+    "SupplierShippingRate",
     "SyncAppliedBatch",
+    "SyncJob",
+    "SyncJobSourceRun",
     "SyncJobRuntime",
+    "WeightRule",
+    "WeightRuleKeyword",
 ]
