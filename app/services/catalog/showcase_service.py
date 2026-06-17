@@ -25,6 +25,6 @@ class ShowcaseService:
             .all()
         )
         return {
-            "showcase_hero_image_asset_id": int(settings.hero_image_asset_id) if settings.hero_image_asset_id else None,
-            "showcase_carousel_image_asset_ids": [int(item.image_asset_id) for item in carousel_items],
+            "hero_image_asset_id": int(settings.hero_image_asset_id) if settings.hero_image_asset_id else None,
+            "carousel_image_asset_ids": [int(item.image_asset_id) for item in carousel_items],
         }

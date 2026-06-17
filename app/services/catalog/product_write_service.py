@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models import ImageAsset, ProductListingGalleryImage
 from app.repositories.catalog_products import CatalogProductRepository
+from app.services.catalog.product_ingest_service import ProductIngestService
 from app.services.catalog.source_registry_service import SourceRegistryService
 
 
@@ -17,11 +18,32 @@ class ProductWriteService:
         self.sources = SourceRegistryService(db)
 
     @staticmethod
-    def _normalize_status(raw: str | None) -> str:
+    def _normalize_visibility_status(raw: str | None) -> str:
         value = str(raw or "").strip().lower()
-        if value in {"available", "out_of_stock", "hidden"}:
+        if value in {"visible", "hidden"}:
             return value
-        return "available"
+        return "visible"
+
+    @staticmethod
+    def _normalize_availability_mode(raw: str | None) -> str:
+        value = str(raw or "").strip().lower()
+        if value in {"in_stock", "by_order"}:
+            return value
+        return "by_order"
+
+    @staticmethod
+    def _normalize_gender(raw: str | None) -> str:
+        value = str(raw or "").strip().lower()
+        if value in {"male", "female", "unisex"}:
+            return value
+        return "unisex"
+
+    @staticmethod
+    def _normalize_orderability_status(raw: str | None) -> str:
+        value = str(raw or "").strip().lower()
+        if value in {"orderable", "sold_out", "unavailable"}:
+            return value
+        return "orderable"
 
     def _product_or_error(self, product_id: int):
         product = self.products.get_product(product_id)
@@ -34,6 +56,53 @@ class ProductWriteService:
         if listing is None:
             raise ValidationError("У товара нет основного listing")
         return listing
+
+    @staticmethod
+    def _int_or_none(value: object) -> int | None:
+        try:
+            if value is None or str(value).strip() == "":
+                return None
+            candidate = int(value)
+        except Exception:
+            return None
+        return candidate if candidate > 0 else None
+
+    def _listing_belongs_to_product(self, *, product_id: int, listing_id: int) -> bool:
+        return any(int(listing.id) == int(listing_id) for listing in self.products.list_product_listings(int(product_id)))
+
+    def _sync_weight_state(self, *, product, listing) -> None:
+        incoming_status = self._normalize_orderability_status(listing.orderability_status)
+        incoming_reason = str(listing.status_reason or "").strip().lower() or None
+        if incoming_reason == "missing_weight":
+            variant_states = [bool(variant.is_orderable) for variant in getattr(listing, "variants", [])]
+            if variant_states:
+                incoming_status = "orderable" if any(variant_states) else "sold_out"
+            incoming_reason = None
+        listing.orderability_status, listing.status_reason = ProductIngestService(self.db)._resolve_listing_status(
+            product=product,
+            listing=listing,
+            incoming_status=incoming_status,
+            incoming_reason=incoming_reason,
+            incoming_reasons=([incoming_reason] if incoming_reason else []),
+        )
+
+    def _apply_price_override(self, *, product_id: int, payload: dict | None, reset: bool = False) -> None:
+        if reset or payload is None:
+            self.products.delete_price_override(int(product_id))
+            return
+        manual_price_rub = payload.get("manual_price_rub")
+        if manual_price_rub is None:
+            self.products.delete_price_override(int(product_id))
+            return
+        self.products.upsert_price_override(
+            product_id=int(product_id),
+            manual_price_rub=float(manual_price_rub),
+            manual_compare_at_price_rub=(
+                float(payload["manual_compare_at_price_rub"])
+                if payload.get("manual_compare_at_price_rub") is not None
+                else None
+            ),
+        )
 
     def _gallery_asset_ids_from_urls(self, manual_image_urls: list[str]) -> list[int]:
         asset_ids: list[int] = []
@@ -89,7 +158,7 @@ class ProductWriteService:
                     listing_image_id=int(image.id),
                     position=position,
                     is_hidden=False,
-                    origin_kind="source",
+                    origin_kind="source_image",
                 )
             )
             position += 1
@@ -107,7 +176,7 @@ class ProductWriteService:
                     image_asset_id=int(asset_id[0]),
                     position=position,
                     is_hidden=False,
-                    origin_kind="uploaded",
+                    origin_kind="uploaded_asset",
                 )
             )
             position += 1
@@ -123,7 +192,7 @@ class ProductWriteService:
                     listing_image_id=int(image.id),
                     position=position,
                     is_hidden=True,
-                    origin_kind="source",
+                    origin_kind="source_image",
                 )
             )
             position += 1
@@ -132,35 +201,54 @@ class ProductWriteService:
 
     def update_product(self, *, product_id: int, payload: dict) -> None:
         product = self._product_or_error(product_id)
+        if payload.get("primary_listing_id") is not None:
+            primary_listing_id = int(payload["primary_listing_id"])
+            if not self._listing_belongs_to_product(product_id=int(product.id), listing_id=primary_listing_id):
+                raise ValidationError("primary_listing_id не принадлежит товару")
+            product.primary_listing_id = primary_listing_id
         listing = self._primary_listing_or_error(product)
         presentation = self.products.ensure_presentation(int(product.id))
 
         reset_to_default = {str(item).strip() for item in payload.get("reset_to_default") or []}
-        if "title" in reset_to_default:
+        if "title_override" in reset_to_default:
             presentation.title_override = None
-        elif "title" in payload:
-            presentation.title_override = str(payload.get("title") or "").strip() or None
+        elif "title_override" in payload:
+            presentation.title_override = str(payload.get("title_override") or "").strip() or None
 
-        if "description" in reset_to_default:
+        if "description_text" in reset_to_default:
             presentation.description_text = None
+        elif "description_text" in payload:
+            presentation.description_text = str(payload.get("description_text") or "").strip() or None
+
+        if "description_html" in reset_to_default:
             presentation.description_html = None
-        elif "description" in payload:
-            presentation.description_text = str(payload.get("description") or "").strip() or None
-            presentation.description_html = None
+        elif "description_html" in payload:
+            presentation.description_html = str(payload.get("description_html") or "").strip() or None
 
         if "description_visibility" in reset_to_default:
             presentation.description_visibility = None
-        elif "description_visible" in payload:
-            presentation.description_visibility = bool(payload.get("description_visible"))
+        elif "description_visibility" in payload:
+            presentation.description_visibility = bool(payload.get("description_visibility"))
 
-        if "status" in payload:
-            status_value = self._normalize_status(payload.get("status"))
-            if status_value == "hidden":
-                product.visibility_status = "hidden"
-            else:
-                product.visibility_status = "visible"
-                listing.orderability_status = "orderable" if status_value == "available" else "sold_out"
-                listing.status_reason = None
+        if "visibility_status" in payload:
+            product.visibility_status = self._normalize_visibility_status(payload.get("visibility_status"))
+
+        if "availability_mode" in payload:
+            product.availability_mode = self._normalize_availability_mode(payload.get("availability_mode"))
+
+        if "gender" in payload:
+            product.gender = self._normalize_gender(payload.get("gender"))
+
+        if "manual_weight_grams" in reset_to_default:
+            product.manual_weight_grams = None
+        elif "manual_weight_grams" in payload:
+            product.manual_weight_grams = self._int_or_none(payload.get("manual_weight_grams"))
+
+        if "price_override" in reset_to_default:
+            self._apply_price_override(product_id=int(product.id), payload=None, reset=True)
+        elif "price_override" in payload:
+            price_payload = payload.get("price_override") if isinstance(payload.get("price_override"), dict) else None
+            self._apply_price_override(product_id=int(product.id), payload=price_payload, reset=False)
 
         images_patch = payload.get("images") if isinstance(payload.get("images"), dict) else None
         if "images" in reset_to_default:
@@ -181,6 +269,7 @@ class ProductWriteService:
                 manual_image_order=manual_image_order,
             )
 
+        self._sync_weight_state(product=product, listing=listing)
         self.db.flush()
 
     def create_manual_product(self, payload: dict) -> int:
@@ -190,11 +279,12 @@ class ProductWriteService:
             raise ValidationError("title is required")
 
         product = self.products.create_product(
-            gender="unisex",
-            availability_mode="in_stock",
+            designer_id=self._int_or_none(payload.get("designer_id")),
+            gender=self._normalize_gender(payload.get("gender")),
+            availability_mode=self._normalize_availability_mode(payload.get("availability_mode") or "in_stock"),
             lifecycle_status="active",
-            visibility_status="hidden" if self._normalize_status(payload.get("status")) == "hidden" else "visible",
-            manual_weight_grams=(int(payload["weight_grams"]) if payload.get("weight_grams") is not None else None),
+            visibility_status=self._normalize_visibility_status(payload.get("visibility_status")),
+            manual_weight_grams=self._int_or_none(payload.get("manual_weight_grams")),
         )
         listing = self.products.create_listing(
             source_id=int(source.id),
@@ -202,12 +292,12 @@ class ProductWriteService:
             url=f"manual://product/{product.id}",
             handle=f"manual-{product.id}",
             source_title=title,
-            source_description_text=str(payload.get("description") or "").strip() or None,
-            source_description_html=None,
+            source_description_text=str(payload.get("description_text") or "").strip() or None,
+            source_description_html=str(payload.get("description_html") or "").strip() or None,
             source_weight_grams=None,
-            source_designer_raw=str(payload.get("vendor") or "").strip() or None,
-            source_category_raw=str(payload.get("product_type") or "").strip() or None,
-            orderability_status="sold_out" if self._normalize_status(payload.get("status")) == "out_of_stock" else "orderable",
+            source_designer_raw=str(payload.get("designer_name") or "").strip() or None,
+            source_category_raw=str(payload.get("source_category_name") or "").strip() or None,
+            orderability_status=self._normalize_orderability_status(payload.get("orderability_status")),
             status_reason=None,
             ingest_mode="manual",
         )
@@ -241,6 +331,12 @@ class ProductWriteService:
             manual_image_order=manual_urls,
         )
 
+        self._apply_price_override(
+            product_id=int(product.id),
+            payload=(payload.get("price_override") if isinstance(payload.get("price_override"), dict) else None),
+            reset=False,
+        )
+        self._sync_weight_state(product=product, listing=listing)
         self.db.flush()
         return int(product.id)
 
@@ -253,14 +349,17 @@ class ProductWriteService:
         title = str(payload.get("title") or "").strip()
         if not title:
             raise ValidationError("title is required")
+        product.designer_id = self._int_or_none(payload.get("designer_id"))
+        product.gender = self._normalize_gender(payload.get("gender"))
+        product.availability_mode = self._normalize_availability_mode(payload.get("availability_mode"))
+        product.visibility_status = self._normalize_visibility_status(payload.get("visibility_status"))
         listing.source_title = title
-        listing.source_description_text = str(payload.get("description") or "").strip() or None
-        listing.source_designer_raw = str(payload.get("vendor") or "").strip() or None
-        listing.source_category_raw = str(payload.get("product_type") or "").strip() or None
-        product.manual_weight_grams = int(payload["weight_grams"]) if payload.get("weight_grams") is not None else None
-        status_value = self._normalize_status(payload.get("status"))
-        product.visibility_status = "hidden" if status_value == "hidden" else "visible"
-        listing.orderability_status = "sold_out" if status_value == "out_of_stock" else "orderable"
+        listing.source_description_text = str(payload.get("description_text") or "").strip() or None
+        listing.source_description_html = str(payload.get("description_html") or "").strip() or None
+        listing.source_designer_raw = str(payload.get("designer_name") or "").strip() or None
+        listing.source_category_raw = str(payload.get("source_category_name") or "").strip() or None
+        product.manual_weight_grams = self._int_or_none(payload.get("manual_weight_grams"))
+        listing.orderability_status = self._normalize_orderability_status(payload.get("orderability_status"))
         listing.status_reason = None
 
         variants = []
@@ -289,6 +388,12 @@ class ProductWriteService:
             manual_image_urls=manual_urls,
             manual_image_order=manual_urls,
         )
+        self._apply_price_override(
+            product_id=int(product.id),
+            payload=(payload.get("price_override") if isinstance(payload.get("price_override"), dict) else None),
+            reset=False,
+        )
+        self._sync_weight_state(product=product, listing=listing)
         self.db.flush()
 
     def delete_manual_product(self, *, product_id: int) -> None:

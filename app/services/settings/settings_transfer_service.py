@@ -13,8 +13,10 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models import (
     AdminUiSettings,
-    ParserBrandMapping,
+    Designer,
+    DesignerSourceName,
     PricingSetting,
+    ShowcaseCarouselImage,
     Source,
     Supplier,
     SupplierShippingRate,
@@ -27,11 +29,12 @@ from app.repositories import (
     CatalogSupplierRepository,
     CatalogWeightRuleRepository,
 )
+from app.services.catalog.showcase_service import ShowcaseService
 from app.services.catalog.source_registry_service import SourceRegistryService
 from app.services.settings.pricing_service import PricingSettingsService
 from app.schemas.parser import (
-    SettingsTransferBrandMappingEntry,
     SettingsTransferAdminUiSettings,
+    SettingsTransferDesignerSourceNameEntry,
     SettingsTransferPayload,
     SettingsTransferPricingSettings,
     SettingsTransferResponse,
@@ -96,6 +99,11 @@ def _norm_host(raw: str) -> str:
     return value.split("/", 1)[0]
 
 
+def _slugify_name(raw: str) -> str:
+    value = re.sub(r"[^a-z0-9]+", "-", str(raw or "").strip().lower())
+    return value.strip("-")[:255] or "designer"
+
+
 class SettingsTransferService:
     """Application service for settings export/import."""
 
@@ -158,20 +166,13 @@ class SettingsTransferService:
             }
         )
         ui_row = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
+        showcase_state = ShowcaseService(self.db).state()
         admin_ui = SettingsTransferAdminUiSettings(
             designers_min_products=max(1, int(getattr(ui_row, "designers_min_products", 1) or 1)),
             designers_exclude_store_vendors=bool(getattr(ui_row, "designers_exclude_store_vendors", False)),
             auto_sync_period_minutes=max(60, int(getattr(ui_row, "auto_sync_period_minutes", 60) or 60)),
-            showcase_hero_image_asset_id=(
-                int(getattr(ui_row, "showcase_hero_image_asset_id"))
-                if isinstance(getattr(ui_row, "showcase_hero_image_asset_id", None), int)
-                and int(getattr(ui_row, "showcase_hero_image_asset_id")) > 0
-                else None
-            ),
-            showcase_carousel_image_asset_ids=PricingSettingsService._normalize_image_asset_ids(
-                getattr(ui_row, "showcase_carousel_image_asset_ids", None),
-                limit=20,
-            ),
+            hero_image_asset_id=showcase_state["hero_image_asset_id"],
+            carousel_image_asset_ids=showcase_state["carousel_image_asset_ids"],
         )
 
         supplier_entries = [
@@ -240,7 +241,7 @@ class SettingsTransferService:
                     enabled=bool(getattr(setting, "is_enabled", True)),
                     sync_enabled=bool(getattr(setting, "is_sync_enabled", True)),
                     hide_auto_added_products=bool(getattr(setting, "hide_auto_added_products", False)),
-                    show_description=str(getattr(setting, "description_mode", "text") or "text") != "hidden",
+                    description_mode=str(getattr(setting, "description_mode", "text") or "text"),
                     show_images=bool(getattr(setting, "show_images", True)),
                     currency_priority=currency_priority,
                     currency_method=currency_method,  # type: ignore[arg-type]
@@ -260,13 +261,12 @@ class SettingsTransferService:
         weight_entries = [
             SettingsTransferWeightRuleEntry(
                 weight_grams=int(rule.weight_grams),
-                sort_order=index,
                 keywords=[
                     str(item.keyword)
                     for item in self.weight_rule_repo.list_keywords(int(rule.id))
                 ],
             )
-            for index, rule in enumerate(weight_rules)
+            for rule in weight_rules
         ]
 
         return SettingsTransferPayload(
@@ -278,16 +278,16 @@ class SettingsTransferService:
             suppliers=supplier_entries,
             sources=source_entries,
             weight_rules=weight_entries,
-            categories=[],
-            category_keywords=[],
-            brand_mappings=[
-                SettingsTransferBrandMappingEntry(
-                    source_brand=str(row.source_brand),
-                    source_brand_key=str(row.source_brand_key),
-                    target_brand=str(row.target_brand),
-                    include_in_designers=bool(getattr(row, "include_in_designers", True)),
+            designer_source_names=[
+                SettingsTransferDesignerSourceNameEntry(
+                    source_name=str(row.source_name),
+                    designer_name=(str(row.designer.name) if row.designer is not None else None),
                 )
-                for row in self.db.query(ParserBrandMapping).order_by(ParserBrandMapping.id.asc()).all()
+                for row in (
+                    self.db.query(DesignerSourceName)
+                    .order_by(DesignerSourceName.source_name.asc(), DesignerSourceName.id.asc())
+                    .all()
+                )
             ],
         )
 
@@ -303,7 +303,7 @@ class SettingsTransferService:
         admin_ui_updated = self._import_admin_ui(payload.admin_ui_settings)
         source_count = self._import_sources(payload.sources, supplier_map=supplier_map)
         weight_count = self._import_weight_rules(payload.weight_rules)
-        brand_mappings_updated = self._import_brand_mappings(payload.brand_mappings)
+        designer_source_names_updated = self._import_designer_source_names(payload.designer_source_names)
 
         self.db.commit()
         return SettingsTransferResponse(
@@ -317,9 +317,7 @@ class SettingsTransferService:
                 "suppliers_upserted": len(supplier_map),
                 "sources_upserted": source_count,
                 "weight_rules_replaced": weight_count,
-                "categories_upserted": 0,
-                "category_keywords_replaced": 0,
-                "brand_mappings_replaced": brand_mappings_updated,
+                "designer_source_names_replaced": designer_source_names_updated,
             },
         )
 
@@ -357,8 +355,8 @@ class SettingsTransferService:
         self.db.query(WeightRuleKeyword).delete(synchronize_session=False)
         self.db.query(WeightRule).delete(synchronize_session=False)
 
-        # 4) Reset designers remapping.
-        self.db.query(ParserBrandMapping).delete(synchronize_session=False)
+        # 4) Reset designer source names.
+        self.db.query(DesignerSourceName).delete(synchronize_session=False)
 
         self.db.commit()
         return SettingsTransferResponse(
@@ -372,8 +370,6 @@ class SettingsTransferService:
                 "suppliers_upserted": len(suppliers),
                 "sources_upserted": sources_reset,
                 "weight_rules_replaced": 0,
-                "categories_upserted": 0,
-                "category_keywords_replaced": 0,
             },
         )
 
@@ -417,13 +413,30 @@ class SettingsTransferService:
             "designers_min_products": max(1, int(values.get("designers_min_products") or 1)),
             "designers_exclude_store_vendors": bool(values.get("designers_exclude_store_vendors")),
             "auto_sync_period_minutes": max(60, int(values.get("auto_sync_period_minutes") or 60)),
-            "showcase_hero_image_asset_id": int(values["showcase_hero_image_asset_id"]) if isinstance(values.get("showcase_hero_image_asset_id"), int) and int(values.get("showcase_hero_image_asset_id")) > 0 else None,
-            "showcase_carousel_image_asset_ids": PricingSettingsService._normalize_image_asset_ids(values.get("showcase_carousel_image_asset_ids"), limit=20),
         }
         for key, raw_value in normalized.items():
             if getattr(row, key) != raw_value:
                 setattr(row, key, raw_value)
                 updated_fields += 1
+        showcase_settings = ShowcaseService(self.db).ensure_settings()
+        hero_image_asset_id = int(values["hero_image_asset_id"]) if isinstance(values.get("hero_image_asset_id"), int) and int(values.get("hero_image_asset_id")) > 0 else None
+        if showcase_settings.hero_image_asset_id != hero_image_asset_id:
+            showcase_settings.hero_image_asset_id = hero_image_asset_id
+            updated_fields += 1
+        desired_carousel_ids = PricingSettingsService._normalize_image_asset_ids(values.get("carousel_image_asset_ids"), limit=20)
+        current_rows = (
+            self.db.query(ShowcaseCarouselImage)
+            .order_by(ShowcaseCarouselImage.position.asc(), ShowcaseCarouselImage.id.asc())
+            .all()
+        )
+        current_ids = [int(row.image_asset_id) for row in current_rows]
+        if current_ids != desired_carousel_ids:
+            for row in current_rows:
+                self.db.delete(row)
+            self.db.flush()
+            for position, image_asset_id in enumerate(desired_carousel_ids, start=1):
+                self.db.add(ShowcaseCarouselImage(image_asset_id=int(image_asset_id), position=position))
+            updated_fields += 1
         return updated_fields
 
     def _import_suppliers(self, suppliers: list[SettingsTransferSupplierEntry]) -> dict[str, Supplier]:
@@ -517,7 +530,7 @@ class SettingsTransferService:
             setting.is_enabled = bool(item.enabled)
             setting.is_sync_enabled = bool(item.sync_enabled)
             setting.hide_auto_added_products = bool(item.hide_auto_added_products)
-            setting.description_mode = "text" if bool(item.show_description) else "hidden"
+            setting.description_mode = str(item.description_mode)
             setting.show_images = bool(item.show_images)
             setting.supplier_id = supplier_id
             setting.promo_factor = float(item.promo_factor)
@@ -569,22 +582,59 @@ class SettingsTransferService:
             count += 1
         return count
 
-    def _import_brand_mappings(self, rows: list[SettingsTransferBrandMappingEntry]) -> int:
-        self.db.query(ParserBrandMapping).delete(synchronize_session=False)
+    def _import_designer_source_names(self, rows: list[SettingsTransferDesignerSourceNameEntry]) -> int:
+        self.db.query(DesignerSourceName).delete(synchronize_session=False)
         self.db.flush()
         inserted = 0
-        seen_keys: set[str] = set()
+        designers_by_name = {
+            str(designer.name).strip().casefold(): designer
+            for designer in self.db.query(Designer).order_by(Designer.id.asc()).all()
+            if str(designer.name or "").strip()
+        }
+        used_slugs = {
+            str(designer.slug).strip()
+            for designer in designers_by_name.values()
+            if str(designer.slug or "").strip()
+        }
+        seen_source_names: set[str] = set()
+
+        def next_slug(name: str) -> str:
+            base = _slugify_name(name)
+            if base not in used_slugs:
+                used_slugs.add(base)
+                return base
+            index = 2
+            while f"{base}-{index}" in used_slugs:
+                index += 1
+            slug = f"{base}-{index}"
+            used_slugs.add(slug)
+            return slug
+
         for item in rows:
-            key = str(item.source_brand_key or "").strip().lower()
-            if not key or key in seen_keys:
+            source_name = str(item.source_name or "").strip()
+            if not source_name:
                 continue
-            seen_keys.add(key)
+            normalized_source_name = source_name.casefold()
+            if normalized_source_name in seen_source_names:
+                continue
+            seen_source_names.add(normalized_source_name)
+
+            designer_id = None
+            designer_name = str(item.designer_name or "").strip()
+            if designer_name:
+                normalized_designer_name = designer_name.casefold()
+                designer = designers_by_name.get(normalized_designer_name)
+                if designer is None:
+                    designer = Designer(name=designer_name, slug=next_slug(designer_name), is_enabled=True)
+                    self.db.add(designer)
+                    self.db.flush()
+                    designers_by_name[normalized_designer_name] = designer
+                designer_id = int(designer.id)
+
             self.db.add(
-                ParserBrandMapping(
-                    source_brand=str(item.source_brand).strip(),
-                    source_brand_key=key,
-                    target_brand=str(item.target_brand).strip(),
-                    include_in_designers=bool(item.include_in_designers),
+                DesignerSourceName(
+                    source_name=source_name,
+                    designer_id=designer_id,
                 )
             )
             inserted += 1

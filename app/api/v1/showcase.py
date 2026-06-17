@@ -48,7 +48,7 @@ def get_showcase_hero_image(db: Session = Depends(get_db)) -> FileResponse:
 @router.get("/showcase/carousel")
 def get_showcase_carousel(db: Session = Depends(get_db)) -> dict:
     state = ShowcaseService(db).state()
-    return {"items": state["showcase_carousel_image_asset_ids"]}
+    return {"items": state["carousel_image_asset_ids"]}
 
 
 @router.get("/showcase/carousel/{image_id}/image")
@@ -96,7 +96,7 @@ def add_showcase_carousel_image(image_id: int, db: Session = Depends(get_db)) ->
         max_position = db.query(ShowcaseCarouselImage.position).order_by(ShowcaseCarouselImage.position.desc()).limit(1).scalar()
         db.add(ShowcaseCarouselImage(image_asset_id=int(image_id), position=int(max_position or 0) + 1))
         db.commit()
-    return {"ok": True, "image_asset_id": int(image_id), "items": ShowcaseService(db).state()["showcase_carousel_image_asset_ids"]}
+    return {"ok": True, "image_asset_id": int(image_id), "items": ShowcaseService(db).state()["carousel_image_asset_ids"]}
 
 
 @router.delete("/showcase/carousel/{image_id}", dependencies=[Depends(require_permission("showcase.edit"))])
@@ -105,7 +105,7 @@ def remove_showcase_carousel_image(image_id: int, db: Session = Depends(get_db))
     if row is not None:
         db.delete(row)
         db.commit()
-    return {"ok": True, "items": ShowcaseService(db).state()["showcase_carousel_image_asset_ids"]}
+    return {"ok": True, "items": ShowcaseService(db).state()["carousel_image_asset_ids"]}
 
 
 @router.put("/showcase/carousel/order", dependencies=[Depends(require_permission("showcase.edit"))])
@@ -124,4 +124,4 @@ def reorder_showcase_carousel(payload: CarouselOrderRequest, db: Session = Depen
         row.position = position
         position += 1
     db.commit()
-    return {"ok": True, "items": ShowcaseService(db).state()["showcase_carousel_image_asset_ids"]}
+    return {"ok": True, "items": ShowcaseService(db).state()["carousel_image_asset_ids"]}

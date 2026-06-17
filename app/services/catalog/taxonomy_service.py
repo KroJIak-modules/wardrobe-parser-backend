@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -28,9 +30,31 @@ from app.schemas.taxonomy import (
 
 
 class TaxonomyService:
+    _SHOWCASE_CATEGORY_SEED = {
+        "new": "Новинки",
+        "designers": "Дизайнеры",
+        "men": "Мужское",
+        "women": "Женское",
+        "sale": "Sale",
+    }
+
     def __init__(self, db: Session) -> None:
         self.db = db
         self.repo = CatalogTaxonomyRepository(db)
+
+    @classmethod
+    def _slugify(cls, raw: str) -> str:
+        translit = str.maketrans(
+            {
+                "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
+                "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+                "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts",
+                "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+            }
+        )
+        value = str(raw or "").strip().lower().translate(translit)
+        value = re.sub(r"[^a-z0-9]+", "-", value).strip("-")
+        return value[:255]
 
     @staticmethod
     def _clean_text_list(values: list[str]) -> list[str]:
@@ -138,18 +162,118 @@ class TaxonomyService:
             showcase_categories=showcase_categories,
         )
 
+    def _prepare_payload(self, payload: TaxonomyState) -> TaxonomyState:
+        filter_slug_aliases: dict[str, str] = {}
+        catalog_slug_aliases: dict[str, str] = {}
+        used_filter_slugs: set[str] = set()
+        used_catalog_slugs: set[str] = set()
+
+        def next_unique_slug(base: str, used: set[str]) -> str:
+            candidate = base or "item"
+            if candidate not in used:
+                used.add(candidate)
+                return candidate
+            index = 2
+            while f"{candidate}-{index}" in used:
+                index += 1
+            final = f"{candidate}-{index}"
+            used.add(final)
+            return final
+
+        def rewrite_nodes(nodes: list[TaxonomyFilterNode]) -> list[TaxonomyFilterNode]:
+            out: list[TaxonomyFilterNode] = []
+            for node in nodes:
+                old_slug = str(node.slug).strip()
+                new_slug = next_unique_slug(self._slugify(node.title), used_filter_slugs)
+                if old_slug:
+                    filter_slug_aliases[old_slug] = new_slug
+                filter_slug_aliases[new_slug] = new_slug
+                out.append(
+                    TaxonomyFilterNode(
+                        slug=new_slug,
+                        title=node.title,
+                        display_title=node.display_title,
+                        node_kind=node.node_kind,
+                        is_enabled=node.is_enabled,
+                        local_category_keywords=node.local_category_keywords,
+                        title_keywords=node.title_keywords,
+                        manual_product_ids=node.manual_product_ids,
+                        children=rewrite_nodes(node.children),
+                    )
+                )
+            return out
+
+        prepared_filters = rewrite_nodes(payload.filters)
+        prepared_catalogs: list[TaxonomyCustomCatalog] = []
+        for catalog in payload.custom_catalogs:
+            old_slug = str(catalog.slug).strip()
+            new_slug = next_unique_slug(self._slugify(catalog.title), used_catalog_slugs)
+            if old_slug:
+                catalog_slug_aliases[old_slug] = new_slug
+            catalog_slug_aliases[new_slug] = new_slug
+            prepared_catalogs.append(
+                TaxonomyCustomCatalog(
+                    slug=new_slug,
+                    title=catalog.title,
+                    description=catalog.description,
+                    is_enabled=catalog.is_enabled,
+                    product_ids=catalog.product_ids,
+                )
+            )
+
+        prepared_showcase: list[TaxonomyShowcaseCategory] = []
+        for showcase_category in payload.showcase_categories:
+            prepared_showcase.append(
+                TaxonomyShowcaseCategory(
+                    code=showcase_category.code,
+                    title=showcase_category.title,
+                    attachments=[
+                        TaxonomyShowcaseAttachment(
+                            kind=attachment.kind,
+                            filter_slug=filter_slug_aliases.get(str(attachment.filter_slug or "").strip()) if attachment.filter_slug else None,
+                            custom_catalog_slug=catalog_slug_aliases.get(str(attachment.custom_catalog_slug or "").strip()) if attachment.custom_catalog_slug else None,
+                            hidden_filter_slugs=[
+                                filter_slug_aliases.get(str(hidden_slug).strip(), str(hidden_slug).strip())
+                                for hidden_slug in attachment.hidden_filter_slugs
+                            ],
+                        )
+                        for attachment in showcase_category.attachments
+                    ],
+                )
+            )
+        return TaxonomyState(
+            filters=prepared_filters,
+            custom_catalogs=prepared_catalogs,
+            showcase_categories=prepared_showcase,
+        )
+
     def _validate_state(self, payload: TaxonomyState) -> tuple[dict[str, TaxonomyFilterNode], dict[str, TaxonomyCustomCatalog]]:
         filters_by_slug: dict[str, TaxonomyFilterNode] = {}
+        filter_child_parent_by_slug: dict[str, str | None] = {}
+        filter_branch_slugs_by_slug: dict[str, set[str]] = {}
 
-        def walk(nodes: list[TaxonomyFilterNode]) -> None:
+        def walk(nodes: list[TaxonomyFilterNode], parent_slug: str | None = None) -> None:
             for node in nodes:
                 slug = str(node.slug).strip()
                 if slug in filters_by_slug:
                     raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Duplicate filter slug: {slug}")
+                if str(node.node_kind).strip() == "filter" and node.children:
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Filter node cannot have children: {slug}")
                 filters_by_slug[slug] = node
-                walk(node.children)
+                filter_child_parent_by_slug[slug] = parent_slug
+                walk(node.children, slug)
 
         walk(payload.filters)
+
+        def collect_branch_slugs(node: TaxonomyFilterNode) -> set[str]:
+            branch = {str(node.slug).strip()}
+            for child in node.children:
+                branch.update(collect_branch_slugs(child))
+            filter_branch_slugs_by_slug[str(node.slug).strip()] = branch
+            return branch
+
+        for root in payload.filters:
+            collect_branch_slugs(root)
 
         catalogs_by_slug: dict[str, TaxonomyCustomCatalog] = {}
         for catalog in payload.custom_catalogs:
@@ -163,6 +287,8 @@ class TaxonomyService:
             code = str(showcase_category.code).strip()
             if code in category_codes:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Duplicate showcase category code: {code}")
+            if code not in self._SHOWCASE_CATEGORY_SEED:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unknown showcase category code: {code}")
             category_codes.add(code)
             for attachment in showcase_category.attachments:
                 if attachment.kind == "filter":
@@ -175,9 +301,14 @@ class TaxonomyService:
                         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid custom catalog attachment in showcase category: {code}")
                     if attachment.custom_catalog_slug not in catalogs_by_slug:
                         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unknown custom catalog slug in attachment: {attachment.custom_catalog_slug}")
+                    if self._clean_text_list(attachment.hidden_filter_slugs):
+                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Custom catalog attachment cannot have hidden filter slugs: {code}")
+                attachment_filter_slug = attachment.filter_slug if attachment.kind == "filter" else None
                 for hidden_slug in self._clean_text_list(attachment.hidden_filter_slugs):
                     if hidden_slug not in filters_by_slug:
                         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unknown hidden filter slug: {hidden_slug}")
+                    if attachment_filter_slug is not None and hidden_slug not in filter_branch_slugs_by_slug.get(attachment_filter_slug, set()):
+                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Hidden filter slug must belong to the same filter branch: {hidden_slug}")
 
         product_ids: set[int] = set()
         for node in filters_by_slug.values():
@@ -195,9 +326,10 @@ class TaxonomyService:
         return filters_by_slug, catalogs_by_slug
 
     def replace_state(self, payload: TaxonomyState) -> TaxonomyState:
-        filters_by_slug, catalogs_by_slug = self._validate_state(payload)
+        prepared = self._prepare_payload(payload)
+        filters_by_slug, catalogs_by_slug = self._validate_state(prepared)
         try:
-            self.repo.clear_state()
+            self.repo.clear_editable_state()
             self.repo.flush()
 
             filter_entity_by_slug: dict[str, Filter] = {}
@@ -239,10 +371,10 @@ class TaxonomyService:
                     )
                     create_filter_nodes(node.children, filter_node)
 
-            create_filter_nodes(payload.filters, parent_node=None)
+            create_filter_nodes(prepared.filters, parent_node=None)
 
             custom_catalog_entity_by_slug: dict[str, CustomCatalog] = {}
-            for catalog in payload.custom_catalogs:
+            for catalog in prepared.custom_catalogs:
                 entity = CustomCatalog(
                     title=str(catalog.title).strip(),
                     description=(str(catalog.description).strip() if catalog.description else None),
@@ -257,10 +389,12 @@ class TaxonomyService:
                     for product_id in self._clean_int_list(catalog.product_ids)
                 )
 
-            for showcase_category in payload.showcase_categories:
-                category_entity = ShowcaseCategory(code=str(showcase_category.code).strip(), title=str(showcase_category.title).strip())
-                self.repo.add(category_entity)
-                self.repo.flush()
+            seeded_categories = {str(category.code): category for category in self.repo.list_showcase_categories()}
+            for showcase_category in prepared.showcase_categories:
+                category_entity = seeded_categories.get(str(showcase_category.code).strip())
+                if category_entity is None:
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unknown showcase category code: {showcase_category.code}")
+                category_entity.title = self._SHOWCASE_CATEGORY_SEED.get(str(showcase_category.code).strip(), str(showcase_category.title).strip())
                 for position, attachment in enumerate(showcase_category.attachments, start=1):
                     attachment_entity = ShowcaseCategoryAttachment(
                         showcase_category_id=int(category_entity.id),

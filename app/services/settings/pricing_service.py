@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings as app_settings
-from app.models import AdminUiSettings, Supplier
+from app.models import AdminUiSettings, ShowcaseCarouselImage, Supplier
 from app.repositories import CatalogPricingSettingsRepository, CatalogSourceRepository, CatalogSupplierRepository
 from app.schemas.parser import (
     AdminUiSettingsResponse,
@@ -26,6 +26,7 @@ from app.schemas.parser import (
     PricingSupplierUpdateRequest,
 )
 from app.services.settings.bybit_rate_provider import BybitP2PRateProvider
+from app.services.catalog.showcase_service import ShowcaseService
 
 _FORMULA_LINES = [
     "BFX = BBR + BEX",
@@ -744,6 +745,7 @@ class PricingSettingsService:
             self.db.add(entity)
             self.db.commit()
             self.db.refresh(entity)
+        showcase_state = ShowcaseService(self.db).state()
         return AdminUiSettingsResponse(
             designers_min_products=max(1, int(getattr(entity, "designers_min_products", 1) or 1)),
             designers_exclude_store_vendors=bool(getattr(entity, "designers_exclude_store_vendors", False)),
@@ -765,16 +767,8 @@ class PricingSettingsService:
             ),
             auto_sync_last_status=(str(getattr(entity, "auto_sync_last_status", "") or "").strip() or None),
             auto_sync_last_error=(str(getattr(entity, "auto_sync_last_error", "") or "").strip() or None),
-            showcase_hero_image_asset_id=(
-                int(getattr(entity, "showcase_hero_image_asset_id"))
-                if isinstance(getattr(entity, "showcase_hero_image_asset_id", None), int)
-                and int(getattr(entity, "showcase_hero_image_asset_id")) > 0
-                else None
-            ),
-            showcase_carousel_image_asset_ids=self._normalize_image_asset_ids(
-                getattr(entity, "showcase_carousel_image_asset_ids", None),
-                limit=20,
-            ),
+            hero_image_asset_id=showcase_state["hero_image_asset_id"],
+            carousel_image_asset_ids=showcase_state["carousel_image_asset_ids"],
         )
 
     def update_admin_ui_settings(self, payload: AdminUiSettingsUpdateRequest) -> AdminUiSettingsResponse:
@@ -786,14 +780,27 @@ class PricingSettingsService:
             patch["designers_exclude_store_vendors"] = bool(patch.get("designers_exclude_store_vendors"))
         if "auto_sync_period_minutes" in patch:
             patch["auto_sync_period_minutes"] = max(60, int(patch.get("auto_sync_period_minutes") or 60))
-        if "showcase_hero_image_asset_id" in patch:
-            raw_hero = patch.get("showcase_hero_image_asset_id")
-            patch["showcase_hero_image_asset_id"] = int(raw_hero) if isinstance(raw_hero, int) and raw_hero > 0 else None
-        if "showcase_carousel_image_asset_ids" in patch:
-            patch["showcase_carousel_image_asset_ids"] = self._normalize_image_asset_ids(
-                patch.get("showcase_carousel_image_asset_ids"),
-                limit=20,
-            )
+        if "hero_image_asset_id" in patch or "carousel_image_asset_ids" in patch:
+            showcase_service = ShowcaseService(self.db)
+            showcase_settings = showcase_service.ensure_settings()
+            if "hero_image_asset_id" in patch:
+                raw_hero = patch.pop("hero_image_asset_id")
+                showcase_settings.hero_image_asset_id = int(raw_hero) if isinstance(raw_hero, int) and raw_hero > 0 else None
+            if "carousel_image_asset_ids" in patch:
+                desired_ids = self._normalize_image_asset_ids(
+                    patch.pop("carousel_image_asset_ids"),
+                    limit=20,
+                )
+                current_rows = (
+                    self.db.query(ShowcaseCarouselImage)
+                    .order_by(ShowcaseCarouselImage.position.asc(), ShowcaseCarouselImage.id.asc())
+                    .all()
+                )
+                for row in current_rows:
+                    self.db.delete(row)
+                self.db.flush()
+                for position, image_asset_id in enumerate(desired_ids, start=1):
+                    self.db.add(ShowcaseCarouselImage(image_asset_id=int(image_asset_id), position=position))
         entity = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
         if entity is None:
             entity = AdminUiSettings(id=1)
@@ -918,7 +925,6 @@ class PricingSettingsService:
             parent_supplier_id=(int(parent_supplier.id) if parent_supplier is not None else None),
             rate_currency=self._normalize_currency(payload.rate_currency, default="RUB"),
         )
-        self.supplier_repo.flush()
         supplier.key = self._build_supplier_key(int(supplier.id))
         settings_entity, _ = self.repo.get_or_create_default()
         usd_to_rub_effective, eur_to_rub_effective = self._effective_rates_from_entity(settings_entity)

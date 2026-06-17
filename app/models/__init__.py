@@ -41,17 +41,7 @@ from app.models.catalog_taxonomy import (
     ShowcaseCategoryAttachment,
     ShowcaseCategoryAttachmentHiddenNode,
 )
-from app.models.parser_entities import (
-    ParserBrandMapping,
-    ParserDedupDecision,
-    ParserFavoriteProduct,
-    ParserProduct,
-    ParserProductOriginVariant,
-    ParserSource,
-)
-from app.models.pricing import ParserPricingSettings, ParserSupplier, ParserSupplierShippingRate
 from app.models.sync_job_runtime import SyncJobRuntime
-from app.models.weight import ParserWeightKeyword, ParserWeightRule
 
 __all__ = [
     "AdminUiSettings",
@@ -78,17 +68,6 @@ __all__ = [
     "ProductListingVariant",
     "ProductPresentation",
     "ProductPriceOverride",
-    "ParserBrandMapping",
-    "ParserDedupDecision",
-    "ParserFavoriteProduct",
-    "ParserPricingSettings",
-    "ParserProduct",
-    "ParserProductOriginVariant",
-    "ParserSource",
-    "ParserSupplier",
-    "ParserSupplierShippingRate",
-    "ParserWeightKeyword",
-    "ParserWeightRule",
     "ShowcaseCarouselImage",
     "ShowcaseCategory",
     "ShowcaseCategoryAttachment",

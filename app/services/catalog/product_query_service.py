@@ -5,7 +5,7 @@ from decimal import Decimal
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from app.models import Product, ProductListing, ProductListingGalleryImage, ProductListingMember, ProductPresentation
+from app.models import Product, ProductListing, ProductListingMember, ProductPresentation
 from app.repositories.catalog_products import CatalogProductRepository
 from app.services.settings.pricing_service import PricingSettingsService
 
@@ -24,7 +24,7 @@ class ProductQueryService:
         return listings[0] if listings else None
 
     @staticmethod
-    def _resolved_weight_grams(product: Product, listing: ProductListing | None) -> int | None:
+    def _effective_weight_grams(product: Product, listing: ProductListing | None) -> int | None:
         if product.manual_weight_grams is not None and int(product.manual_weight_grams) > 0:
             return int(product.manual_weight_grams)
         if listing is not None and listing.source_weight_grams is not None and int(listing.source_weight_grams) > 0:
@@ -34,67 +34,127 @@ class ProductQueryService:
         return None
 
     @staticmethod
-    def _gallery_urls(product: Product, listing: ProductListing | None) -> tuple[list[str], dict]:
+    def _decimal_to_float(value: Decimal | None) -> float | None:
+        return float(value) if value is not None else None
+
+    @staticmethod
+    def _show_images_enabled(listing: ProductListing | None) -> bool:
+        source_setting = getattr(getattr(listing, "source", None), "setting", None) if listing is not None else None
+        return bool(getattr(source_setting, "show_images", True))
+
+    @staticmethod
+    def _gallery_state(product: Product, listing: ProductListing | None) -> dict:
         if listing is None:
-            return [], {
-                "hidden_source_image_urls": [],
-                "manual_image_urls": [],
-                "manual_image_order": [],
+            return {
+                "display_image_urls": [],
                 "source_image_urls": [],
-                "images_sync_locked": False,
+                "hidden_source_image_urls": [],
+                "uploaded_image_urls": [],
+                "rows": [],
             }
+        show_images_enabled = ProductQueryService._show_images_enabled(listing)
         scope = [
             row
             for row in sorted(product.gallery_images, key=lambda value: (int(value.position), int(value.id or 0)))
             if int(row.listing_id) == int(listing.id)
         ]
-        source_urls = [image.url for image in sorted(listing.images, key=lambda value: int(value.position))]
+        source_urls = [str(image.url) for image in sorted(listing.images, key=lambda value: int(value.position))]
+        if not scope:
+            if not show_images_enabled:
+                return {
+                    "display_image_urls": [],
+                    "source_image_urls": [],
+                    "hidden_source_image_urls": [],
+                    "uploaded_image_urls": [],
+                    "rows": [],
+                }
+            return {
+                "display_image_urls": list(source_urls),
+                "source_image_urls": list(source_urls),
+                "hidden_source_image_urls": [],
+                "uploaded_image_urls": [],
+                "rows": [
+                    {
+                        "position": index,
+                        "origin_kind": "source_image",
+                        "is_hidden": False,
+                        "url": url,
+                    }
+                    for index, url in enumerate(source_urls, start=1)
+                ],
+            }
+
+        display_urls: list[str] = []
         hidden_source_urls: list[str] = []
-        manual_urls: list[str] = []
-        ordered_urls: list[str] = []
-        if scope:
-            for row in scope:
-                if row.image_asset_id is not None:
-                    url = f"/api/v1/products/images/{int(row.image_asset_id)}"
-                    manual_urls.append(url)
-                    if not row.is_hidden:
-                        ordered_urls.append(url)
+        uploaded_urls: list[str] = []
+        rows: list[dict] = []
+        for row in scope:
+            url: str | None
+            if row.image_asset_id is not None:
+                url = f"/api/v1/products/images/{int(row.image_asset_id)}"
+                uploaded_urls.append(url)
+            else:
+                if not show_images_enabled:
                     continue
-                source_url = str(getattr(row.listing_image, "url", "") or "").strip()
-                if not source_url:
-                    continue
-                if row.is_hidden:
-                    hidden_source_urls.append(source_url)
-                    continue
-                ordered_urls.append(source_url)
-        else:
-            ordered_urls = list(source_urls)
-        return ordered_urls, {
+                url = str(getattr(row.listing_image, "url", "") or "").strip() or None
+                if url and row.is_hidden:
+                    hidden_source_urls.append(url)
+            if url and not row.is_hidden:
+                display_urls.append(url)
+            rows.append(
+                {
+                    "position": int(row.position),
+                    "origin_kind": str(row.origin_kind),
+                    "is_hidden": bool(row.is_hidden),
+                    "url": url,
+                    "listing_image_id": int(row.listing_image_id) if row.listing_image_id is not None else None,
+                    "image_asset_id": int(row.image_asset_id) if row.image_asset_id is not None else None,
+                }
+            )
+        return {
+            "display_image_urls": display_urls,
+            "source_image_urls": (source_urls if show_images_enabled else []),
             "hidden_source_image_urls": hidden_source_urls,
-            "manual_image_urls": manual_urls,
-            "manual_image_order": [*manual_urls],
-            "source_image_urls": source_urls,
-            "images_sync_locked": bool(hidden_source_urls or manual_urls),
+            "uploaded_image_urls": uploaded_urls,
+            "rows": rows,
         }
 
     @staticmethod
-    def _effective_description(product: Product, listing: ProductListing | None) -> tuple[str | None, bool, bool | None]:
-        description_visibility = None
-        if product.presentation is not None:
-            description_visibility = product.presentation.description_visibility
-            if product.presentation.description_text:
-                return str(product.presentation.description_text), bool(description_visibility is not False), description_visibility
-            if product.presentation.description_html:
-                return str(product.presentation.description_html), bool(description_visibility is not False), description_visibility
+    def _description_state(product: Product, listing: ProductListing | None) -> dict:
+        presentation = product.presentation
+        source_setting = getattr(getattr(listing, "source", None), "setting", None) if listing is not None else None
+        effective_text = (
+            str(presentation.description_text)
+            if presentation is not None and presentation.description_text
+            else (str(listing.source_description_text) if listing is not None and listing.source_description_text else None)
+        )
+        effective_html = (
+            str(presentation.description_html)
+            if presentation is not None and presentation.description_html
+            else (str(listing.source_description_html) if listing is not None and listing.source_description_html else None)
+        )
+        description_mode = str(getattr(source_setting, "description_mode", "text") or "text")
+        description_mode = description_mode.strip().lower() or "text"
+        visibility_override = presentation.description_visibility if presentation is not None else None
 
-        if listing is None:
-            return None, True, description_visibility
-        description_mode = str(getattr(getattr(listing.source, "setting", None), "description_mode", "text") or "text").strip().lower()
+        public_description: str | None = None
+        is_public_visible = visibility_override is not False
         if description_mode == "hidden":
-            return None, False, description_visibility
-        if description_mode == "html":
-            return listing.source_description_html or listing.source_description_text, True, description_visibility
-        return listing.source_description_text or listing.source_description_html, True, description_visibility
+            is_public_visible = False
+        elif is_public_visible:
+            if description_mode == "html":
+                public_description = effective_html or effective_text
+            else:
+                public_description = effective_text or effective_html
+
+        return {
+            "description_mode": description_mode,
+            "visibility_override": visibility_override,
+            "public_visible": bool(is_public_visible and public_description is not None),
+            "public_description": public_description if is_public_visible else None,
+            "effective_text": effective_text,
+            "effective_html": effective_html,
+        }
 
     @staticmethod
     def _effective_title(product: Product, listing: ProductListing | None) -> str:
@@ -105,63 +165,70 @@ class ProductQueryService:
         return f"Product {int(product.id)}"
 
     @staticmethod
-    def _effective_vendor(product: Product, listing: ProductListing | None) -> str | None:
-        if product.designer is not None and product.designer.name:
-            return str(product.designer.name)
-        if listing is not None and listing.source_designer_raw:
-            return str(listing.source_designer_raw)
-        return None
-
-    @staticmethod
-    def _effective_product_type(listing: ProductListing | None) -> str | None:
-        if listing is None:
-            return None
-        return str(listing.source_category_raw) if listing.source_category_raw else None
-
-    @staticmethod
-    def _product_status(product: Product) -> str:
-        if str(product.visibility_status or "").strip().lower() == "hidden":
-            return "hidden"
-        orderabilities = {
-            str(membership.listing.orderability_status or "").strip().lower()
-            for membership in product.memberships
-            if membership.listing is not None
+    def _listing_payload(product: Product, listing: ProductListing) -> dict:
+        gallery = ProductQueryService._gallery_state(product, listing)
+        return {
+            "id": int(listing.id),
+            "source_id": int(listing.source_id),
+            "source_name": str(getattr(getattr(listing, "source", None), "name", "") or "") or None,
+            "ingest_mode": str(listing.ingest_mode),
+            "external_id": str(listing.external_id) if listing.external_id else None,
+            "url": str(listing.url),
+            "handle": str(listing.handle) if listing.handle else None,
+            "source_title": str(listing.source_title),
+            "source_description_text": str(listing.source_description_text) if listing.source_description_text else None,
+            "source_description_html": str(listing.source_description_html) if listing.source_description_html else None,
+            "source_weight_grams": int(listing.source_weight_grams) if listing.source_weight_grams is not None else None,
+            "source_designer_name": str(listing.source_designer_raw) if listing.source_designer_raw else None,
+            "source_category_name": str(listing.source_category_raw) if listing.source_category_raw else None,
+            "orderability_status": str(listing.orderability_status),
+            "status_reason": str(listing.status_reason) if listing.status_reason else None,
+            "image_urls": gallery["display_image_urls"],
+            "gallery": gallery,
+            "variants": [
+                {
+                    "id": int(variant.id),
+                    "position": int(variant.position),
+                    "title": str(variant.title),
+                    "available": bool(variant.is_orderable),
+                    "price": ProductQueryService._decimal_to_float(variant.price_amount),
+                    "compare_at_price": ProductQueryService._decimal_to_float(variant.compare_at_price_amount),
+                    "currency": str(variant.currency_code or "").upper() or None,
+                    "sku": str(variant.sku) if variant.sku else None,
+                    "source_ref_id": str(variant.source_ref_id) if variant.source_ref_id else None,
+                }
+                for variant in sorted(listing.variants, key=lambda item: int(item.position))
+            ],
         }
-        if "orderable" in orderabilities:
-            return "available"
-        if "sold_out" in orderabilities:
-            return "out_of_stock"
-        return "unavailable"
 
-    @staticmethod
-    def _decimal_to_float(value: Decimal | None) -> float | None:
-        return float(value) if value is not None else None
+    def _listing_variants(self, listing: ProductListing | None) -> list[dict]:
+        if listing is None:
+            return []
+        return [
+            {
+                "id": int(variant.id),
+                "title": str(variant.title or ""),
+                "available": bool(variant.is_orderable),
+                "price": self._decimal_to_float(variant.price_amount),
+                "inventory_quantity": 1 if bool(variant.is_orderable) else 0,
+                "sku": variant.sku,
+                "currency": str(variant.currency_code or "").upper() or None,
+                "compare_at_price": self._decimal_to_float(variant.compare_at_price_amount),
+                "source_id": int(listing.source_id),
+                "source_name": str(getattr(listing.source, "name", "") or "") or None,
+                "listing_id": int(listing.id),
+                "source_ref_id": str(variant.source_ref_id) if variant.source_ref_id else None,
+            }
+            for variant in sorted(listing.variants, key=lambda item: int(item.position))
+        ]
 
     def _build_variants(self, product: Product) -> list[dict]:
         variants: list[dict] = []
-        memberships = sorted(product.memberships, key=lambda item: int(item.listing_id))
-        for membership in memberships:
+        for membership in sorted(product.memberships, key=lambda item: int(item.listing_id)):
             listing = membership.listing
             if listing is None:
                 continue
-            for variant in sorted(listing.variants, key=lambda item: int(item.position)):
-                variants.append(
-                    {
-                        "title": str(variant.title or ""),
-                        "option1": None,
-                        "option2": None,
-                        "option3": None,
-                        "available": bool(variant.is_orderable),
-                        "price": self._decimal_to_float(variant.price_amount),
-                        "inventory_quantity": 1 if bool(variant.is_orderable) else 0,
-                        "sku": variant.sku,
-                        "currency": str(variant.currency_code or "").upper(),
-                        "compare_at_price": self._decimal_to_float(variant.compare_at_price_amount),
-                        "source_id": int(listing.source_id),
-                        "source_name": str(getattr(listing.source, "name", "") or "") or None,
-                        "listing_id": int(listing.id),
-                    }
-                )
+            variants.extend(self._listing_variants(listing))
         return variants
 
     def _compute_pricing(self, product: Product, listing: ProductListing | None, variants: list[dict], weight_grams: int | None) -> tuple[float | None, dict | None]:
@@ -207,76 +274,94 @@ class ProductQueryService:
                 "reason": computation.reason,
                 **(computation.components or {}),
             }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return None, {"manual_required": True, "reason": f"pricing_error:{exc.__class__.__name__}"}
 
     def build_product_payload(self, product: Product) -> dict:
-        listing = self._resolved_primary_listing(product)
-        title = self._effective_title(product, listing)
-        description, description_visible_effective, description_override = self._effective_description(product, listing)
-        image_urls, image_meta = self._gallery_urls(product, listing)
+        primary_listing = self._resolved_primary_listing(product)
+        title = self._effective_title(product, primary_listing)
+        description = self._description_state(product, primary_listing)
+        gallery = self._gallery_state(product, primary_listing)
         variants = self._build_variants(product)
-        weight_grams = self._resolved_weight_grams(product, listing)
-        final_price, pricing_components = self._compute_pricing(product, listing, variants, weight_grams)
-        source_price = next((variant.get("price") for variant in variants if variant.get("price") is not None), None)
-        source_currency = next((variant.get("currency") for variant in variants if variant.get("currency")), None)
-        status = self._product_status(product)
+        primary_listing_variants = self._listing_variants(primary_listing)
+        effective_weight_grams = self._effective_weight_grams(product, primary_listing)
+        final_price, pricing_components = self._compute_pricing(product, primary_listing, primary_listing_variants, effective_weight_grams)
+        source_price = next((variant.get("price") for variant in primary_listing_variants if variant.get("price") is not None), None)
+        source_currency = next((variant.get("currency") for variant in primary_listing_variants if variant.get("currency")), None)
+        listings = [
+            self._listing_payload(product, listing)
+            for listing in self.products.list_product_listings(int(product.id))
+        ]
 
         return {
             "id": int(product.id),
-            "source_id": int(listing.source_id) if listing is not None else 0,
-            "handle": str(listing.handle or "") if listing is not None else "",
+            "designer_id": int(product.designer_id) if product.designer_id is not None else None,
+            "designer_name": str(getattr(product.designer, "name", "") or "") or None,
+            "primary_listing_id": int(primary_listing.id) if primary_listing is not None else None,
+            "gender": str(product.gender),
+            "availability_mode": str(product.availability_mode),
+            "visibility_status": str(product.visibility_status),
+            "lifecycle_status": str(product.lifecycle_status),
+            "manual_weight_grams": int(product.manual_weight_grams) if product.manual_weight_grams is not None else None,
+            "weight_rule_id": int(product.weight_rule_id) if product.weight_rule_id is not None else None,
+            "effective_weight_grams": effective_weight_grams,
             "title": title,
-            "vendor": self._effective_vendor(product, listing),
-            "product_type": self._effective_product_type(listing),
-            "url": str(listing.url or "") if listing is not None else "",
+            "url": str(primary_listing.url) if primary_listing is not None else "",
+            "handle": str(primary_listing.handle) if primary_listing is not None and primary_listing.handle else None,
+            "source_id": int(primary_listing.source_id) if primary_listing is not None else None,
+            "source_name": str(getattr(getattr(primary_listing, "source", None), "name", "") or "") or None,
+            "source_category_name": str(primary_listing.source_category_raw) if primary_listing is not None and primary_listing.source_category_raw else None,
+            "source_designer_name": str(primary_listing.source_designer_raw) if primary_listing is not None and primary_listing.source_designer_raw else None,
+            "orderability_status": str(primary_listing.orderability_status) if primary_listing is not None else "unavailable",
+            "status_reason": str(primary_listing.status_reason) if primary_listing is not None and primary_listing.status_reason else None,
+            "description_mode": description["description_mode"],
+            "description": description["public_description"],
+            "description_text": description["effective_text"],
+            "description_html": description["effective_html"],
+            "description_public_visible": description["public_visible"],
             "price": final_price if final_price is not None else source_price,
-            "currency": "RUB" if final_price is not None else str(source_currency or ""),
+            "currency": "RUB" if final_price is not None else source_currency,
             "source_price": source_price,
             "source_currency": source_currency,
             "final_price": final_price,
             "final_currency": "RUB" if final_price is not None else None,
-            "pricing_manual_required": bool((pricing_components or {}).get("manual_required", False)),
-            "pricing_reason": (pricing_components or {}).get("reason"),
             "pricing_components": pricing_components,
-            "status": status,
-            "image_count": len(image_urls),
-            "image_urls": image_urls,
+            "price_override": (
+                {
+                    "manual_price_rub": float(product.price_override.manual_price_rub),
+                    "manual_compare_at_price_rub": (
+                        float(product.price_override.manual_compare_at_price_rub)
+                        if product.price_override.manual_compare_at_price_rub is not None
+                        else None
+                    ),
+                }
+                if product.price_override is not None and product.price_override.manual_price_rub is not None
+                else None
+            ),
+            "image_urls": gallery["display_image_urls"],
+            "gallery": gallery,
             "variants": variants,
-            "description": description if description_visible_effective else None,
-            "source_name": str(getattr(getattr(listing, "source", None), "name", "") or "") or None,
-            "weight_grams": weight_grams,
-            "product_edit": {
-                "title_sync_locked": bool(product.presentation and product.presentation.title_override),
-                "description_sync_locked": bool(product.presentation and (product.presentation.description_text or product.presentation.description_html)),
-                "description_visible_override": description_override,
-                "description_visible_effective": description_visible_effective,
-                "images_sync_locked": bool(image_meta["images_sync_locked"]),
+            "presentation": {
                 "title_override": getattr(product.presentation, "title_override", None) if product.presentation is not None else None,
-                "description_override": getattr(product.presentation, "description_text", None) if product.presentation is not None else None,
-                **image_meta,
+                "description_text": getattr(product.presentation, "description_text", None) if product.presentation is not None else None,
+                "description_html": getattr(product.presentation, "description_html", None) if product.presentation is not None else None,
+                "description_visibility": getattr(product.presentation, "description_visibility", None) if product.presentation is not None else None,
             },
+            "listings": listings,
             "created_at": product.created_at.isoformat() if product.created_at else None,
             "updated_at": product.updated_at.isoformat() if product.updated_at else None,
         }
 
-    def list_products(self, *, limit: int, offset: int) -> dict:
-        items = self.products.list_products(limit=limit, offset=offset)
-        return {
-            "items": [self.build_product_payload(product) for product in items],
-            "total": self.products.count_products(),
-            "limit": int(limit),
-            "offset": int(offset),
-        }
-
-    def get_product_payload(self, product_id: int) -> dict | None:
-        product = self.products.get_product(product_id)
-        if product is None:
-            return None
-        return self.build_product_payload(product)
-
-    def search_products(self, *, query: str, limit: int, offset: int) -> dict:
-        normalized_query = " ".join(str(query or "").strip().lower().split())
+    def _base_product_id_query(
+        self,
+        *,
+        query: str = "",
+        source_id: int | None = None,
+        designer_id: int | None = None,
+        visibility_status: str | None = None,
+        availability_mode: str | None = None,
+        orderability_status: str | None = None,
+    ):
         base_query = (
             self.db.query(Product.id.label("product_id"))
             .join(ProductListingMember, ProductListingMember.product_id == Product.id)
@@ -284,18 +369,56 @@ class ProductQueryService:
             .outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
             .filter(Product.lifecycle_status != "merged")
         )
+        if source_id is not None:
+            base_query = base_query.filter(ProductListing.source_id == int(source_id))
+        if designer_id is not None:
+            base_query = base_query.filter(Product.designer_id == int(designer_id))
+        if visibility_status:
+            base_query = base_query.filter(Product.visibility_status == str(visibility_status).strip().lower())
+        if availability_mode:
+            base_query = base_query.filter(Product.availability_mode == str(availability_mode).strip().lower())
+        if orderability_status:
+            base_query = base_query.filter(ProductListing.orderability_status == str(orderability_status).strip().lower())
+
+        normalized_query = " ".join(str(query or "").strip().lower().split())
         if normalized_query:
             pattern = f"%{normalized_query}%"
             base_query = base_query.filter(
                 or_(
-                    func.lower(ProductListing.source_title).like(pattern),
-                    func.lower(ProductListing.source_designer_raw).like(pattern),
-                    func.lower(ProductListing.handle).like(pattern),
-                    func.lower(ProductPresentation.title_override).like(pattern),
+                    func.lower(func.coalesce(ProductListing.source_title, "")).like(pattern),
+                    func.lower(func.coalesce(ProductListing.source_description_text, "")).like(pattern),
+                    func.lower(func.coalesce(ProductListing.source_description_html, "")).like(pattern),
+                    func.lower(func.coalesce(ProductListing.source_designer_raw, "")).like(pattern),
+                    func.lower(func.coalesce(ProductListing.source_category_raw, "")).like(pattern),
+                    func.lower(func.coalesce(ProductListing.handle, "")).like(pattern),
+                    func.lower(func.coalesce(ProductListing.url, "")).like(pattern),
+                    func.lower(func.coalesce(ProductPresentation.title_override, "")).like(pattern),
+                    func.lower(func.coalesce(ProductPresentation.description_text, "")).like(pattern),
+                    func.lower(func.coalesce(ProductPresentation.description_html, "")).like(pattern),
                 )
             )
+        return base_query
 
-        filtered_ids = base_query.distinct().subquery()
+    def list_products(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        query: str = "",
+        source_id: int | None = None,
+        designer_id: int | None = None,
+        visibility_status: str | None = None,
+        availability_mode: str | None = None,
+        orderability_status: str | None = None,
+    ) -> dict:
+        filtered_ids = self._base_product_id_query(
+            query=query,
+            source_id=source_id,
+            designer_id=designer_id,
+            visibility_status=visibility_status,
+            availability_mode=availability_mode,
+            orderability_status=orderability_status,
+        ).distinct().subquery()
         total = int(self.db.query(func.count()).select_from(filtered_ids).scalar() or 0)
         product_ids = [
             int(row[0])
@@ -319,3 +442,12 @@ class ProductQueryService:
             "limit": int(limit),
             "offset": int(offset),
         }
+
+    def get_product_payload(self, product_id: int) -> dict | None:
+        product = self.products.get_product(product_id)
+        if product is None:
+            return None
+        return self.build_product_payload(product)
+
+    def search_products(self, *, query: str, limit: int, offset: int) -> dict:
+        return self.list_products(limit=limit, offset=offset, query=query)

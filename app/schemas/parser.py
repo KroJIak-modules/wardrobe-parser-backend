@@ -127,13 +127,13 @@ class PricingSettingsUpdateRequest(BaseModel):
 
 
 class ShowcaseMediaSettingsUpdateRequest(BaseModel):
-    showcase_hero_image_asset_id: int | None = None
-    showcase_carousel_image_asset_ids: list[int] | None = None
+    hero_image_asset_id: int | None = None
+    carousel_image_asset_ids: list[int] | None = None
 
 
 class ShowcaseMediaSettingsResponse(BaseModel):
-    showcase_hero_image_asset_id: int | None = None
-    showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
+    hero_image_asset_id: int | None = None
+    carousel_image_asset_ids: list[int] = Field(default_factory=list)
     carousel_limit: int = 20
 
 
@@ -154,16 +154,16 @@ class AdminUiSettingsResponse(BaseModel):
     auto_sync_last_finished_at: str | None = None
     auto_sync_last_status: str | None = None
     auto_sync_last_error: str | None = None
-    showcase_hero_image_asset_id: int | None = None
-    showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
+    hero_image_asset_id: int | None = None
+    carousel_image_asset_ids: list[int] = Field(default_factory=list)
 
 
 class AdminUiSettingsUpdateRequest(BaseModel):
     designers_min_products: int | None = Field(default=None, ge=1, le=1_000_000)
     designers_exclude_store_vendors: bool | None = None
     auto_sync_period_minutes: int | None = Field(default=None, ge=60, le=1_000_000)
-    showcase_hero_image_asset_id: int | None = None
-    showcase_carousel_image_asset_ids: list[int] | None = None
+    hero_image_asset_id: int | None = None
+    carousel_image_asset_ids: list[int] | None = None
 
 
 class PricingSupplierRateResponse(BaseModel):
@@ -266,8 +266,8 @@ class SettingsTransferAdminUiSettings(BaseModel):
     designers_min_products: int = Field(ge=1, le=1_000_000)
     designers_exclude_store_vendors: bool = False
     auto_sync_period_minutes: int = Field(ge=60, le=1_000_000, default=60)
-    showcase_hero_image_asset_id: int | None = None
-    showcase_carousel_image_asset_ids: list[int] = Field(default_factory=list)
+    hero_image_asset_id: int | None = None
+    carousel_image_asset_ids: list[int] = Field(default_factory=list)
 
 
 class SettingsTransferSupplierRateEntry(BaseModel):
@@ -292,7 +292,7 @@ class SettingsTransferSourceEntry(BaseModel):
     enabled: bool = True
     sync_enabled: bool = True
     hide_auto_added_products: bool = False
-    show_description: bool = True
+    description_mode: Literal["hidden", "text", "html"] = "text"
     show_images: bool = True
     currency_priority: list[str] = Field(default_factory=list)
     currency_method: Literal["priority_list", "locked_param_currency", "locked_no_currency"] = "priority_list"
@@ -306,7 +306,6 @@ class SettingsTransferSourceEntry(BaseModel):
 
 class SettingsTransferWeightRuleEntry(BaseModel):
     weight_grams: int = Field(ge=1, le=1000000)
-    sort_order: int = Field(default=0, ge=0, le=1000000)
     keywords: list[str] = Field(default_factory=list)
 
 
@@ -325,11 +324,9 @@ class SettingsTransferCategoryKeywordEntry(BaseModel):
     scope: Literal["local", "title", "status"] = "local"
 
 
-class SettingsTransferBrandMappingEntry(BaseModel):
-    source_brand: str = Field(min_length=1, max_length=255)
-    source_brand_key: str = Field(min_length=1, max_length=255)
-    target_brand: str = Field(min_length=1, max_length=255)
-    include_in_designers: bool = True
+class SettingsTransferDesignerSourceNameEntry(BaseModel):
+    source_name: str = Field(min_length=1, max_length=255)
+    designer_name: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class SettingsTransferPayload(BaseModel):
@@ -341,9 +338,7 @@ class SettingsTransferPayload(BaseModel):
     suppliers: list[SettingsTransferSupplierEntry] = Field(default_factory=list)
     sources: list[SettingsTransferSourceEntry] = Field(default_factory=list)
     weight_rules: list[SettingsTransferWeightRuleEntry] = Field(default_factory=list)
-    categories: list[SettingsTransferCategoryEntry] = Field(default_factory=list)
-    category_keywords: list[SettingsTransferCategoryKeywordEntry] = Field(default_factory=list)
-    brand_mappings: list[SettingsTransferBrandMappingEntry] = Field(default_factory=list)
+    designer_source_names: list[SettingsTransferDesignerSourceNameEntry] = Field(default_factory=list)
 
 
 class SettingsTransferResponse(BaseModel):
@@ -471,17 +466,10 @@ class DedupRejectRequest(BaseModel):
     product_b_id: int
 
 
-class DedupCombineRequest(BaseModel):
-    product_a_id: int
-    product_b_id: int
-
-
 class DedupDecisionResponse(BaseModel):
     pair_key: str
     action: str
     decided_at: datetime | None = None
-    can_undo: bool = False
-    undo_block_reason: str | None = None
     left: ProductResponse
     right: ProductResponse
 
@@ -491,10 +479,6 @@ class DedupDecisionListResponse(BaseModel):
     total: int
     limit: int
     offset: int = 0
-
-
-class DedupUndoRequest(BaseModel):
-    pair_key: str
 
 
 CategoryTreeNodeResponse.model_rebuild()

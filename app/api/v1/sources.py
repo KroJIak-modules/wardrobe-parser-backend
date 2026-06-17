@@ -8,7 +8,7 @@ import requests
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import NotFoundError, ValidationError
 from app.models import Product, ProductListing, ProductListingMember, Source
 from app.services.auth.admin_auth_service import require_permission
 from app.services.catalog.source_registry_service import SourceRegistryService
@@ -30,7 +30,7 @@ class AutoHidePatch(BaseModel):
 
 
 class AttributeVisibilityPatch(BaseModel):
-    show_description: bool | None = None
+    description_mode: str | None = None
     show_images: bool | None = None
 
 
@@ -91,27 +91,17 @@ def _source_payload(db: Session, source: Source, service_item: dict | None) -> d
         "source_id": int(source.id),
         "name": source.name,
         "base_url": source.base_url,
-        "parser_type": str((service_item or {}).get("adapter_key") or "unknown"),
         "enabled": bool(getattr(setting, "is_enabled", True)),
         "sync_enabled": bool(getattr(setting, "is_sync_enabled", True)),
         "hide_auto_added_products": bool(getattr(setting, "hide_auto_added_products", False)),
-        "show_description": str(getattr(setting, "description_mode", "text")) != "hidden",
+        "description_mode": str(getattr(setting, "description_mode", "text") or "text"),
         "show_images": bool(getattr(setting, "show_images", True)),
-        "currency_priority": [],
-        "currency_method": "priority_list",
-        "locked_currency": None,
-        "notes": None,
-        "status_label": str(getattr(sync_state, "last_sync_status", "") or "") or None,
         "products_count": int(products_count),
         "manual_products_count": int(manual_products_count),
         "bound_sync_products_count": int(bound_sync_products_count),
-        "categories_count": 0,
         "last_sync_at": sync_state.last_sync_at.isoformat() if getattr(sync_state, "last_sync_at", None) else None,
         "last_sync_duration_sec": getattr(sync_state, "last_sync_duration_sec", None),
         "last_sync_status": getattr(sync_state, "last_sync_status", None),
-        "is_password_protected": False,
-        "is_auto_ingest": True,
-        "is_personal": source.key == SourceRegistryService.MANUAL_SOURCE_KEY,
         "supplier_id": int(getattr(setting, "supplier_id", 0) or 0) or None,
         "supplier_key": getattr(supplier, "key", None),
         "supplier_name": getattr(supplier, "name", None),
@@ -177,8 +167,11 @@ def patch_attribute_visibility(source_key: str, payload: AttributeVisibilityPatc
     if entity is None:
         raise NotFoundError("Источник не найден")
     setting = repo.ensure_setting(entity)
-    if payload.show_description is not None:
-        setting.description_mode = "text" if payload.show_description else "hidden"
+    if payload.description_mode is not None:
+        description_mode = str(payload.description_mode or "").strip().lower()
+        if description_mode not in {"hidden", "text", "html"}:
+            raise ValidationError("Некорректный description_mode")
+        setting.description_mode = description_mode
     if payload.show_images is not None:
         setting.show_images = bool(payload.show_images)
     db.commit()
@@ -197,12 +190,3 @@ def patch_source_supplier(source_key: str, payload: SupplierPatch, db: Session =
     db.commit()
     refreshed = repo.get_by_key(source_key)
     return _source_payload(db, refreshed, _service_sources_payload().get(refreshed.key))
-
-
-@router.patch("/sources/{source_key}/currency-priority", dependencies=[Depends(require_permission("control.sources.edit"))])
-def patch_source_currency_priority(source_key: str, db: Session = Depends(get_db)) -> dict:
-    SourceRegistryService(db).refresh_from_service()
-    entity = SourceRegistryService(db).repo.get_by_key(source_key)
-    if entity is None:
-        raise NotFoundError("Источник не найден")
-    return _source_payload(db, entity, _service_sources_payload().get(entity.key))

@@ -8,10 +8,6 @@ from app.repositories.catalog_settings import CatalogPricingSettingsRepository, 
 from app.repositories.catalog_sources import CatalogSourceRepository
 from app.repositories.catalog_sync import CatalogSyncRepository
 from app.repositories.catalog_taxonomy import CatalogTaxonomyRepository
-from app.repositories.parser_brand_mapping import ParserBrandMappingRepository
-from app.repositories.parser_dedup import ParserDedupDecisionRepository
-from app.repositories.parser_favorite_product import ParserFavoriteProductRepository
-from app.repositories.parser_product import ParserProductRepository
 
 __all__ = [
     "BaseRepository",
@@ -25,8 +21,4 @@ __all__ = [
     "CatalogSyncRepository",
     "CatalogTaxonomyRepository",
     "CatalogWeightRuleRepository",
-    "ParserBrandMappingRepository",
-    "ParserDedupDecisionRepository",
-    "ParserFavoriteProductRepository",
-    "ParserProductRepository",
 ]

@@ -249,9 +249,6 @@ class CatalogProductRepository:
         listing_images: list[ProductListingImage],
     ) -> None:
         existing = self.list_gallery_scope(product_id=product_id, listing_id=listing_id)
-        if any(row.image_asset_id is not None for row in existing):
-            return
-
         for row in existing:
             self.session.delete(row)
         self.session.flush()
@@ -264,7 +261,7 @@ class CatalogProductRepository:
                     listing_image_id=int(listing_image.id),
                     position=position,
                     is_hidden=False,
-                    origin_kind="source",
+                    origin_kind="source_image",
                 )
             )
         self.session.flush()

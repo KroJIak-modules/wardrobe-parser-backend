@@ -26,6 +26,9 @@ class CatalogSupplierRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
+    def query(self):
+        return self.session.query(Supplier)
+
     def list_all_with_rates(self) -> list[Supplier]:
         return (
             self.session.query(Supplier)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import time
 import requests
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func
@@ -25,10 +25,16 @@ router = APIRouter(tags=["products"])
 
 
 class ProductPatchRequest(BaseModel):
-    title: str | None = None
-    description: str | None = None
-    description_visible: bool | None = None
-    status: str | None = None
+    title_override: str | None = None
+    description_text: str | None = None
+    description_html: str | None = None
+    description_visibility: bool | None = None
+    visibility_status: str | None = None
+    availability_mode: str | None = None
+    gender: str | None = None
+    primary_listing_id: int | None = None
+    manual_weight_grams: int | None = None
+    price_override: dict | None = None
     images: dict | None = None
     reset_to_default: list[str] = Field(default_factory=list)
 
@@ -42,17 +48,28 @@ class ManualVariantRequest(BaseModel):
 
 class ManualProductRequest(BaseModel):
     title: str
-    description: str | None = None
-    vendor: str | None = None
-    product_type: str | None = None
+    description_text: str | None = None
+    description_html: str | None = None
+    designer_id: int | None = None
+    designer_name: str | None = None
+    source_category_name: str | None = None
+    gender: str = "unisex"
+    availability_mode: str = "in_stock"
+    visibility_status: str = "visible"
+    orderability_status: str = "orderable"
     variants: list[ManualVariantRequest] = Field(default_factory=list)
     manual_image_asset_ids: list[int] = Field(default_factory=list)
-    weight_grams: int | None = None
-    status: str | None = None
+    manual_weight_grams: int | None = None
+    price_override: dict | None = None
 
 
 class ProductUrlRequest(BaseModel):
     url: str
+
+
+class BindSourceByUrlRequest(BaseModel):
+    url: str
+    set_as_primary: bool = False
 
 
 def _service_url(path: str) -> str:
@@ -98,10 +115,11 @@ def _preview_payload_from_service_item(item: dict) -> dict:
     return {
         "handle": str(item.get("handle") or "").strip(),
         "title": str(item.get("title") or "").strip(),
-        "description": str(item.get("description") or "").strip() or None,
-        "weight_grams": item.get("weight_grams"),
-        "vendor": str(item.get("designer") or "").strip() or None,
-        "product_type": str(item.get("category") or "").strip() or None,
+        "description_text": str(item.get("description") or "").strip() or None,
+        "description_html": str(item.get("description_html") or "").strip() or None,
+        "source_weight_grams": item.get("source_weight_grams"),
+        "designer_name": str(item.get("designer") or "").strip() or None,
+        "source_category_name": str(item.get("category") or "").strip() or None,
         "product_url": str(item.get("url") or "").strip(),
         "price": first_variant.get("price") if first_variant else None,
         "currency": str(first_variant.get("currency") or "").strip().upper() if first_variant else "",
@@ -133,35 +151,51 @@ def _resolve_source_id(db: Session, url: str) -> int:
 
 @router.get("/products")
 def list_products(
+    q: str = Query(default="", max_length=255),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     source_id: int | None = Query(default=None),
+    designer_id: int | None = Query(default=None),
+    visibility_status: str | None = Query(default=None),
+    availability_mode: str | None = Query(default=None),
+    orderability_status: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> dict:
-    payload = ProductQueryService(db).list_products(limit=limit, offset=offset)
-    if source_id is None:
-        return payload
-    filtered = [
-        item
-        for item in payload["items"]
-        if int(item.get("source_id") or 0) == int(source_id)
-    ]
-    return {
-        "items": filtered,
-        "total": len(filtered),
-        "limit": limit,
-        "offset": offset,
-    }
+    return ProductQueryService(db).list_products(
+        limit=limit,
+        offset=offset,
+        query=q,
+        source_id=source_id,
+        designer_id=designer_id,
+        visibility_status=visibility_status,
+        availability_mode=availability_mode,
+        orderability_status=orderability_status,
+    )
 
 
 @router.get("/admin/products/table", dependencies=[Depends(require_permission("control.products.read"))])
 def admin_products_table(
+    q: str = Query(default="", max_length=255),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     source_id: int | None = Query(default=None),
+    designer_id: int | None = Query(default=None),
+    visibility_status: str | None = Query(default=None),
+    availability_mode: str | None = Query(default=None),
+    orderability_status: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> dict:
-    return list_products(limit=limit, offset=offset, source_id=source_id, db=db)
+    return list_products(
+        q=q,
+        limit=limit,
+        offset=offset,
+        source_id=source_id,
+        designer_id=designer_id,
+        visibility_status=visibility_status,
+        availability_mode=availability_mode,
+        orderability_status=orderability_status,
+        db=db,
+    )
 
 
 @router.get("/admin/products/table/facets", dependencies=[Depends(require_permission("control.products.read"))])
@@ -174,7 +208,22 @@ def admin_products_table_facets(db: Session = Depends(get_db)) -> dict:
         .group_by(ProductListing.source_id)
         .all()
     )
-    return {"source_counts": [{"source_id": int(source_id), "count": int(count)} for source_id, count in rows]}
+    visibility_rows = db.query(Product.visibility_status, func.count(Product.id)).filter(Product.lifecycle_status != "merged").group_by(Product.visibility_status).all()
+    availability_rows = db.query(Product.availability_mode, func.count(Product.id)).filter(Product.lifecycle_status != "merged").group_by(Product.availability_mode).all()
+    orderability_rows = (
+        db.query(ProductListing.orderability_status, func.count(func.distinct(Product.id)))
+        .join(ProductListingMember, ProductListingMember.listing_id == ProductListing.id)
+        .join(Product, Product.id == ProductListingMember.product_id)
+        .filter(Product.lifecycle_status != "merged")
+        .group_by(ProductListing.orderability_status)
+        .all()
+    )
+    return {
+        "source_counts": [{"source_id": int(source_id), "count": int(count)} for source_id, count in rows],
+        "visibility_status_counts": [{"value": str(value), "count": int(count)} for value, count in visibility_rows],
+        "availability_mode_counts": [{"value": str(value), "count": int(count)} for value, count in availability_rows],
+        "orderability_status_counts": [{"value": str(value), "count": int(count)} for value, count in orderability_rows],
+    }
 
 
 @router.get("/products/pricing-example", dependencies=[Depends(require_permission("control.pricing.read"))])
@@ -276,20 +325,18 @@ def add_product_by_url(payload: ProductUrlRequest, db: Session = Depends(get_db)
     return {"ok": True}
 
 
-@router.get("/products/{product_id}/starred-categories", dependencies=[Depends(require_permission("showcase.read"))])
-def get_product_starred_categories(product_id: int) -> dict:
-    return {"assigned_category_ids": [], "available_categories": []}
-
-
-class StarredCategoriesRequest(BaseModel):
-    category_ids: list[int] = Field(default_factory=list)
-
-
-@router.put("/products/{product_id}/starred-categories", dependencies=[Depends(require_permission("showcase.edit"))])
-def put_product_starred_categories(product_id: int, payload: StarredCategoriesRequest) -> dict:
-    return {"assigned_category_ids": [int(item) for item in payload.category_ids]}
-
-
-@router.get("/products/starred-categories/options", dependencies=[Depends(require_permission("showcase.read"))])
-def get_starred_categories_options() -> dict:
-    return {"items": []}
+@router.post("/products/{product_id}/bind-source-by-url", dependencies=[Depends(require_permission("control.products.edit"))])
+def bind_source_by_url(product_id: int, payload: BindSourceByUrlRequest, db: Session = Depends(get_db)) -> dict:
+    service_item = _probe_service_product(payload.url)
+    source_id = _resolve_source_id(db, payload.url)
+    ProductIngestService(db).apply_batch(
+        source_id=source_id,
+        items=[service_item],
+        target_product_id=product_id,
+        force_primary_listing=bool(payload.set_as_primary),
+    )
+    db.commit()
+    refreshed = ProductQueryService(db).get_product_payload(product_id)
+    if refreshed is None:
+        raise NotFoundError("Товар не найден")
+    return refreshed

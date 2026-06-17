@@ -7,6 +7,7 @@ import re
 
 from sqlalchemy.orm import Session
 
+from app.core.exceptions import ValidationError
 from app.models import Product, ProductListing, WeightRule, WeightRuleKeyword
 from app.repositories.catalog_products import CatalogProductRepository
 
@@ -106,22 +107,60 @@ class ProductIngestService:
         listing: ProductListing,
         incoming_status: str,
         incoming_reason: str | None,
+        incoming_reasons: list[str],
     ) -> tuple[str, str | None]:
+        reasons = [reason for reason in incoming_reasons if reason]
+        if incoming_reason and incoming_reason not in reasons:
+            reasons.append(incoming_reason)
+
         source_weight = self._positive_int(listing.source_weight_grams)
         manual_weight = self._positive_int(product.manual_weight_grams)
         if manual_weight is not None:
             product.weight_rule_id = None
-            return incoming_status, incoming_reason
-        if source_weight is not None:
+            reasons = [reason for reason in reasons if reason != "missing_weight"]
+        elif source_weight is not None:
             product.weight_rule_id = None
-            return incoming_status, incoming_reason
+            reasons = [reason for reason in reasons if reason != "missing_weight"]
+        else:
+            keyword_rule = self._resolve_keyword_weight_rule(listing)
+            if keyword_rule is not None:
+                product.weight_rule_id = int(keyword_rule[0])
+                reasons = [reason for reason in reasons if reason != "missing_weight"]
+            else:
+                product.weight_rule_id = None
+                if "missing_weight" not in reasons:
+                    reasons.append("missing_weight")
 
-        keyword_rule = self._resolve_keyword_weight_rule(listing)
-        if keyword_rule is not None:
-            product.weight_rule_id = int(keyword_rule[0])
-            return incoming_status, incoming_reason
-        product.weight_rule_id = None
-        return "unavailable", "missing_weight"
+        if reasons:
+            return "unavailable", reasons[0]
+        if incoming_status == "unavailable":
+            return "unavailable", None
+        return incoming_status, None
+
+    @staticmethod
+    def _normalize_status_reasons(item: dict) -> list[str]:
+        raw_reasons = item.get("status_reasons") if isinstance(item.get("status_reasons"), list) else []
+        reasons: list[str] = []
+        seen: set[str] = set()
+        for raw_reason in raw_reasons:
+            reason = str(raw_reason or "").strip().lower()
+            if not reason or reason in seen:
+                continue
+            seen.add(reason)
+            reasons.append(reason)
+        reason_text = str(item.get("status_reason") or "").strip().lower()
+        if reason_text and reason_text not in seen:
+            reasons.append(reason_text)
+        return reasons
+
+    def _resolve_product(self, *, listing_id: int, target_product_id: int | None) -> Product | None:
+        if target_product_id is not None:
+            product = self.products.get_product(int(target_product_id))
+            if product is None:
+                raise ValidationError(f"target product not found: {target_product_id}")
+            self.products.ensure_membership(product_id=int(product.id), listing_id=int(listing_id))
+            return product
+        return self.products.get_product_by_listing(int(listing_id))
 
     @staticmethod
     def _variant_payloads(item: dict) -> list[dict]:
@@ -165,7 +204,15 @@ class ProductIngestService:
             out.append(value)
         return out
 
-    def apply_batch(self, *, source_id: int, items: list[dict], reconcile_missing: bool = False) -> BatchApplyResult:
+    def apply_batch(
+        self,
+        *,
+        source_id: int,
+        items: list[dict],
+        reconcile_missing: bool = False,
+        target_product_id: int | None = None,
+        force_primary_listing: bool = False,
+    ) -> BatchApplyResult:
         result = BatchApplyResult(listings_seen=0, listings_applied=0)
         seen_listing_ids: set[int] = set()
 
@@ -191,7 +238,7 @@ class ProductIngestService:
                     source_title=str(item.get("title") or "").strip() or url,
                     source_description_html=str(item.get("description_html") or "").strip() or None,
                     source_description_text=str(item.get("description") or "").strip() or None,
-                    source_weight_grams=self._positive_int(item.get("weight_grams")),
+                    source_weight_grams=self._positive_int(item.get("source_weight_grams")),
                     source_designer_raw=str(item.get("designer") or "").strip() or None,
                     source_category_raw=str(item.get("category") or "").strip() or None,
                     ingest_mode="sync",
@@ -205,30 +252,36 @@ class ProductIngestService:
                 listing.source_title = str(item.get("title") or "").strip() or url
                 listing.source_description_html = str(item.get("description_html") or "").strip() or None
                 listing.source_description_text = str(item.get("description") or "").strip() or None
-                listing.source_weight_grams = self._positive_int(item.get("weight_grams"))
+                listing.source_weight_grams = self._positive_int(item.get("source_weight_grams"))
                 listing.source_designer_raw = str(item.get("designer") or "").strip() or None
                 listing.source_category_raw = str(item.get("category") or "").strip() or None
                 listing.last_seen_at = self._utcnow()
                 listing.last_synced_at = self._utcnow()
 
-            product = self.products.get_product_by_listing(int(listing.id))
+            product = self._resolve_product(listing_id=int(listing.id), target_product_id=target_product_id)
             if product is None:
+                source_setting = getattr(getattr(listing, "source", None), "setting", None)
+                visibility_status = "hidden" if bool(getattr(source_setting, "hide_auto_added_products", False)) else "visible"
                 product = self.products.create_product(
                     gender=self._normalize_gender(item.get("gender")),
                     availability_mode="by_order",
                     lifecycle_status="active",
-                    visibility_status="visible",
+                    visibility_status=visibility_status,
                 )
                 self.products.ensure_membership(product_id=int(product.id), listing_id=int(listing.id))
+                product.primary_listing_id = int(listing.id)
+            elif target_product_id is not None and force_primary_listing:
                 product.primary_listing_id = int(listing.id)
 
             incoming_status = self._normalize_orderability(str(item.get("status") or "unavailable"))
             incoming_reason = str(item.get("status_reason") or "").strip() or None
+            incoming_reasons = self._normalize_status_reasons(item)
             listing.orderability_status, listing.status_reason = self._resolve_listing_status(
                 product=product,
                 listing=listing,
                 incoming_status=incoming_status,
                 incoming_reason=incoming_reason,
+                incoming_reasons=incoming_reasons,
             )
 
             variants = self._variant_payloads(item)

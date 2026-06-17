@@ -11,6 +11,7 @@ from app.models import (
     Filter,
     FilterNode,
     Product,
+    ShowcaseCategoryAttachmentHiddenNode,
     ShowcaseCategory,
     ShowcaseCategoryAttachment,
 )
@@ -71,10 +72,10 @@ class CatalogTaxonomyRepository:
         )
         return {int(row.id) for row in rows}
 
-    def clear_state(self) -> None:
+    def clear_editable_state(self) -> None:
         for model in (
+            ShowcaseCategoryAttachmentHiddenNode,
             ShowcaseCategoryAttachment,
-            ShowcaseCategory,
             CustomCatalog,
             FilterNode,
             Filter,

@@ -16,6 +16,7 @@ router = APIRouter(tags=["dedup"])
 class MergeRequest(BaseModel):
     primary_product_id: int = Field(ge=1)
     duplicate_product_id: int = Field(ge=1)
+    primary_listing_id: int | None = Field(default=None, ge=1)
 
 
 class RejectRequest(BaseModel):
@@ -39,6 +40,7 @@ def merge_dedup_pair(payload: MergeRequest, db: Session = Depends(get_db)) -> di
     product_id = DedupServiceV2(db).merge(
         primary_product_id=int(payload.primary_product_id),
         duplicate_product_id=int(payload.duplicate_product_id),
+        primary_listing_id=(int(payload.primary_listing_id) if payload.primary_listing_id is not None else None),
     )
     db.commit()
     return {"ok": True, "created_product_id": product_id}
@@ -71,8 +73,6 @@ def list_dedup_decisions(
                 "pair_key": f"{min(int(left['id']), int(right['id']))}:{max(int(left['id']), int(right['id']))}",
                 "action": str(decision.decision_kind),
                 "decided_at": decision.created_at.isoformat() if decision.created_at else None,
-                "can_undo": False,
-                "undo_block_reason": "undo_removed",
                 "left": left,
                 "right": right,
             }
