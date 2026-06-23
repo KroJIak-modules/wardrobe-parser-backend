@@ -15,6 +15,7 @@ from app.models import (
     ProductListingMember,
 )
 from app.repositories.catalog_products import CatalogProductRepository
+from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
 from app.services.catalog.product_ingest_service import ProductIngestService
 from app.services.catalog.source_registry_service import SourceRegistryService
 
@@ -24,6 +25,7 @@ class ProductWriteService:
         self.db = db
         self.products = CatalogProductRepository(db)
         self.sources = SourceRegistryService(db)
+        self.filter_assignments = ProductFilterAssignmentService(db)
 
     @staticmethod
     def _normalize_visibility_status(raw: str | None) -> str:
@@ -213,8 +215,7 @@ class ProductWriteService:
             return
         manual_price_rub = payload.get("manual_price_rub")
         if manual_price_rub is None:
-            self.products.delete_price_override(int(product_id))
-            return
+            raise ValidationError("manual_price_rub is required when price_override is provided")
         self.products.upsert_price_override(
             product_id=int(product_id),
             manual_price_rub=float(manual_price_rub),
@@ -257,38 +258,75 @@ class ProductWriteService:
         if listing is None:
             return
         source_images = {str(image.url): image for image in listing.images}
+        hidden_source_set = set(hidden_source_image_urls)
         manual_asset_ids = self._gallery_asset_ids_from_urls(manual_image_urls)
         manual_assets = {
             int(asset.id): asset
             for asset in self.db.query(ImageAsset).filter(ImageAsset.id.in_(manual_asset_ids)).all()
         } if manual_asset_ids else {}
 
-        ordered_manual_urls = [url for url in manual_image_order if url in manual_image_urls]
-        for url in manual_image_urls:
-            if url not in ordered_manual_urls:
-                ordered_manual_urls.append(url)
-
         position = 1
-        visible_source_urls = [url for url in source_images.keys() if url not in set(hidden_source_image_urls)]
-        for source_url in visible_source_urls:
-            image = source_images[source_url]
-            self.db.add(
-                ProductListingGalleryImage(
-                    product_id=int(product_id),
-                    listing_id=int(listing_id),
-                    listing_image_id=int(image.id),
-                    position=position,
-                    is_hidden=False,
-                    origin_kind="source_image",
-                )
-            )
-            position += 1
+        visible_source_urls = [url for url in source_images.keys() if url not in hidden_source_set]
+        ordered_entries: list[tuple[str, str]] = []
+        seen_source_urls: set[str] = set()
+        seen_manual_urls: set[str] = set()
 
-        for manual_url in ordered_manual_urls:
-            asset_id = self._gallery_asset_ids_from_urls([manual_url])
-            if not asset_id:
+        for raw_entry in manual_image_order:
+            entry = str(raw_entry or "").strip()
+            if not entry:
                 continue
-            if asset_id[0] not in manual_assets:
+            if entry.startswith("s:"):
+                source_url = entry[2:].strip()
+                if source_url and source_url in source_images and source_url not in hidden_source_set and source_url not in seen_source_urls:
+                    ordered_entries.append(("source_image", source_url))
+                    seen_source_urls.add(source_url)
+                continue
+            if entry.startswith("m:"):
+                manual_url = entry[2:].strip()
+                if manual_url and manual_url in manual_image_urls and manual_url not in seen_manual_urls:
+                    ordered_entries.append(("uploaded_asset", manual_url))
+                    seen_manual_urls.add(manual_url)
+                continue
+            if entry in source_images and entry not in hidden_source_set and entry not in seen_source_urls:
+                ordered_entries.append(("source_image", entry))
+                seen_source_urls.add(entry)
+                continue
+            if entry in manual_image_urls and entry not in seen_manual_urls:
+                ordered_entries.append(("uploaded_asset", entry))
+                seen_manual_urls.add(entry)
+
+        for source_url in visible_source_urls:
+            if source_url in seen_source_urls:
+                continue
+            ordered_entries.append(("source_image", source_url))
+            seen_source_urls.add(source_url)
+
+        for manual_url in manual_image_urls:
+            if manual_url in seen_manual_urls:
+                continue
+            ordered_entries.append(("uploaded_asset", manual_url))
+            seen_manual_urls.add(manual_url)
+
+        for origin_kind, entry_url in ordered_entries:
+            if origin_kind == "source_image":
+                image = source_images.get(entry_url)
+                if image is None:
+                    continue
+                self.db.add(
+                    ProductListingGalleryImage(
+                        product_id=int(product_id),
+                        listing_id=int(listing_id),
+                        listing_image_id=int(image.id),
+                        position=position,
+                        is_hidden=False,
+                        origin_kind="source_image",
+                    )
+                )
+                position += 1
+                continue
+
+            asset_id = self._gallery_asset_ids_from_urls([entry_url])
+            if not asset_id or asset_id[0] not in manual_assets:
                 continue
             self.db.add(
                 ProductListingGalleryImage(
@@ -328,7 +366,7 @@ class ProductWriteService:
                 raise ValidationError("primary_listing_id не принадлежит товару")
             product.primary_listing_id = primary_listing_id
         listing = self._primary_listing_or_error(product)
-        presentation = self.products.ensure_presentation(int(product.id))
+        presentation = product.presentation
         manual_listing = self._manual_listing(product)
 
         reset_to_default = {str(item).strip() for item in payload.get("reset_to_default") or []}
@@ -350,23 +388,31 @@ class ProductWriteService:
                 manual_listing.source_description_html = str(payload.get("description_html") or "").strip() or None
         else:
             if "title_override" in reset_to_default:
+                presentation = presentation or self.products.ensure_presentation(int(product.id))
                 presentation.title_override = None
             elif "title_override" in payload:
+                presentation = presentation or self.products.ensure_presentation(int(product.id))
                 presentation.title_override = str(payload.get("title_override") or "").strip() or None
 
             if "description_text" in reset_to_default:
+                presentation = presentation or self.products.ensure_presentation(int(product.id))
                 presentation.description_text = None
             elif "description_text" in payload:
+                presentation = presentation or self.products.ensure_presentation(int(product.id))
                 presentation.description_text = str(payload.get("description_text") or "").strip() or None
 
             if "description_html" in reset_to_default:
+                presentation = presentation or self.products.ensure_presentation(int(product.id))
                 presentation.description_html = None
             elif "description_html" in payload:
+                presentation = presentation or self.products.ensure_presentation(int(product.id))
                 presentation.description_html = str(payload.get("description_html") or "").strip() or None
 
         if "description_visibility" in reset_to_default:
+            presentation = presentation or self.products.ensure_presentation(int(product.id))
             presentation.description_visibility = None
         elif "description_visibility" in payload:
+            presentation = presentation or self.products.ensure_presentation(int(product.id))
             presentation.description_visibility = bool(payload.get("description_visibility"))
 
         if "visibility_status" in payload:
@@ -418,6 +464,39 @@ class ProductWriteService:
 
         self._sync_weight_state(product=product, listing=listing)
         self.db.flush()
+        if "filter_slugs" in payload:
+            self.filter_assignments.enqueue_product_ids_after_commit([int(product.id)])
+
+    def bulk_update_products(self, *, product_ids: list[int], payload: dict) -> list[int]:
+        normalized_ids: list[int] = []
+        seen: set[int] = set()
+        for raw_product_id in product_ids:
+            product_id = int(raw_product_id)
+            if product_id <= 0 or product_id in seen:
+                continue
+            seen.add(product_id)
+            normalized_ids.append(product_id)
+        if not normalized_ids:
+            raise ValidationError("product_ids is required")
+
+        supports_gender = "gender" in payload
+        if not supports_gender:
+            raise ValidationError("bulk update payload is empty")
+
+        products = self.products.list_products_by_ids(normalized_ids, include_merged=False)
+        found_ids = {int(product.id) for product in products}
+        missing_ids = [product_id for product_id in normalized_ids if product_id not in found_ids]
+        if missing_ids:
+            raise NotFoundError(f"Не найдены товары: {', '.join(str(product_id) for product_id in missing_ids)}")
+
+        for product in products:
+            if supports_gender:
+                product.gender = self._normalize_gender(payload.get("gender"))
+            listing = self._primary_listing_or_error(product)
+            self._sync_weight_state(product=product, listing=listing)
+
+        self.db.flush()
+        return [int(product.id) for product in products]
 
     def create_manual_product(self, payload: dict) -> int:
         source = self.sources.ensure_manual_source()
@@ -490,6 +569,7 @@ class ProductWriteService:
         )
         self._sync_weight_state(product=product, listing=listing)
         self.db.flush()
+        self.filter_assignments.enqueue_product_ids_after_commit([int(product.id)])
         return int(product.id)
 
     def update_manual_product(self, *, product_id: int, payload: dict) -> None:
@@ -566,13 +646,17 @@ class ProductWriteService:
             )
         self._sync_weight_state(product=product, listing=listing)
         self.db.flush()
+        if any(key in payload for key in ("title", "source_category_name", "filter_slugs")):
+            self.filter_assignments.enqueue_product_ids_after_commit([int(product.id)])
 
     def delete_manual_product(self, *, product_id: int) -> None:
         product = self._product_or_error(product_id)
+        affected_product_ids: set[int] = {int(product.id)}
         listings = self.products.list_product_listings(int(product.id))
         if not listings:
             self.db.delete(product)
             self.db.flush()
+            self.filter_assignments.enqueue_product_ids_after_commit(affected_product_ids)
             return
         sync_listings = [listing for listing in listings if str(listing.ingest_mode or "") == "sync"]
         for listing in sync_listings:
@@ -587,6 +671,7 @@ class ProductWriteService:
             )
             self.products.ensure_membership(product_id=int(detached.id), listing_id=int(listing.id))
             detached.primary_listing_id = int(listing.id)
+            affected_product_ids.add(int(detached.id))
             self._duplicate_gallery_scope(
                 from_product_id=int(product.id),
                 to_product_id=int(detached.id),
@@ -599,6 +684,7 @@ class ProductWriteService:
                 self.db.delete(listing)
         self.db.delete(product)
         self.db.flush()
+        self.filter_assignments.enqueue_product_ids_after_commit(affected_product_ids)
 
     def unbind_listing(self, *, product_id: int, listing_id: int) -> int:
         product = self._product_or_error(product_id)
@@ -621,6 +707,7 @@ class ProductWriteService:
         )
         self.products.ensure_membership(product_id=int(detached.id), listing_id=int(listing.id))
         detached.primary_listing_id = int(listing.id)
+        affected_product_ids: set[int] = {int(product.id), int(detached.id)}
         self._duplicate_gallery_scope(
             from_product_id=int(product.id),
             to_product_id=int(detached.id),
@@ -638,9 +725,11 @@ class ProductWriteService:
         if not remaining_memberships:
             self.db.delete(product)
             self.db.flush()
+            self.filter_assignments.enqueue_product_ids_after_commit(affected_product_ids)
             return int(detached.id)
 
         if int(product.primary_listing_id or 0) == int(listing.id):
             product.primary_listing_id = int(remaining_memberships[0].listing_id)
         self.db.flush()
+        self.filter_assignments.enqueue_product_ids_after_commit(affected_product_ids)
         return int(detached.id)

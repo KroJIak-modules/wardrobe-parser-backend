@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
+import logging
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, or_
@@ -12,13 +12,26 @@ from sqlalchemy.orm import Session
 
 from app.models import Product, ProductListing, Source
 from app.repositories import CatalogWeightRuleRepository
-from app.schemas.parser import (
+from app.schemas.admin_settings import (
     WeightMissingProductResponse,
     WeightRuleCreateRequest,
     WeightRuleKeywordRequest,
     WeightRuleResponse,
     WeightRuleUpdateRequest,
 )
+from app.services.settings.weight_rule_matcher import (
+    WeightRuleMatcherField,
+    WeightRuleMatcherEntry,
+    keyword_has_wildcards,
+    normalize_haystack,
+    normalize_keyword,
+    resolve_match,
+    resolve_match_for_fields,
+)
+from app.services.settings.weight_recalc_queue import WeightRuleRecalcQueue
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -29,8 +42,7 @@ class WeightMatchResult:
 
 
 def _normalize_keyword(keyword: str) -> str:
-    normalized = re.sub(r"[^a-z0-9\s*?]+", " ", keyword.strip().lower())
-    normalized = " ".join(normalized.split())
+    normalized = normalize_keyword(keyword)
     if not normalized:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ключевое слово не может быть пустым")
     if len(normalized) > 255:
@@ -39,28 +51,12 @@ def _normalize_keyword(keyword: str) -> str:
 
 
 def _normalize_match_haystack(*parts: str | None) -> str:
-    text = " ".join(item.strip().lower() for item in parts if item and item.strip())
-    normalized = re.sub(r"[^a-z0-9\s]+", " ", text)
-    return " ".join(normalized.split())
-
-
-def _keyword_has_wildcards(keyword: str) -> bool:
-    return "*" in keyword or "?" in keyword
-
-
-def _keyword_wildcard_to_regex(keyword: str) -> re.Pattern[str]:
-    escaped = re.escape(keyword)
-    pattern = escaped.replace(r"\*", ".*").replace(r"\?", ".")
-    return re.compile(pattern, flags=re.IGNORECASE)
-
-
-def _keyword_specificity(keyword: str) -> int:
-    return len(keyword.replace("*", "").replace("?", "").strip())
+    return normalize_haystack(*parts)
 
 
 def _keyword_to_sql_like_pattern(keyword: str) -> str:
     escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    if _keyword_has_wildcards(escaped):
+    if keyword_has_wildcards(escaped):
         return escaped.replace("*", "%").replace("?", "_")
     return f"%{escaped}%"
 
@@ -175,18 +171,17 @@ class WeightRuleService:
                 self.db.rollback()
 
     @staticmethod
-    def _listing_haystack(listing: ProductListing | None) -> str:
+    def _listing_match_fields(listing: ProductListing | None) -> list[WeightRuleMatcherField]:
         if listing is None:
-            return ""
-        return " ".join(
-            [
-                str(listing.source_title or ""),
-                str(listing.source_description_text or ""),
-                str(listing.source_description_html or ""),
-                str(listing.source_designer_raw or ""),
-                str(listing.source_category_raw or ""),
-            ]
-        ).lower()
+            return []
+        return [
+            WeightRuleMatcherField(name="title", text=listing.source_title, weight=8),
+            WeightRuleMatcherField(name="category", text=listing.source_category_raw, weight=7),
+            WeightRuleMatcherField(name="handle", text=listing.handle, weight=6),
+            WeightRuleMatcherField(name="designer", text=listing.source_designer_raw, weight=2),
+            WeightRuleMatcherField(name="description_text", text=listing.source_description_text, weight=1),
+            WeightRuleMatcherField(name="description_html", text=listing.source_description_html, weight=1),
+        ]
 
     @staticmethod
     def _derive_listing_orderability(listing: ProductListing | None) -> str:
@@ -201,53 +196,21 @@ class WeightRuleService:
         return current if current in {"orderable", "sold_out", "unavailable"} else "unavailable"
 
     def _resolve_rule_match(self, listing: ProductListing | None, rules: list[WeightRuleResponse]) -> WeightMatchResult:
-        haystack = self._listing_haystack(listing)
-        if not haystack.strip() or not rules:
+        fields = self._listing_match_fields(listing)
+        if not fields or not rules:
             return WeightMatchResult(rule_id=None, weight_grams=None, matched_keyword=None)
-
-        best_hits = 0
-        best_rule_id: int | None = None
-        best_weight_grams: int | None = None
-        best_keyword: str | None = None
-        best_keyword_len = -1
-
-        for rule in rules:
-            local_hits = 0
-            local_best_keyword: str | None = None
-            local_best_keyword_len = -1
-            for keyword in rule.keywords:
-                normalized_keyword = _normalize_keyword(keyword)
-                matched = bool(_keyword_wildcard_to_regex(normalized_keyword).search(haystack)) if _keyword_has_wildcards(normalized_keyword) else normalized_keyword in haystack
-                if not matched:
-                    continue
-                local_hits += 1
-                keyword_len = _keyword_specificity(normalized_keyword)
-                if keyword_len > local_best_keyword_len:
-                    local_best_keyword_len = keyword_len
-                    local_best_keyword = normalized_keyword
-            if local_hits <= 0:
-                continue
-            if (
-                local_hits > best_hits
-                or (local_hits == best_hits and local_best_keyword_len > best_keyword_len)
-                or (
-                    local_hits == best_hits
-                    and local_best_keyword_len == best_keyword_len
-                    and best_rule_id is not None
-                    and int(rule.id) < best_rule_id
+        match = resolve_match_for_fields(
+            rules=[
+                WeightRuleMatcherEntry(
+                    rule_id=int(rule.id),
+                    weight_grams=int(rule.weight_grams),
+                    keywords=[_normalize_keyword(keyword) for keyword in rule.keywords],
                 )
-            ):
-                best_hits = local_hits
-                best_rule_id = int(rule.id)
-                best_weight_grams = int(rule.weight_grams)
-                best_keyword = local_best_keyword
-                best_keyword_len = local_best_keyword_len
-
-        return WeightMatchResult(
-            rule_id=best_rule_id,
-            weight_grams=(float(best_weight_grams) if best_weight_grams is not None else None),
-            matched_keyword=best_keyword,
+                for rule in rules
+            ],
+            fields=fields,
         )
+        return WeightMatchResult(rule_id=match.rule_id, weight_grams=match.weight_grams, matched_keyword=match.matched_keyword)
 
     def _find_candidate_product_ids(self, keywords: list[str]) -> set[int]:
         normalized = [str(keyword).strip().lower() for keyword in keywords if str(keyword).strip()]
@@ -263,6 +226,7 @@ class WeightRuleService:
                     func.lower(func.coalesce(ProductListing.source_description_html, "")).like(token, escape="\\"),
                     func.lower(func.coalesce(ProductListing.source_designer_raw, "")).like(token, escape="\\"),
                     func.lower(func.coalesce(ProductListing.source_category_raw, "")).like(token, escape="\\"),
+                    func.lower(func.coalesce(ProductListing.handle, "")).like(token, escape="\\"),
                 ]
             )
         rows = (
@@ -280,7 +244,7 @@ class WeightRuleService:
         rows = self.db.query(Product.id).filter(Product.weight_rule_id == int(rule_id)).all()
         return {int(row[0]) for row in rows}
 
-    def _recalculate_products_for_weight_rules(self, *, only_product_ids: set[int] | None = None) -> None:
+    def _recalculate_products_for_weight_rules(self, *, only_product_ids: set[int] | None = None) -> int:
         rules = self.list_rules()
         products = self.rule_repo.list_products_for_weight_recalc(product_ids=only_product_ids if only_product_ids else None)
         changed = False
@@ -333,6 +297,25 @@ class WeightRuleService:
 
         if changed:
             self.db.commit()
+        return len(products)
+
+    def recalculate_product_ids(self, product_ids: set[int] | list[int] | tuple[int, ...]) -> int:
+        normalized = {int(product_id) for product_id in product_ids if int(product_id) > 0}
+        if not normalized:
+            return 0
+        return self._recalculate_products_for_weight_rules(only_product_ids=normalized)
+
+    def _enqueue_recalculation(self, product_ids: set[int]) -> None:
+        normalized = {int(product_id) for product_id in product_ids if int(product_id) > 0}
+        if not normalized:
+            return
+        try:
+            enqueued = WeightRuleRecalcQueue().enqueue_product_ids(normalized)
+            LOGGER.info("Queued weight recalculation for %s products (%s newly enqueued)", len(normalized), enqueued)
+            return
+        except Exception:
+            LOGGER.exception("Failed to enqueue weight recalculation, falling back to synchronous recalculation")
+        self._recalculate_products_for_weight_rules(only_product_ids=normalized)
 
     def list_rules(self) -> list[WeightRuleResponse]:
         self.ensure_default_rules()
@@ -352,7 +335,7 @@ class WeightRuleService:
         keywords = [item.keyword for item in self.rule_repo.list_keywords(rule_id)]
         affected_ids = self._find_candidate_product_ids(keywords) | self._find_current_rule_product_ids(rule_id)
         self.db.commit()
-        self._recalculate_products_for_weight_rules(only_product_ids=affected_ids)
+        self._enqueue_recalculation(affected_ids)
         return WeightRuleResponse(id=int(rule.id), weight_grams=int(rule.weight_grams), keywords=keywords)
 
     def delete_rule(self, rule_id: int) -> dict:
@@ -365,7 +348,7 @@ class WeightRuleService:
             self.db.delete(keyword)
         rule.is_enabled = False
         self.db.commit()
-        self._recalculate_products_for_weight_rules(only_product_ids=affected_ids)
+        self._enqueue_recalculation(affected_ids)
         return {"ok": True}
 
     def add_keyword(self, rule_id: int, payload: WeightRuleKeywordRequest) -> dict:
@@ -378,7 +361,7 @@ class WeightRuleService:
         self.rule_repo.create_keyword(rule_id=rule_id, keyword=keyword)
         self.db.commit()
         affected_ids = self._find_candidate_product_ids([keyword]) | self._find_current_rule_product_ids(rule_id)
-        self._recalculate_products_for_weight_rules(only_product_ids=affected_ids)
+        self._enqueue_recalculation(affected_ids)
         return {"ok": True, "keyword": keyword}
 
     def remove_keyword(self, rule_id: int, keyword: str) -> dict:
@@ -392,7 +375,7 @@ class WeightRuleService:
         affected_ids = self._find_candidate_product_ids([normalized]) | self._find_current_rule_product_ids(rule_id)
         self.db.delete(entity)
         self.db.commit()
-        self._recalculate_products_for_weight_rules(only_product_ids=affected_ids)
+        self._enqueue_recalculation(affected_ids)
         return {"ok": True}
 
     def get_matching_rules(self) -> list[WeightRuleResponse]:
@@ -434,70 +417,46 @@ class WeightRuleService:
         *,
         rules: list[WeightRuleResponse],
         title: str | None,
-        vendor: str | None,
-        product_type: str | None,
+        designer: str | None,
+        category: str | None,
         handle: str | None,
     ) -> WeightMatchResult:
         if not rules:
             return WeightMatchResult(rule_id=None, weight_grams=None, matched_keyword=None)
-        haystack = _normalize_match_haystack(title, vendor, product_type, handle)
-        if not haystack:
+        fields = [
+            WeightRuleMatcherField(name="title", text=title, weight=8),
+            WeightRuleMatcherField(name="category", text=category, weight=7),
+            WeightRuleMatcherField(name="handle", text=handle, weight=6),
+            WeightRuleMatcherField(name="designer", text=designer, weight=2),
+        ]
+        if not _normalize_match_haystack(title, designer, category, handle):
             return WeightMatchResult(rule_id=None, weight_grams=None, matched_keyword=None)
 
-        best_hits = 0
-        best_rule_id: int | None = None
-        best_rule_weight: int | None = None
-        best_keyword: str | None = None
-        best_keyword_len = -1
-
-        for rule in rules:
-            local_hits = 0
-            local_best_keyword: str | None = None
-            local_best_keyword_len = -1
-            for keyword in rule.keywords:
-                normalized_keyword = _normalize_keyword(keyword)
-                matched = bool(_keyword_wildcard_to_regex(normalized_keyword).search(haystack)) if _keyword_has_wildcards(normalized_keyword) else normalized_keyword in haystack
-                if not matched:
-                    continue
-                local_hits += 1
-                keyword_len = _keyword_specificity(normalized_keyword)
-                if keyword_len > local_best_keyword_len:
-                    local_best_keyword_len = keyword_len
-                    local_best_keyword = normalized_keyword
-            if local_hits <= 0:
-                continue
-            if (
-                local_hits > best_hits
-                or (local_hits == best_hits and local_best_keyword_len > best_keyword_len)
-                or (
-                    local_hits == best_hits
-                    and local_best_keyword_len == best_keyword_len
-                    and best_rule_id is not None
-                    and int(rule.id) < best_rule_id
+        match = resolve_match_for_fields(
+            rules=[
+                WeightRuleMatcherEntry(
+                    rule_id=int(rule.id),
+                    weight_grams=int(rule.weight_grams),
+                    keywords=[_normalize_keyword(keyword) for keyword in rule.keywords],
                 )
-            ):
-                best_hits = local_hits
-                best_rule_id = int(rule.id)
-                best_rule_weight = int(rule.weight_grams)
-                best_keyword = local_best_keyword
-                best_keyword_len = local_best_keyword_len
-
-        if best_rule_id is None or best_rule_weight is None:
-            return WeightMatchResult(rule_id=None, weight_grams=None, matched_keyword=None)
-        return WeightMatchResult(rule_id=best_rule_id, weight_grams=float(best_rule_weight), matched_keyword=best_keyword)
+                for rule in rules
+            ],
+            fields=fields,
+        )
+        return WeightMatchResult(rule_id=match.rule_id, weight_grams=match.weight_grams, matched_keyword=match.matched_keyword)
 
     def match_weight_by_keywords(
         self,
         *,
         title: str | None,
-        vendor: str | None,
-        product_type: str | None,
+        designer: str | None,
+        category: str | None,
         handle: str | None,
     ) -> WeightMatchResult:
         return self.match_weight_from_rules(
             rules=self.get_matching_rules(),
             title=title,
-            vendor=vendor,
-            product_type=product_type,
+            designer=designer,
+            category=category,
             handle=handle,
         )

@@ -13,6 +13,7 @@ from app.core.database import SessionLocal
 from app.models import SyncJob
 from app.repositories.catalog_sources import CatalogSourceRepository
 from app.repositories.catalog_sync import CatalogSyncRepository
+from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.product_ingest_service import ProductIngestService
 from app.services.catalog.source_registry_service import SourceRegistryService
 
@@ -43,9 +44,9 @@ class SyncJobService:
         value = str(raw or "").strip().lower()
         if value in {"queued", "completed", "failed"}:
             return value
-        if value in {"in_progress", "running"}:
+        if value == "running":
             return "running"
-        if value in {"cancelled", "canceled"}:
+        if value == "canceled":
             return "canceled"
         return "queued"
 
@@ -58,9 +59,9 @@ class SyncJobService:
             return "completed"
         if value == "partial":
             return "completed"
-        if value in {"in_progress", "running"}:
+        if value == "running":
             return "running"
-        if value in {"cancelled", "canceled"}:
+        if value == "canceled":
             return "failed"
         return "queued"
 
@@ -91,21 +92,36 @@ class SyncJobService:
             db.commit()
         except Exception:
             db.rollback()
+            raise
         finally:
             db.close()
 
-    def start_job(self, *, triggered_by_admin_user_id: int | None, source_keys: list[str] | None = None) -> dict:
+    def start_job(
+        self,
+        *,
+        triggered_by_admin_user_id: int | None,
+        source_keys: list[str] | None = None,
+        trigger_kind: str = "manual",
+    ) -> dict:
         registry = SourceRegistryService(self.db)
         sources = registry.refresh_from_service()
+        service_items = SourceRegistryService.fetch_service_sources_payload()
         normalized_requested = [str(key or "").strip().lower() for key in (source_keys or []) if str(key or "").strip()]
-        selected_sources = [
-            source
-            for source in sources
-            if source.key != SourceRegistryService.MANUAL_SOURCE_KEY
-            and bool(getattr(getattr(source, "setting", None), "is_enabled", True))
-            and bool(getattr(getattr(source, "setting", None), "is_sync_enabled", True))
-            and (not normalized_requested or source.key in normalized_requested)
-        ]
+        selected_sources = []
+        for source in sources:
+            source_mode = SourceRegistryService.derive_source_mode(source.key, service_items.get(source.key))
+            if source_mode == "personal":
+                continue
+            if not bool(getattr(getattr(source, "setting", None), "is_enabled", True)):
+                continue
+            if not bool(getattr(getattr(source, "setting", None), "is_sync_enabled", True)):
+                continue
+            if normalized_requested:
+                if source.key in normalized_requested:
+                    selected_sources.append(source)
+                continue
+            if source_mode == "auto":
+                selected_sources.append(source)
         if not selected_sources:
             raise ValueError("Нет доступных источников для синхронизации")
 
@@ -125,7 +141,7 @@ class SyncJobService:
             raise RuntimeError("service did not return job_id")
 
         job = self.sync_repo.create_job(
-            trigger_kind="manual",
+            trigger_kind=str(trigger_kind or "manual").strip().lower() or "manual",
             status="queued",
             triggered_by_admin_user_id=(int(triggered_by_admin_user_id) if triggered_by_admin_user_id is not None else None),
             total_sources=len(selected_sources),
@@ -242,22 +258,24 @@ class SyncJobService:
             max(0, int(source_run.products_received or 0) - int(source_run.products_applied or 0)),
         )
         source_run.failed_products = failed_products
-        if cls._normalize_source_state_status(status_value) == "failed":
+        normalized_source_state_status = cls._normalize_source_state_status(status_value)
+        if normalized_source_state_status == "failed":
             source_run.error_message = str(error_message or "").strip() or None
             source_run.error_code = cls._derive_error_code(source_run.error_message)
-        else:
+        elif normalized_source_state_status is not None:
             source_run.error_message = None
             source_run.error_code = None
 
         sync_state = source_repo.ensure_sync_state(source)
         sync_state.last_sync_at = now
-        sync_state.last_sync_status = cls._normalize_source_state_status(status_value)
+        if normalized_source_state_status is not None:
+            sync_state.last_sync_status = normalized_source_state_status
         if source_run.started_at is not None:
             sync_state.last_sync_duration_sec = max(0, int((now - source_run.started_at).total_seconds()))
-        if sync_state.last_sync_status == "failed":
+        if normalized_source_state_status == "failed":
             sync_state.last_error_message = source_run.error_message
             sync_state.last_error_code = source_run.error_code
-        else:
+        elif normalized_source_state_status is not None:
             sync_state.last_error_message = None
             sync_state.last_error_code = None
         job = sync_repo.get_job(backend_job_id)
@@ -332,7 +350,7 @@ class SyncJobService:
 
                 cursor = next_cursor
                 service_status = str(status_payload.get("status") or "").strip().lower()
-                if service_status in {"completed", "failed", "cancelled"}:
+                if service_status in {"completed", "failed", "canceled"}:
                     final_status = cls._normalize_job_status(service_status)
                     error_message = str(status_payload.get("error") or "").strip() or None
                     break
@@ -343,6 +361,7 @@ class SyncJobService:
                 job.status = cls._normalize_job_status(final_status)
                 job.finished_at = cls._utcnow()
                 job.error_message = error_message
+            DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
             db.commit()
         except Exception as exc:
             db.rollback()
@@ -367,7 +386,6 @@ class SyncJobService:
         total_sources = max(0, int(job.total_sources or 0))
         processed_sources = max(0, int(job.processed_sources or 0))
         source_progress = (processed_sources / total_sources * 100.0) if total_sources > 0 else 0.0
-        product_progress = (processed_products / expected_products * 100.0) if expected_products > 0 else 0.0
         return {
             "job_id": str(job.id),
             "status": self._normalize_job_status(getattr(job, "status", "queued")),
@@ -380,7 +398,6 @@ class SyncJobService:
             "products_seen": expected_products,
             "products_applied": processed_products,
             "failed_products": max(0, expected_products - processed_products),
-            "products_progress_percent": round(product_progress if expected_products > 0 else 0.0, 2),
             "error": job.error_message,
             "can_cancel": self._normalize_job_status(getattr(job, "status", "")) in {"queued", "running"},
         }

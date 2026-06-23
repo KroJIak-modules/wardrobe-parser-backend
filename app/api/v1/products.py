@@ -5,7 +5,7 @@ import time
 import requests
 from fastapi import APIRouter, Depends, File, Query, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -24,6 +24,17 @@ from app.services.catalog.source_registry_service import SourceRegistryService
 router = APIRouter(tags=["products"])
 
 
+class PriceOverridePatchRequest(BaseModel):
+    manual_price_rub: float | None = None
+    manual_compare_at_price_rub: float | None = None
+
+    @model_validator(mode="after")
+    def validate_manual_price_present(self) -> "PriceOverridePatchRequest":
+        if self.manual_price_rub is None:
+            raise ValueError("manual_price_rub is required when price_override is provided")
+        return self
+
+
 class ProductPatchRequest(BaseModel):
     title_override: str | None = None
     description_text: str | None = None
@@ -34,12 +45,17 @@ class ProductPatchRequest(BaseModel):
     gender: str | None = None
     primary_listing_id: int | None = None
     manual_weight_grams: int | None = None
-    price_override: dict | None = None
+    price_override: PriceOverridePatchRequest | None = None
     images: dict | None = None
     gallery_listing_id: int | None = None
     filter_slugs: list[str] | None = None
     custom_catalog_slugs: list[str] | None = None
     reset_to_default: list[str] = Field(default_factory=list)
+
+
+class ProductBulkPatchRequest(BaseModel):
+    product_ids: list[int] = Field(default_factory=list, min_length=1)
+    gender: str | None = None
 
 
 class ManualVariantRequest(BaseModel):
@@ -63,7 +79,7 @@ class ManualProductRequest(BaseModel):
     variants: list[ManualVariantRequest] = Field(default_factory=list)
     manual_image_asset_ids: list[int] = Field(default_factory=list)
     manual_weight_grams: int | None = None
-    price_override: dict | None = None
+    price_override: PriceOverridePatchRequest | None = None
     filter_slugs: list[str] = Field(default_factory=list)
     custom_catalog_slugs: list[str] = Field(default_factory=list)
     bind_source_url: str | None = None
@@ -85,7 +101,7 @@ class ManualProductPatchRequest(BaseModel):
     manual_image_asset_ids: list[int] | None = None
     gallery_listing_id: int | None = None
     manual_weight_grams: int | None = None
-    price_override: dict | None = None
+    price_override: PriceOverridePatchRequest | None = None
     filter_slugs: list[str] | None = None
     custom_catalog_slugs: list[str] | None = None
 
@@ -116,7 +132,7 @@ def _probe_service_product(url: str) -> dict:
         status_res.raise_for_status()
         status_payload = status_res.json() if isinstance(status_res.json(), dict) else {}
         status_value = str(status_payload.get("status") or "").strip().lower()
-        if status_value in {"completed", "failed", "cancelled"}:
+        if status_value in {"completed", "failed", "canceled"}:
             break
         time.sleep(1.0)
 
@@ -139,6 +155,7 @@ def _probe_service_product(url: str) -> dict:
 def _preview_payload_from_service_item(item: dict) -> dict:
     variants = item.get("variants") if isinstance(item.get("variants"), list) else []
     first_variant = next((variant for variant in variants if isinstance(variant, dict)), None)
+    orderability_status = str(item.get("orderability_status") or "").strip().lower() or "orderable"
     return {
         "handle": str(item.get("handle") or "").strip(),
         "title": str(item.get("title") or "").strip(),
@@ -147,11 +164,15 @@ def _preview_payload_from_service_item(item: dict) -> dict:
         "source_weight_grams": item.get("source_weight_grams"),
         "designer_name": str(item.get("designer") or "").strip() or None,
         "source_category_name": str(item.get("category") or "").strip() or None,
+        "gender": str(item.get("gender") or "").strip().lower() or None,
         "product_url": str(item.get("url") or "").strip(),
         "price": first_variant.get("price") if first_variant else None,
         "currency": str(first_variant.get("currency") or "").strip().upper() if first_variant else "",
         "buyer_total_price": item.get("buyer_total_price"),
         "buyer_service_fee": item.get("buyer_service_fee"),
+        "visibility_status": "visible",
+        "availability_mode": "by_order",
+        "orderability_status": orderability_status,
         "image_urls": [str(url).strip() for url in item.get("images") or [] if str(url).strip()],
         "variants": [
             {
@@ -182,8 +203,9 @@ def list_products(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     source_id: int | None = Query(default=None),
-    designer_id: int | None = Query(default=None),
-    category_slug: str | None = Query(default=None),
+    source_mode: str | None = Query(default=None),
+    designer_id: str | None = Query(default=None),
+    gender: str | None = Query(default=None),
     filter_slug: str | None = Query(default=None),
     custom_catalog_slug: str | None = Query(default=None),
     visibility_status: str | None = Query(default=None),
@@ -191,18 +213,20 @@ def list_products(
     orderability_status: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> dict:
-    return ProductQueryService(db).list_products(
+    return ProductQueryService(db).list_admin_table_products(
         limit=limit,
         offset=offset,
         query=q,
         source_id=source_id,
-        designer_id=designer_id,
-        category_slug=category_slug,
+        source_mode=source_mode,
+        designer_filter=designer_id,
+        gender=gender,
         filter_slug=filter_slug,
         custom_catalog_slug=custom_catalog_slug,
         visibility_status=visibility_status,
         availability_mode=availability_mode,
         orderability_status=orderability_status,
+        audience="public",
     )
 
 
@@ -212,8 +236,9 @@ def admin_products_table(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     source_id: int | None = Query(default=None),
-    designer_id: int | None = Query(default=None),
-    category_slug: str | None = Query(default=None),
+    source_mode: str | None = Query(default=None),
+    designer_id: str | None = Query(default=None),
+    gender: str | None = Query(default=None),
     filter_slug: str | None = Query(default=None),
     custom_catalog_slug: str | None = Query(default=None),
     visibility_status: str | None = Query(default=None),
@@ -221,72 +246,68 @@ def admin_products_table(
     orderability_status: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> dict:
-    return list_products(
-        q=q,
+    return ProductQueryService(db).list_admin_table_products(
         limit=limit,
         offset=offset,
+        query=q,
         source_id=source_id,
-        designer_id=designer_id,
-        category_slug=category_slug,
+        source_mode=source_mode,
+        designer_filter=designer_id,
+        gender=gender,
         filter_slug=filter_slug,
         custom_catalog_slug=custom_catalog_slug,
         visibility_status=visibility_status,
         availability_mode=availability_mode,
         orderability_status=orderability_status,
-        db=db,
     )
-
 
 @router.get("/admin/products/table/facets", dependencies=[Depends(require_permission("control.products.read"))])
-def admin_products_table_facets(db: Session = Depends(get_db)) -> dict:
-    rows = (
-        db.query(ProductListing.source_id, func.count(func.distinct(Product.id)))
-        .join(ProductListingMember, ProductListingMember.listing_id == ProductListing.id)
-        .join(Product, Product.id == ProductListingMember.product_id)
-        .filter(Product.lifecycle_status != "merged")
-        .group_by(ProductListing.source_id)
-        .all()
+def admin_products_table_facets(
+    q: str = Query(default="", max_length=255),
+    source_id: int | None = Query(default=None),
+    source_mode: str | None = Query(default=None),
+    designer_id: str | None = Query(default=None),
+    gender: str | None = Query(default=None),
+    filter_slug: str | None = Query(default=None),
+    custom_catalog_slug: str | None = Query(default=None),
+    visibility_status: str | None = Query(default=None),
+    availability_mode: str | None = Query(default=None),
+    orderability_status: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> dict:
+    return ProductQueryService(db).admin_table_facets(
+        query=q,
+        source_id=source_id,
+        source_mode=source_mode,
+        designer_filter=designer_id,
+        gender=gender,
+        filter_slug=filter_slug,
+        custom_catalog_slug=custom_catalog_slug,
+        visibility_status=visibility_status,
+        availability_mode=availability_mode,
+        orderability_status=orderability_status,
     )
-    visibility_rows = db.query(Product.visibility_status, func.count(Product.id)).filter(Product.lifecycle_status != "merged").group_by(Product.visibility_status).all()
-    availability_rows = db.query(Product.availability_mode, func.count(Product.id)).filter(Product.lifecycle_status != "merged").group_by(Product.availability_mode).all()
-    orderability_rows = (
-        db.query(ProductListing.orderability_status, func.count(func.distinct(Product.id)))
-        .join(ProductListingMember, ProductListingMember.listing_id == ProductListing.id)
-        .join(Product, Product.id == ProductListingMember.product_id)
-        .filter(Product.lifecycle_status != "merged")
-        .group_by(ProductListing.orderability_status)
-        .all()
-    )
-    return {
-        "source_counts": [{"source_id": int(source_id), "count": int(count)} for source_id, count in rows],
-        "visibility_status_counts": [{"value": str(value), "count": int(count)} for value, count in visibility_rows],
-        "availability_mode_counts": [{"value": str(value), "count": int(count)} for value, count in availability_rows],
-        "orderability_status_counts": [{"value": str(value), "count": int(count)} for value, count in orderability_rows],
-    }
 
 
 @router.get("/products/pricing-example", dependencies=[Depends(require_permission("control.pricing.read"))])
 def pricing_example(db: Session = Depends(get_db)) -> dict:
-    payload = ProductQueryService(db).list_products(limit=1, offset=0)
-    if not payload["items"]:
-        raise NotFoundError("Нет товаров для примера")
-    product = payload["items"][0]
-    return {
-        "product_id": int(product["id"]),
-        "title": product["title"],
-        "url": product["url"],
-        "source_name": product.get("source_name"),
-        "image_url": (product.get("image_urls") or [None])[0],
-        "source_price": product.get("source_price"),
-        "source_currency": product.get("source_currency"),
-        "final_price": product.get("final_price"),
-        "components": product.get("pricing_components") or {},
-    }
+    payload = ProductQueryService(db).get_pricing_example_payload()
+    if payload is None:
+        raise NotFoundError("Не удалось выбрать товар для примера")
+    return payload
 
 
 @router.get("/products/{product_id}")
 def get_product(product_id: int, db: Session = Depends(get_db)) -> dict:
-    payload = ProductQueryService(db).get_product_payload(product_id)
+    payload = ProductQueryService(db).get_product_payload(product_id, audience="public")
+    if payload is None:
+        raise NotFoundError("Товар не найден")
+    return payload
+
+
+@router.get("/admin/products/{product_id}", dependencies=[Depends(require_permission("control.products.read"))])
+def get_admin_product(product_id: int, db: Session = Depends(get_db)) -> dict:
+    payload = ProductQueryService(db).get_product_payload(product_id, audience="admin")
     if payload is None:
         raise NotFoundError("Товар не найден")
     return payload
@@ -294,12 +315,25 @@ def get_product(product_id: int, db: Session = Depends(get_db)) -> dict:
 
 @router.patch("/products/{product_id}", dependencies=[Depends(require_permission("control.products.edit"))])
 def patch_product(product_id: int, payload: ProductPatchRequest, db: Session = Depends(get_db)) -> dict:
-    ProductWriteService(db).update_product(product_id=product_id, payload=payload.model_dump(exclude_none=False))
+    ProductWriteService(db).update_product(
+        product_id=product_id,
+        payload=payload.model_dump(exclude_unset=True, exclude_none=False),
+    )
     db.commit()
-    refreshed = ProductQueryService(db).get_product_payload(product_id)
+    refreshed = ProductQueryService(db).get_product_payload(product_id, audience="admin")
     if refreshed is None:
         raise NotFoundError("Товар не найден")
     return refreshed
+
+
+@router.patch("/admin/products/bulk", dependencies=[Depends(require_permission("control.products.edit"))])
+def patch_products_bulk(payload: ProductBulkPatchRequest, db: Session = Depends(get_db)) -> dict:
+    updated_ids = ProductWriteService(db).bulk_update_products(
+        product_ids=[int(product_id) for product_id in payload.product_ids],
+        payload=payload.model_dump(exclude_none=False),
+    )
+    db.commit()
+    return {"ok": True, "updated_product_ids": updated_ids}
 
 
 @router.post("/products/manual", dependencies=[Depends(require_permission("control.products.edit"))])
@@ -384,7 +418,7 @@ def bind_source_by_url(product_id: int, payload: BindSourceByUrlRequest, db: Ses
         force_primary_listing=bool(payload.set_as_primary),
     )
     db.commit()
-    refreshed = ProductQueryService(db).get_product_payload(product_id)
+    refreshed = ProductQueryService(db).get_product_payload(product_id, audience="admin")
     if refreshed is None:
         raise NotFoundError("Товар не найден")
     return refreshed
@@ -394,7 +428,7 @@ def bind_source_by_url(product_id: int, payload: BindSourceByUrlRequest, db: Ses
 def unbind_listing(product_id: int, listing_id: int, db: Session = Depends(get_db)) -> dict:
     detached_product_id = ProductWriteService(db).unbind_listing(product_id=product_id, listing_id=listing_id)
     db.commit()
-    refreshed = ProductQueryService(db).get_product_payload(product_id)
+    refreshed = ProductQueryService(db).get_product_payload(product_id, audience="admin")
     if refreshed is None:
         raise NotFoundError("Товар не найден")
     return {

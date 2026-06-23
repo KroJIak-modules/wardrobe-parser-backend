@@ -27,7 +27,13 @@ class MediaAssetService:
         return target
 
     @staticmethod
-    def _detect_image_meta(content: bytes) -> tuple[str, int | None, int | None]:
+    def _detect_image_meta(content: bytes, *, file_name: str = "") -> tuple[str, int | None, int | None]:
+        normalized_name = str(file_name or "").strip().lower()
+        stripped = content.lstrip()
+        if normalized_name.endswith(".svg") or stripped.startswith(b"<svg") or stripped.startswith(b"<?xml"):
+            head = stripped[:512].decode("utf-8", errors="ignore").lower()
+            if "<svg" in head:
+                return "image/svg+xml", None, None
         mime_type = "application/octet-stream"
         width_px: int | None = None
         height_px: int | None = None
@@ -48,7 +54,7 @@ class MediaAssetService:
         return mimetypes.guess_extension(mime_type) or ".bin"
 
     def save_bytes(self, *, scope: str, file_name: str, content: bytes) -> ImageAsset:
-        mime_type, width_px, height_px = self._detect_image_meta(content)
+        mime_type, width_px, height_px = self._detect_image_meta(content, file_name=file_name)
         suffix = self._safe_suffix(file_name, mime_type)
         digest = sha256(content).hexdigest()
 

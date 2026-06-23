@@ -10,8 +10,12 @@ from fastapi import HTTPException
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models import AdminUiSettings
-from app.api.v1.jobs import StartSyncRequest, run_sync_all_enabled_sources
+from app.services.catalog.filter_assignment_queue import ProductFilterAssignmentQueue
+from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
+from app.services.catalog.sync_job_service import SyncJobService
 from app.services.settings.pricing_service import PricingSettingsService
+from app.services.settings.weight_recalc_queue import WeightRuleRecalcQueue
+from app.services.settings.weight_rule_service import WeightRuleService
 
 
 logger = logging.getLogger("backend.bybit_worker")
@@ -75,7 +79,11 @@ def _run_auto_sync_once() -> tuple[bool, int]:
             return True, max(1, wait_sec)
 
         try:
-            run_sync_all_enabled_sources(StartSyncRequest(triggered_by="auto"))
+            SyncJobService(db).start_job(
+                triggered_by_admin_user_id=None,
+                source_keys=None,
+                trigger_kind="scheduled",
+            )
             entity.auto_sync_last_started_at = now_utc
             entity.auto_sync_last_status = "started"
             entity.auto_sync_last_error = None
@@ -112,12 +120,93 @@ def _run_auto_sync_once() -> tuple[bool, int]:
         db.close()
 
 
+def _run_weight_recalc_once(batch_size: int) -> int:
+    queue = WeightRuleRecalcQueue()
+    product_ids = queue.pop_ready_batch(
+        limit=batch_size,
+        debounce_sec=int(settings.weight_recalc_worker_debounce_sec),
+    )
+    if not product_ids:
+        return 0
+
+    db = SessionLocal()
+    try:
+        processed = WeightRuleService(db).recalculate_product_ids(product_ids)
+        logger.info("Weight recalculation done for %s products", processed)
+        return processed
+    except Exception as exc:  # pragma: no cover - worker runtime guard
+        logger.exception("Weight recalculation failed: %s", exc)
+        try:
+            queue.enqueue_product_ids(product_ids)
+        except Exception as requeue_exc:  # pragma: no cover - worker runtime guard
+            logger.exception("Weight recalculation requeue failed: %s", requeue_exc)
+        return 0
+    finally:
+        db.close()
+
+
+def _run_filter_assignment_rebuild_once(batch_size: int) -> int:
+    db = SessionLocal()
+    try:
+        revision = ProductFilterAssignmentService(db).rebuild_pending_revision(batch_size=batch_size)
+        if revision > 0:
+            logger.info("Filter assignment rebuild completed: revision=%s", revision)
+        return int(revision)
+    except Exception as exc:  # pragma: no cover - worker runtime guard
+        logger.exception("Filter assignment rebuild failed: %s", exc)
+        return 0
+    finally:
+        db.close()
+
+
+def _run_filter_assignment_refresh_once(batch_size: int) -> int:
+    queue = ProductFilterAssignmentQueue()
+    product_ids = queue.pop_ready_batch(
+        limit=batch_size,
+        debounce_sec=int(settings.filter_assignment_worker_debounce_sec),
+    )
+    if not product_ids:
+        return 0
+
+    db = SessionLocal()
+    try:
+        processed = ProductFilterAssignmentService(db).refresh_current_revision_product_ids(product_ids)
+        logger.info("Filter assignment refresh done for %s products", processed)
+        return processed
+    except Exception as exc:  # pragma: no cover - worker runtime guard
+        logger.exception("Filter assignment refresh failed: %s", exc)
+        try:
+            queue.enqueue_product_ids(product_ids)
+        except Exception as requeue_exc:  # pragma: no cover - worker runtime guard
+            logger.exception("Filter assignment refresh requeue failed: %s", requeue_exc)
+        return 0
+    finally:
+        db.close()
+
+
 def run_forever() -> None:
     bybit_interval_sec = max(30, int(settings.pricing_bybit_worker_interval_sec))
     bybit_retry_sec = max(10, min(30, bybit_interval_sec // 2))
-    logger.info("Bybit+AutoSync worker started. bybit_interval_sec=%s", bybit_interval_sec)
+    weight_recalc_idle_sec = max(1, int(settings.weight_recalc_worker_idle_sec))
+    weight_recalc_batch_size = max(1, int(settings.weight_recalc_worker_batch_size))
+    weight_recalc_debounce_sec = max(0, int(settings.weight_recalc_worker_debounce_sec))
+    filter_assignment_idle_sec = max(1, int(settings.filter_assignment_worker_idle_sec))
+    filter_assignment_batch_size = max(1, int(settings.filter_assignment_worker_batch_size))
+    filter_assignment_debounce_sec = max(0, int(settings.filter_assignment_worker_debounce_sec))
+    logger.info(
+        "Bybit+AutoSync worker started. bybit_interval_sec=%s weight_recalc_idle_sec=%s weight_recalc_batch_size=%s weight_recalc_debounce_sec=%s filter_assignment_idle_sec=%s filter_assignment_batch_size=%s filter_assignment_debounce_sec=%s",
+        bybit_interval_sec,
+        weight_recalc_idle_sec,
+        weight_recalc_batch_size,
+        weight_recalc_debounce_sec,
+        filter_assignment_idle_sec,
+        filter_assignment_batch_size,
+        filter_assignment_debounce_sec,
+    )
     next_bybit_at = time.time()
     next_auto_sync_at = time.time()
+    next_weight_recalc_at = time.time()
+    next_filter_assignment_at = time.time()
     while True:
         now = time.time()
         if now >= next_bybit_at:
@@ -128,6 +217,16 @@ def run_forever() -> None:
         if now >= next_auto_sync_at:
             _, delay_sec = _run_auto_sync_once()
             next_auto_sync_at = now + max(1, int(delay_sec))
+        if now >= next_weight_recalc_at:
+            processed = _run_weight_recalc_once(weight_recalc_batch_size)
+            next_weight_recalc_at = now + (1 if processed > 0 else weight_recalc_idle_sec)
+        if now >= next_filter_assignment_at:
+            rebuilt_revision = _run_filter_assignment_rebuild_once(filter_assignment_batch_size)
+            if rebuilt_revision > 0:
+                next_filter_assignment_at = now + 1
+            else:
+                processed = _run_filter_assignment_refresh_once(filter_assignment_batch_size)
+                next_filter_assignment_at = now + (1 if processed > 0 else filter_assignment_idle_sec)
         time.sleep(1)
 
 

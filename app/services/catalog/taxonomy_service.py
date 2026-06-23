@@ -22,11 +22,17 @@ from app.models import (
 from app.repositories.catalog_taxonomy import CatalogTaxonomyRepository
 from app.schemas.taxonomy import (
     TaxonomyCustomCatalog,
+    TaxonomyCustomCatalogWrite,
     TaxonomyFilterNode,
+    TaxonomyFilterWriteNode,
     TaxonomyShowcaseAttachment,
+    TaxonomyShowcaseAttachmentWrite,
     TaxonomyShowcaseCategory,
+    TaxonomyShowcaseCategoryWrite,
     TaxonomyState,
+    TaxonomyWriteState,
 )
+from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
 
 
 class TaxonomyService:
@@ -247,6 +253,53 @@ class TaxonomyService:
             showcase_categories=prepared_showcase,
         )
 
+    def _coerce_write_payload(self, payload: TaxonomyWriteState) -> TaxonomyState:
+        def rewrite_nodes(nodes: list[TaxonomyFilterWriteNode]) -> list[TaxonomyFilterNode]:
+            return [
+                TaxonomyFilterNode(
+                    slug=(str(node.ref_slug).strip() or None),
+                    title=node.title,
+                    display_title=node.display_title,
+                    node_kind=node.node_kind,
+                    is_enabled=node.is_enabled,
+                    local_category_keywords=node.local_category_keywords,
+                    title_keywords=node.title_keywords,
+                    manual_product_ids=node.manual_product_ids,
+                    children=rewrite_nodes(node.children),
+                )
+                for node in nodes
+            ]
+
+        return TaxonomyState(
+            filters=rewrite_nodes(payload.filters),
+            custom_catalogs=[
+                TaxonomyCustomCatalog(
+                    slug=(str(catalog.ref_slug).strip() or None),
+                    title=catalog.title,
+                    description=catalog.description,
+                    is_enabled=catalog.is_enabled,
+                    product_ids=catalog.product_ids,
+                )
+                for catalog in payload.custom_catalogs
+            ],
+            showcase_categories=[
+                TaxonomyShowcaseCategory(
+                    code=category.code,
+                    title=category.title,
+                    attachments=[
+                        TaxonomyShowcaseAttachment(
+                            kind=attachment.kind,
+                            filter_slug=attachment.filter_slug,
+                            custom_catalog_slug=attachment.custom_catalog_slug,
+                            hidden_filter_slugs=attachment.hidden_filter_slugs,
+                        )
+                        for attachment in category.attachments
+                    ],
+                )
+                for category in payload.showcase_categories
+            ],
+        )
+
     def _validate_state(self, payload: TaxonomyState) -> tuple[dict[str, TaxonomyFilterNode], dict[str, TaxonomyCustomCatalog]]:
         filters_by_slug: dict[str, TaxonomyFilterNode] = {}
         filter_child_parent_by_slug: dict[str, str | None] = {}
@@ -421,6 +474,7 @@ class TaxonomyService:
                         for hidden_slug in self._clean_text_list(attachment.hidden_filter_slugs)
                     )
 
+            ProductFilterAssignmentService(self.db).request_full_rebuild()
             self.db.commit()
         except HTTPException:
             self.db.rollback()
@@ -429,3 +483,6 @@ class TaxonomyService:
             self.db.rollback()
             raise
         return self.get_state()
+
+    def replace_state_from_write(self, payload: TaxonomyWriteState) -> TaxonomyState:
+        return self.replace_state(self._coerce_write_payload(payload))

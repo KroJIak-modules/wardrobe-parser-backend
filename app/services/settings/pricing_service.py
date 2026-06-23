@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 import math
 from typing import Any
@@ -16,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings as app_settings
 from app.models import AdminUiSettings, Supplier
 from app.repositories import CatalogPricingSettingsRepository, CatalogSourceRepository, CatalogSupplierRepository
-from app.schemas.parser import (
+from app.schemas.admin_settings import (
     AdminUiSettingsResponse,
     AdminUiSettingsUpdateRequest,
     PricingSettingsResponse,
@@ -33,23 +34,21 @@ _FORMULA_LINES = [
     "SPR = SPU * BFX",
     "BUY = SPR * PRM + BSC",
     "PFR = BUY * PFRP",
-    "INS = insurance tier by SPE",
     "CDR = ((max(0, SPE - THR) * DUT) * (1 + CPR)) * (E2U * BFX) + CFX",
-    "SVC = configurable surcharge by BUY (fixed RUB or percent)",
-    "SUB = BUY + PFR + INS + CDR + SSR[SUP,RNG]",
-    "SUBM = SUB * (1 + MUP) + SVC",
+    "SUB = BUY + PFR + CDR + SSR[SUP,RNG]",
+    "SUBM = SUB * MUP",
     "TAX = SUBM * TXR",
     "FPR = round(SUBM + TAX, RND)",
 ]
 
 _FORMULA_LATEX = (
-    r"\operatorname{round}_{RND}\!\left(\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,RNG]\right)\cdot(1+MUP)+SVC\right)+\left(\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+INS+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,RNG]\right)\cdot(1+MUP)+SVC\right)\cdot TXR\right)\right)"
+    r"\operatorname{round}_{RND}\!\left(\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,RNG]\right)\cdot MUP\right)+\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,RNG]\right)\cdot MUP\cdot TXR\right)\right)"
 )
 
 _FORMULA_LEGEND = [
     {"key": "SP", "description": "Цена товара в исходной валюте магазина."},
     {"key": "SPU", "description": "Цена товара в USD."},
-    {"key": "SPE", "description": "Цена товара в EUR (для таможни и страхования)."},
+    {"key": "SPE", "description": "Цена товара в EUR для таможенного расчета."},
     {"key": "SPR", "description": "Цена товара в RUB по курсу Bybit."},
     {"key": "BBR", "description": "Курс первого адекватного Bybit-ордера (единый для всех товаров, USDT/RUB)."},
     {"key": "BEX", "description": "Надбавка к курсу Bybit."},
@@ -70,26 +69,17 @@ _FORMULA_LEGEND = [
     {"key": "SSR", "description": "Доставка поставщика."},
     {"key": "SUP", "description": "Поставщик."},
     {"key": "RNG", "description": "Весовой диапазон тарифа доставки."},
-    {"key": "INS", "description": "Страховка в RUB."},
-    {"key": "SVC", "description": "Пользовательская надбавка сервиса в RUB (фикс или % от BUY)."},
-    {"key": "SUB", "description": "База до наценки и SVC: BUY + PFR + INS + CDR + SSR."},
-    {"key": "SUBM", "description": "Сумма до налога: SUB * (1 + MUP) + SVC."},
+    {"key": "SUB", "description": "База до наценки: BUY + PFR + CDR + SSR."},
+    {"key": "SUBM", "description": "Сумма до налога: SUB * MUP."},
     {"key": "TXR", "description": "Ставка налога."},
     {"key": "TAX", "description": "Налог в RUB."},
-    {"key": "MUP", "description": "Наценка (доля к SUB, например 0.25 = +25%)."},
+    {"key": "MUP", "description": "Множитель наценки для SUB."},
     {"key": "RND", "description": "Режим округления финальной цены."},
     {"key": "FPR", "description": "Финальная цена в RUB."},
 ]
 
-_DEFAULT_INSURANCE_RULES: list[dict[str, Any]] = [
-    {"min_eur": 0.0, "max_eur": 300.0, "mode": "percent", "value": 0.01},
-    {"min_eur": 300.0, "max_eur": 520.0, "mode": "fixed_rub", "value": 1000.0},
-    {"min_eur": 520.0, "max_eur": None, "mode": "fixed_rub", "value": 1300.0},
-]
-
 _DEFAULT_GBP_TO_USD_RATE = 1.27
 _DEFAULT_JPY_TO_USD_RATE = 0.0065
-_DEFAULT_SHIPPING_ALT_THRESHOLD_EUR = 300.0
 
 @dataclass(slots=True)
 class ProductPricingComputation:
@@ -231,49 +221,6 @@ class PricingSettingsService:
             usd_to_rub_rate=float(settings.usd_to_rub_rate),
             eur_to_rub_rate=float(settings.eur_to_rub_rate),
         )
-
-    @staticmethod
-    def _normalize_rule_mode(raw_mode: str | None, *, default: str = "fixed_rub") -> str:
-        mode = (raw_mode or default).strip().lower()
-        if mode not in {"fixed_rub", "percent"}:
-            return default
-        return mode
-
-    @staticmethod
-    def _normalize_range_rules(
-        raw_rules: Any,
-        *,
-        min_key: str,
-        max_key: str,
-        default_rules: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        if not isinstance(raw_rules, list):
-            raw_rules = default_rules
-        normalized: list[dict[str, Any]] = []
-        for row in raw_rules:
-            if not isinstance(row, dict):
-                continue
-            min_raw = PricingSettingsService._safe_float(row.get(min_key))
-            max_raw = PricingSettingsService._safe_float(row.get(max_key))
-            mode = PricingSettingsService._normalize_rule_mode(str(row.get("mode") or "fixed_rub"))
-            value = max(0.0, float(PricingSettingsService._safe_float(row.get("value")) or 0.0))
-            normalized.append(
-                {
-                    min_key: min_raw if min_raw is None else float(min_raw),
-                    max_key: max_raw if max_raw is None else float(max_raw),
-                    "mode": mode,
-                    "value": value,
-                }
-            )
-        if not normalized:
-            return [dict(item) for item in default_rules]
-        normalized.sort(
-            key=lambda item: (
-                float(item.get(min_key) or 0.0),
-                float(item.get(max_key) or float("inf")) if item.get(max_key) is not None else float("inf"),
-            )
-        )
-        return normalized
 
     @staticmethod
     def _normalize_shipping_rows(rows: Any) -> list[dict[str, Any]]:
@@ -560,7 +507,7 @@ class PricingSettingsService:
             self.db.refresh(entity)
         return AdminUiSettingsResponse(
             designers_min_products=max(1, int(getattr(entity, "designers_min_products", 1) or 1)),
-            designers_exclude_store_vendors=bool(getattr(entity, "designers_exclude_store_vendors", False)),
+            designers_exclude_store_names=bool(getattr(entity, "designers_exclude_store_names", False)),
             auto_sync_period_minutes=max(60, int(getattr(entity, "auto_sync_period_minutes", 60) or 60)),
             auto_sync_next_run_at=(
                 getattr(entity, "auto_sync_next_run_at", None).isoformat()
@@ -586,8 +533,8 @@ class PricingSettingsService:
         reset_sync_timer = "auto_sync_period_minutes" in patch
         if "designers_min_products" in patch:
             patch["designers_min_products"] = max(1, int(patch.get("designers_min_products") or 1))
-        if "designers_exclude_store_vendors" in patch:
-            patch["designers_exclude_store_vendors"] = bool(patch.get("designers_exclude_store_vendors"))
+        if "designers_exclude_store_names" in patch:
+            patch["designers_exclude_store_names"] = bool(patch.get("designers_exclude_store_names"))
         if "auto_sync_period_minutes" in patch:
             patch["auto_sync_period_minutes"] = max(60, int(patch.get("auto_sync_period_minutes") or 60))
         entity = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
@@ -752,7 +699,6 @@ class PricingSettingsService:
         *,
         supplier_id: int | None,
         billable_kg: float,
-        use_alt_rate: bool,
         settings: PricingSettingsResponse,
     ) -> tuple[float, dict[str, Any]]:
         suppliers = settings.suppliers or []
@@ -762,25 +708,12 @@ class PricingSettingsService:
                 "supplier_id": supplier_id,
                 "supplier_key": None,
                 "supplier_name": None,
-                "shipping_mode": "normal",
+                "shipping_mode": "selected_supplier",
                 "shipping_billable_kg": round(float(billable_kg), 4),
                 "shipping_rate_mode": "missing_supplier",
             }
 
-        mode = "alt" if use_alt_rate else "normal"
-        selected_candidate = selected
-        candidates = [selected]
-        if use_alt_rate and getattr(selected, "parent_supplier_id", None) is None:
-            alternatives = [
-                item
-                for item in suppliers
-                if getattr(item, "parent_supplier_id", None) == int(selected.id)
-            ]
-            alternatives.sort(key=lambda item: int(item.id))
-            candidates = alternatives if alternatives else [selected]
-
-        selected_candidate = candidates[0] if candidates else selected
-        tariff_rows = selected_candidate.rates or []
+        tariff_rows = selected.rates or []
         normalized_tariff_rows = PricingSettingsService._normalize_shipping_rows(tariff_rows)
         value, meta = PricingSettingsService._resolve_tariff_by_weight(
             rows=normalized_tariff_rows,
@@ -788,10 +721,10 @@ class PricingSettingsService:
         )
 
         return float(value or 0.0), {
-            "supplier_id": selected_candidate.id,
-            "supplier_key": selected_candidate.key,
-            "supplier_name": selected_candidate.name,
-            "shipping_mode": mode,
+            "supplier_id": selected.id,
+            "supplier_key": selected.key,
+            "supplier_name": selected.name,
+            "shipping_mode": "selected_supplier",
             "shipping_billable_kg": round(float(billable_kg), 4),
             **meta,
         }
@@ -840,42 +773,10 @@ class PricingSettingsService:
         }
 
     @staticmethod
-    def _pick_range_rule(
-        *,
-        value: float,
-        rules: list[dict[str, Any]],
-        min_key: str,
-        max_key: str,
-    ) -> dict[str, Any] | None:
-        target = float(value)
-        for row in rules:
-            if not isinstance(row, dict):
-                continue
-            min_raw = PricingSettingsService._safe_float(row.get(min_key))
-            max_raw = PricingSettingsService._safe_float(row.get(max_key))
-            min_ok = True if min_raw is None else target >= float(min_raw)
-            max_ok = True if max_raw is None else target <= float(max_raw)
-            if min_ok and max_ok:
-                return row
-        return None
-
-    @staticmethod
-    def _compute_rule_amount(base_value: float, rule: dict[str, Any] | None) -> tuple[float, dict[str, Any]]:
-        if not isinstance(rule, dict):
-            return 0.0, {"mode": "missing_rule", "value": 0.0}
-        mode = PricingSettingsService._normalize_rule_mode(str(rule.get("mode") or "fixed_rub"))
-        value = max(0.0, float(PricingSettingsService._safe_float(rule.get("value")) or 0.0))
-        if mode == "percent":
-            amount = float(base_value) * value
-        else:
-            amount = value
-        return max(0.0, float(amount)), {"mode": mode, "value": value}
-
-    @staticmethod
     def _safe_float(value: Any) -> float | None:
         if value is None:
             return None
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float, Decimal)):
             return float(value)
         if isinstance(value, str):
             stripped = value.strip().replace(",", ".")
@@ -1160,13 +1061,7 @@ class PricingSettingsService:
 
         payment_fee_rub = buyout_rub * max(0.0, float(settings.payment_fee_rate))
 
-        insurance_rule = PricingSettingsService._pick_range_rule(
-            value=sp_after_promo_eur,
-            rules=[dict(item) for item in _DEFAULT_INSURANCE_RULES],
-            min_key="min_eur",
-            max_key="max_eur",
-        )
-        insurance_rub, insurance_meta = PricingSettingsService._compute_rule_amount(sp_after_promo_rub, insurance_rule)
+        insurance_rub = 0.0
 
         customs_excess_eur = max(0.0, sp_after_promo_eur - float(settings.customs_threshold_eur))
         customs_duty_eur = customs_excess_eur * max(0.0, float(settings.customs_duty_rate))
@@ -1175,11 +1070,9 @@ class PricingSettingsService:
         customs_fixed_rub = max(0.0, float(settings.customs_fixed_rub)) if customs_duty_eur > 0 else 0.0
         customs_rub = customs_base_rub + customs_fixed_rub
 
-        use_alt_shipping = sp_after_promo_eur > _DEFAULT_SHIPPING_ALT_THRESHOLD_EUR
         supplier_shipping_rub, supplier_meta = PricingSettingsService._resolve_supplier_rate(
             supplier_id=supplier_id,
             billable_kg=billable_kg,
-            use_alt_rate=use_alt_shipping,
             settings=settings,
         )
         shipping_rate_mode = str(supplier_meta.get("shipping_rate_mode") or "").strip().lower()
@@ -1202,16 +1095,10 @@ class PricingSettingsService:
             )
         delivery_rub = supplier_shipping_rub
 
-        svc_rule = PricingSettingsService._pick_range_rule(
-            value=buyout_rub,
-            rules=[],
-            min_key="min_rub",
-            max_key="max_rub",
-        )
-        service_fee_rub, service_fee_meta = PricingSettingsService._compute_rule_amount(buyout_rub, svc_rule)
+        service_fee_rub = 0.0
         subtotal_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub
         markup_multiplier = max(0.0, float(settings.markup_multiplier))
-        subtotal_after_markup_rub = (subtotal_rub * markup_multiplier) + service_fee_rub
+        subtotal_after_markup_rub = subtotal_rub * markup_multiplier
         tax_rub = subtotal_after_markup_rub * max(0.0, float(settings.tax_rate))
         pass_through_costs_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub
         margin_rub = subtotal_after_markup_rub - pass_through_costs_rub
@@ -1246,8 +1133,8 @@ class PricingSettingsService:
                 "payment_fee_rate": round(float(settings.payment_fee_rate), 6),
                 "payment_fee_rub": round(payment_fee_rub, 4),
                 "insurance_rub": round(insurance_rub, 4),
-                "insurance_mode": insurance_meta.get("mode"),
-                "insurance_value": insurance_meta.get("value"),
+                "insurance_mode": "not_used",
+                "insurance_value": 0.0,
                 "customs_threshold_eur": round(settings.customs_threshold_eur, 4),
                 "customs_duty_rate": round(settings.customs_duty_rate, 6),
                 "customs_processing_rate": round(float(settings.customs_processing_rate), 6),
@@ -1265,8 +1152,8 @@ class PricingSettingsService:
                 "shipping_rule_max_kg": supplier_meta.get("shipping_tariff_max_kg"),
                 "shipping_rule_label": supplier_meta.get("shipping_tariff_label"),
                 "service_fee_rub": round(service_fee_rub, 4),
-                "service_fee_mode": service_fee_meta.get("mode"),
-                "service_fee_value": service_fee_meta.get("value"),
+                "service_fee_mode": "not_used",
+                "service_fee_value": 0.0,
                 "tax_rate": round(float(settings.tax_rate), 6),
                 "tax_rub": round(tax_rub, 4),
                 "subtotal_rub": round(subtotal_rub, 4),

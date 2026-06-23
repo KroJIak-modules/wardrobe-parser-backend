@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.schemas.parser import (
+from app.schemas.admin_settings import (
     AdminUiSettingsResponse,
     AdminUiSettingsUpdateRequest,
     PricingSettingsResponse,

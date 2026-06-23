@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session, joinedload
 
-from app.core.source_identity import normalize_host
+from app.core.source_identity import normalize_base_url, normalize_host
 from app.models import Source, SourceSetting, SourceSyncState
 
 
@@ -37,8 +37,25 @@ class CatalogSourceRepository:
             .one_or_none()
         )
 
+    def get_by_base_url_normalized(self, base_url_normalized: str) -> Source | None:
+        normalized = str(base_url_normalized or "").strip().lower()
+        if not normalized:
+            return None
+        return (
+            self.session.query(Source)
+            .options(joinedload(Source.setting), joinedload(Source.sync_state))
+            .filter(Source.base_url_normalized == normalized)
+            .one_or_none()
+        )
+
     def create(self, *, key: str, name: str, base_url: str) -> Source:
-        entity = Source(key=key, name=name, base_url=base_url, host_normalized=normalize_host(base_url))
+        entity = Source(
+            key=key,
+            name=name,
+            base_url=base_url,
+            base_url_normalized=normalize_base_url(base_url),
+            host_normalized=normalize_host(base_url),
+        )
         self.session.add(entity)
         self.session.flush()
         return entity

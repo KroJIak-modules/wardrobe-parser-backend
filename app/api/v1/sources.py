@@ -4,9 +4,6 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-import requests
-
-from app.core.config import settings
 from app.core.database import get_db
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models import Product, ProductListing, ProductListingMember, Source
@@ -25,6 +22,10 @@ class SyncEnabledPatch(BaseModel):
     sync_enabled: bool
 
 
+class DedupEnabledPatch(BaseModel):
+    dedup_enabled: bool
+
+
 class AutoHidePatch(BaseModel):
     hide_auto_added_products: bool
 
@@ -36,72 +37,70 @@ class AttributeVisibilityPatch(BaseModel):
 
 class SupplierPatch(BaseModel):
     supplier_id: int | None = None
+    promo_factor: float | None = None
+    promo_only_no_discount: bool | None = None
+    buyout_surcharge_value: float | None = None
+    buyout_surcharge_currency: str | None = None
 
 
-def _service_sources_payload() -> dict[str, dict]:
-    try:
-        response = requests.get(f"{settings.service_base_url.rstrip('/')}/api/v1/sync/sources", timeout=(3, 20))
-        response.raise_for_status()
-        payload = response.json()
-    except Exception:
-        payload = []
-    items = payload if isinstance(payload, list) else []
-    return {
-        str(item.get("key") or "").strip().lower(): item
-        for item in items
-        if isinstance(item, dict) and str(item.get("key") or "").strip()
-    }
+def _normalize_source_sync_status(raw: object) -> str | None:
+    value = str(raw or "").strip().lower()
+    if value in {"success", "partial", "failed"}:
+        return value
+    if value == "completed":
+        return "success"
+    return None
 
 
-def _source_payload(db: Session, source: Source, service_item: dict | None) -> dict:
-    products_count = (
-        db.query(func.count(func.distinct(Product.id)))
+def _source_counts_by_id(db: Session) -> dict[int, dict[str, int]]:
+    rows = (
+        db.query(
+            ProductListing.source_id.label("source_id"),
+            ProductListing.ingest_mode.label("ingest_mode"),
+            func.count(func.distinct(Product.id)).label("product_count"),
+        )
         .join(ProductListingMember, ProductListingMember.product_id == Product.id)
         .join(ProductListing, ProductListing.id == ProductListingMember.listing_id)
         .filter(Product.lifecycle_status != "merged")
-        .filter(ProductListing.source_id == int(source.id))
-        .scalar()
-        or 0
+        .group_by(ProductListing.source_id, ProductListing.ingest_mode)
+        .all()
     )
-    bound_sync_products_count = (
-        db.query(func.count(func.distinct(Product.id)))
-        .join(ProductListingMember, ProductListingMember.product_id == Product.id)
-        .join(ProductListing, ProductListing.id == ProductListingMember.listing_id)
-        .filter(Product.lifecycle_status != "merged")
-        .filter(ProductListing.source_id == int(source.id))
-        .filter(ProductListing.ingest_mode == "sync")
-        .scalar()
-        or 0
-    )
-    manual_products_count = (
-        db.query(func.count(func.distinct(Product.id)))
-        .join(ProductListingMember, ProductListingMember.product_id == Product.id)
-        .join(ProductListing, ProductListing.id == ProductListingMember.listing_id)
-        .filter(Product.lifecycle_status != "merged")
-        .filter(ProductListing.source_id == int(source.id))
-        .filter(ProductListing.ingest_mode == "manual")
-        .scalar()
-        or 0
-    )
+    counts: dict[int, dict[str, int]] = {}
+    for source_id, ingest_mode, product_count in rows:
+        bucket = counts.setdefault(int(source_id), {"products_count": 0, "bound_sync_products_count": 0, "manual_products_count": 0})
+        count = int(product_count or 0)
+        bucket["products_count"] += count
+        if str(ingest_mode) == "sync":
+            bucket["bound_sync_products_count"] += count
+        if str(ingest_mode) == "manual":
+            bucket["manual_products_count"] += count
+    return counts
+
+
+def _source_payload(db: Session, source: Source, service_item: dict | None, counts_by_source_id: dict[int, dict[str, int]] | None = None) -> dict:
+    counts = (counts_by_source_id or {}).get(int(source.id), {})
     setting = source.setting
     sync_state = source.sync_state
     supplier = getattr(setting, "supplier", None) if setting is not None else None
+    mode = SourceRegistryService.derive_source_mode(str(source.key), service_item)
     return {
         "key": source.key,
         "source_id": int(source.id),
+        "mode": mode,
         "name": source.name,
         "base_url": source.base_url,
         "enabled": bool(getattr(setting, "is_enabled", True)),
         "sync_enabled": bool(getattr(setting, "is_sync_enabled", True)),
+        "dedup_enabled": bool(getattr(setting, "dedup_enabled", True)),
         "hide_auto_added_products": bool(getattr(setting, "hide_auto_added_products", False)),
         "description_mode": str(getattr(setting, "description_mode", "text") or "text"),
         "show_images": bool(getattr(setting, "show_images", True)),
-        "products_count": int(products_count),
-        "manual_products_count": int(manual_products_count),
-        "bound_sync_products_count": int(bound_sync_products_count),
+        "products_count": int(counts.get("products_count", 0)),
+        "manual_products_count": int(counts.get("manual_products_count", 0)),
+        "bound_sync_products_count": int(counts.get("bound_sync_products_count", 0)),
         "last_sync_at": sync_state.last_sync_at.isoformat() if getattr(sync_state, "last_sync_at", None) else None,
         "last_sync_duration_sec": getattr(sync_state, "last_sync_duration_sec", None),
-        "last_sync_status": getattr(sync_state, "last_sync_status", None),
+        "last_sync_status": _normalize_source_sync_status(getattr(sync_state, "last_sync_status", None)),
         "last_error_code": getattr(sync_state, "last_error_code", None),
         "last_error_message": getattr(sync_state, "last_error_message", None),
         "supplier_id": int(getattr(setting, "supplier_id", 0) or 0) or None,
@@ -126,11 +125,12 @@ def _source_payload(db: Session, source: Source, service_item: dict | None) -> d
 def list_sources(db: Session = Depends(get_db)) -> list[dict]:
     registry = SourceRegistryService(db)
     sources = registry.refresh_from_service()
-    service_items = _service_sources_payload()
+    db.commit()
+    service_items = SourceRegistryService.fetch_service_sources_payload()
+    counts_by_source_id = _source_counts_by_id(db)
     return [
-        _source_payload(db, source, service_items.get(source.key))
+        _source_payload(db, source, service_items.get(source.key), counts_by_source_id)
         for source in sources
-        if str(source.key) != SourceRegistryService.MANUAL_SOURCE_KEY
     ]
 
 
@@ -144,7 +144,7 @@ def patch_enabled(source_key: str, payload: EnabledPatch, db: Session = Depends(
     setting = repo.ensure_setting(entity)
     setting.is_enabled = bool(payload.enabled)
     db.commit()
-    return _source_payload(db, entity, _service_sources_payload().get(entity.key))
+    return _source_payload(db, entity, SourceRegistryService.fetch_service_sources_payload().get(entity.key), _source_counts_by_id(db))
 
 
 @router.patch("/sources/{source_key}/sync-enabled", dependencies=[Depends(require_permission("control.sources.edit"))])
@@ -157,7 +157,20 @@ def patch_sync_enabled(source_key: str, payload: SyncEnabledPatch, db: Session =
     setting = repo.ensure_setting(entity)
     setting.is_sync_enabled = bool(payload.sync_enabled)
     db.commit()
-    return _source_payload(db, entity, _service_sources_payload().get(entity.key))
+    return _source_payload(db, entity, SourceRegistryService.fetch_service_sources_payload().get(entity.key), _source_counts_by_id(db))
+
+
+@router.patch("/sources/{source_key}/dedup-enabled", dependencies=[Depends(require_permission("control.sources.edit"))])
+def patch_dedup_enabled(source_key: str, payload: DedupEnabledPatch, db: Session = Depends(get_db)) -> dict:
+    SourceRegistryService(db).refresh_from_service()
+    repo = SourceRegistryService(db).repo
+    entity = repo.get_by_key(source_key)
+    if entity is None:
+        raise NotFoundError("Источник не найден")
+    setting = repo.ensure_setting(entity)
+    setting.dedup_enabled = bool(payload.dedup_enabled)
+    db.commit()
+    return _source_payload(db, entity, SourceRegistryService.fetch_service_sources_payload().get(entity.key), _source_counts_by_id(db))
 
 
 @router.patch("/sources/{source_key}/hide-auto-added-products", dependencies=[Depends(require_permission("control.sources.edit"))])
@@ -170,7 +183,7 @@ def patch_hide_auto_added(source_key: str, payload: AutoHidePatch, db: Session =
     setting = repo.ensure_setting(entity)
     setting.hide_auto_added_products = bool(payload.hide_auto_added_products)
     db.commit()
-    return _source_payload(db, entity, _service_sources_payload().get(entity.key))
+    return _source_payload(db, entity, SourceRegistryService.fetch_service_sources_payload().get(entity.key), _source_counts_by_id(db))
 
 
 @router.patch("/sources/{source_key}/attribute-visibility", dependencies=[Depends(require_permission("control.sources.edit"))])
@@ -189,7 +202,7 @@ def patch_attribute_visibility(source_key: str, payload: AttributeVisibilityPatc
     if payload.show_images is not None:
         setting.show_images = bool(payload.show_images)
     db.commit()
-    return _source_payload(db, entity, _service_sources_payload().get(entity.key))
+    return _source_payload(db, entity, SourceRegistryService.fetch_service_sources_payload().get(entity.key), _source_counts_by_id(db))
 
 
 @router.patch("/sources/{source_key}/supplier", dependencies=[Depends(require_permission("control.pricing.edit"))])
@@ -200,7 +213,21 @@ def patch_source_supplier(source_key: str, payload: SupplierPatch, db: Session =
     if entity is None:
         raise NotFoundError("Источник не найден")
     setting = repo.ensure_setting(entity)
-    setting.supplier_id = int(payload.supplier_id) if payload.supplier_id is not None else None
+    if "supplier_id" in payload.model_fields_set:
+        setting.supplier_id = int(payload.supplier_id) if payload.supplier_id is not None else None
+    if "promo_factor" in payload.model_fields_set:
+        setting.promo_factor = float(payload.promo_factor) if payload.promo_factor is not None else 1.0
+    if "promo_only_no_discount" in payload.model_fields_set:
+        setting.promo_only_no_discount = bool(payload.promo_only_no_discount)
+    if "buyout_surcharge_value" in payload.model_fields_set:
+        setting.buyout_surcharge_value = (
+            float(payload.buyout_surcharge_value)
+            if payload.buyout_surcharge_value is not None
+            else None
+        )
+    if "buyout_surcharge_currency" in payload.model_fields_set:
+        value = str(payload.buyout_surcharge_currency or "").strip().upper() or None
+        setting.buyout_surcharge_currency = value
     db.commit()
     refreshed = repo.get_by_key(source_key)
-    return _source_payload(db, refreshed, _service_sources_payload().get(refreshed.key))
+    return _source_payload(db, refreshed, SourceRegistryService.fetch_service_sources_payload().get(refreshed.key), _source_counts_by_id(db))

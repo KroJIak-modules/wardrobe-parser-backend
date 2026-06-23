@@ -31,6 +31,7 @@ def start_sync_job(
         return SyncJobService(db).start_job(
             triggered_by_admin_user_id=context.user_id,
             source_keys=list(payload.sources or []),
+            trigger_kind="manual",
         )
     except ValueError as exc:
         raise ValidationError(str(exc)) from exc

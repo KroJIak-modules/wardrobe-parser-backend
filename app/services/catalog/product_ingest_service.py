@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-import re
 
 from sqlalchemy.orm import Session
 
@@ -11,6 +10,8 @@ from app.core.source_identity import normalize_host, normalize_listing_url
 from app.core.exceptions import ValidationError
 from app.models import Product, ProductListing, WeightRule, WeightRuleKeyword
 from app.repositories.catalog_products import CatalogProductRepository
+from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
+from app.services.settings.weight_rule_matcher import WeightRuleMatcherEntry, WeightRuleMatcherField, resolve_match_for_fields
 
 
 @dataclass(slots=True)
@@ -31,9 +32,9 @@ class ProductIngestService:
     @staticmethod
     def _normalize_orderability(status: str | None) -> str:
         value = str(status or "").strip().lower()
-        if value == "available":
+        if value == "orderable":
             return "orderable"
-        if value in {"out_of_stock", "sold_out"}:
+        if value == "sold_out":
             return "sold_out"
         return "unavailable"
 
@@ -46,31 +47,62 @@ class ProductIngestService:
         return candidate if candidate > 0 else None
 
     @staticmethod
+    def _normalized_optional_text(value: object) -> str | None:
+        text = str(value or "").strip()
+        return text or None
+
+    @classmethod
+    def _normalized_text_list(cls, value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        result: list[str] = []
+        seen: set[str] = set()
+        for raw_item in value:
+            item = cls._normalized_optional_text(raw_item)
+            if item is None or item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+        return result
+
+    @classmethod
+    def _prefer_existing_text(cls, incoming: object, existing: str | None) -> str | None:
+        incoming_text = cls._normalized_optional_text(incoming)
+        if incoming_text is not None:
+            return incoming_text
+        return cls._normalized_optional_text(existing)
+
+    @classmethod
+    def _prefer_existing_text_list(cls, incoming: object, existing: object) -> list[str]:
+        incoming_items = cls._normalized_text_list(incoming)
+        if incoming_items:
+            return incoming_items
+        return cls._normalized_text_list(existing)
+
+    @classmethod
+    def _prefer_existing_positive_int(cls, incoming: object, existing: int | None) -> int | None:
+        incoming_value = cls._positive_int(incoming)
+        if incoming_value is not None:
+            return incoming_value
+        return cls._positive_int(existing)
+
+    @staticmethod
     def _normalize_gender(value: object) -> str:
         candidate = str(value or "").strip().lower()
         if candidate in {"male", "female", "unisex"}:
             return candidate
         return "unisex"
 
-    @staticmethod
-    def _match_count(text: str, keyword: str) -> int:
-        normalized_keyword = str(keyword or "").strip().lower()
-        if not normalized_keyword:
-            return 0
-        pattern = rf"(?<!\w){re.escape(normalized_keyword)}(?!\w)"
-        return 1 if re.search(pattern, text) else 0
-
     def _resolve_keyword_weight_rule(self, listing: ProductListing) -> tuple[int, int] | None:
-        haystack = " ".join(
-            [
-                str(listing.source_title or ""),
-                str(listing.source_description_text or ""),
-                str(listing.source_description_html or ""),
-                str(listing.source_designer_raw or ""),
-                str(listing.source_category_raw or ""),
-            ]
-        ).lower()
-        if not haystack.strip():
+        fields = [
+            WeightRuleMatcherField(name="title", text=listing.source_title, weight=8),
+            WeightRuleMatcherField(name="category", text=listing.source_category_raw, weight=7),
+            WeightRuleMatcherField(name="handle", text=listing.handle, weight=6),
+            WeightRuleMatcherField(name="designer", text=listing.source_designer_raw, weight=2),
+            WeightRuleMatcherField(name="description_text", text=listing.source_description_text, weight=1),
+            WeightRuleMatcherField(name="description_html", text=listing.source_description_html, weight=1),
+        ]
+        if not any(str(field.text or "").strip() for field in fields):
             return None
 
         rules = (
@@ -79,27 +111,28 @@ class ProductIngestService:
             .order_by(WeightRule.id.asc())
             .all()
         )
-
-        best_rule_id: int | None = None
-        best_weight_grams: int | None = None
-        best_hits = 0
-        for rule in rules:
-            keywords = (
-                self.db.query(WeightRuleKeyword)
-                .filter(WeightRuleKeyword.rule_id == int(rule.id))
-                .order_by(WeightRuleKeyword.id.asc())
-                .all()
-            )
-            hits = sum(self._match_count(haystack, str(keyword.keyword or "")) for keyword in keywords)
-            if hits <= 0:
-                continue
-            if hits > best_hits or (hits == best_hits and best_rule_id is not None and int(rule.id) < best_rule_id):
-                best_hits = hits
-                best_rule_id = int(rule.id)
-                best_weight_grams = int(rule.weight_grams)
-        if best_rule_id is None or best_weight_grams is None:
+        match = resolve_match_for_fields(
+            rules=[
+                WeightRuleMatcherEntry(
+                    rule_id=int(rule.id),
+                    weight_grams=int(rule.weight_grams),
+                    keywords=[
+                        str(keyword.keyword or "")
+                        for keyword in (
+                            self.db.query(WeightRuleKeyword)
+                            .filter(WeightRuleKeyword.rule_id == int(rule.id))
+                            .order_by(WeightRuleKeyword.id.asc())
+                            .all()
+                        )
+                    ],
+                )
+                for rule in rules
+            ],
+            fields=fields,
+        )
+        if match.rule_id is None or match.weight_grams is None:
             return None
-        return best_rule_id, best_weight_grams
+        return int(match.rule_id), int(match.weight_grams)
 
     def _resolve_listing_status(
         self,
@@ -114,7 +147,8 @@ class ProductIngestService:
         if incoming_reason and incoming_reason not in reasons:
             reasons.append(incoming_reason)
 
-        source_weight = self._positive_int(listing.source_weight_grams)
+        effective_listing = product.primary_listing or listing
+        source_weight = self._positive_int(effective_listing.source_weight_grams)
         manual_weight = self._positive_int(product.manual_weight_grams)
         if manual_weight is not None:
             product.weight_rule_id = None
@@ -123,7 +157,7 @@ class ProductIngestService:
             product.weight_rule_id = None
             reasons = [reason for reason in reasons if reason != "missing_weight"]
         else:
-            keyword_rule = self._resolve_keyword_weight_rule(listing)
+            keyword_rule = self._resolve_keyword_weight_rule(effective_listing)
             if keyword_rule is not None:
                 product.weight_rule_id = int(keyword_rule[0])
                 reasons = [reason for reason in reasons if reason != "missing_weight"]
@@ -171,23 +205,32 @@ class ProductIngestService:
             if not isinstance(variant, dict):
                 continue
             source_ref = variant.get("source_ref") if isinstance(variant.get("source_ref"), dict) else {}
+            raw_price = variant.get("price")
+            if raw_price is None or str(raw_price).strip() == "":
+                raw_price = variant.get("price_amount")
+            raw_compare_at_price = variant.get("compare_at_price")
+            if raw_compare_at_price is None or str(raw_compare_at_price).strip() == "":
+                raw_compare_at_price = variant.get("compare_at_price_amount")
+            raw_currency = variant.get("currency")
+            if raw_currency is None or str(raw_currency).strip() == "":
+                raw_currency = variant.get("currency_code")
             variants.append(
                 {
                     "source_ref_id": str(source_ref.get("id") or "").strip() or None,
                     "sku": str(source_ref.get("sku") or variant.get("sku") or "").strip() or None,
                     "title": str(variant.get("title") or "").strip() or "Default",
                     "price_amount": (
-                        Decimal(str(variant.get("price")))
-                        if variant.get("price") is not None and str(variant.get("price")).strip() != ""
+                        Decimal(str(raw_price))
+                        if raw_price is not None and str(raw_price).strip() != ""
                         else None
                     ),
                     "compare_at_price_amount": (
-                        Decimal(str(variant.get("compare_at_price")))
-                        if variant.get("compare_at_price") is not None and str(variant.get("compare_at_price")).strip() != ""
+                        Decimal(str(raw_compare_at_price))
+                        if raw_compare_at_price is not None and str(raw_compare_at_price).strip() != ""
                         else None
                     ),
-                    "currency_code": str(variant.get("currency") or "").strip().upper() or None,
-                    "is_orderable": bool(variant.get("available", True)),
+                    "currency_code": str(raw_currency or "").strip().upper() or None,
+                    "is_orderable": bool(variant.get("available", variant.get("is_orderable", True))),
                 }
             )
         return variants
@@ -216,6 +259,7 @@ class ProductIngestService:
     ) -> BatchApplyResult:
         result = BatchApplyResult(listings_seen=0, listings_applied=0)
         seen_listing_ids: set[int] = set()
+        affected_product_ids: set[int] = set()
 
         for item in items:
             if not isinstance(item, dict):
@@ -237,13 +281,14 @@ class ProductIngestService:
                     url=url,
                     url_normalized=normalize_listing_url(url),
                     host_normalized=normalize_host(url),
-                    handle=str(item.get("handle") or "").strip() or None,
+                    handle=self._normalized_optional_text(item.get("handle")),
                     source_title=str(item.get("title") or "").strip() or url,
-                    source_description_html=str(item.get("description_html") or "").strip() or None,
-                    source_description_text=str(item.get("description") or "").strip() or None,
+                    source_description_html=self._normalized_optional_text(item.get("description_html")),
+                    source_description_text=self._normalized_optional_text(item.get("description")),
                     source_weight_grams=self._positive_int(item.get("source_weight_grams")),
-                    source_designer_raw=str(item.get("designer") or "").strip() or None,
-                    source_category_raw=str(item.get("category") or "").strip() or None,
+                    source_designer_raw=self._normalized_optional_text(item.get("designer")),
+                    source_category_raw=self._normalized_optional_text(item.get("category")),
+                    source_tags=self._normalized_text_list(item.get("tags")),
                     ingest_mode="sync",
                     last_seen_at=self._utcnow(),
                     last_synced_at=self._utcnow(),
@@ -253,16 +298,19 @@ class ProductIngestService:
                 listing.url = url
                 listing.url_normalized = normalize_listing_url(url)
                 listing.host_normalized = normalize_host(url)
-                listing.handle = str(item.get("handle") or "").strip() or None
+                listing.handle = self._normalized_optional_text(item.get("handle"))
                 listing.source_title = str(item.get("title") or "").strip() or url
-                listing.source_description_html = str(item.get("description_html") or "").strip() or None
-                listing.source_description_text = str(item.get("description") or "").strip() or None
-                listing.source_weight_grams = self._positive_int(item.get("source_weight_grams"))
-                listing.source_designer_raw = str(item.get("designer") or "").strip() or None
-                listing.source_category_raw = str(item.get("category") or "").strip() or None
+                listing.source_description_html = self._normalized_optional_text(item.get("description_html"))
+                listing.source_description_text = self._normalized_optional_text(item.get("description"))
+                # Optional source metadata must not degrade to blank because one parser pass missed it.
+                listing.source_weight_grams = self._prefer_existing_positive_int(item.get("source_weight_grams"), listing.source_weight_grams)
+                listing.source_designer_raw = self._prefer_existing_text(item.get("designer"), listing.source_designer_raw)
+                listing.source_category_raw = self._prefer_existing_text(item.get("category"), listing.source_category_raw)
+                listing.source_tags = self._prefer_existing_text_list(item.get("tags"), listing.source_tags)
                 listing.last_seen_at = self._utcnow()
                 listing.last_synced_at = self._utcnow()
 
+            previous_owner = self.products.get_product_by_listing(int(listing.id))
             product = self._resolve_product(listing_id=int(listing.id), target_product_id=target_product_id)
             if product is None:
                 source_setting = getattr(getattr(listing, "source", None), "setting", None)
@@ -277,8 +325,11 @@ class ProductIngestService:
                 product.primary_listing_id = int(listing.id)
             elif target_product_id is not None and force_primary_listing:
                 product.primary_listing_id = int(listing.id)
+            if previous_owner is not None:
+                affected_product_ids.add(int(previous_owner.id))
+            affected_product_ids.add(int(product.id))
 
-            incoming_status = self._normalize_orderability(str(item.get("status") or "unavailable"))
+            incoming_status = self._normalize_orderability(str(item.get("orderability_status") or "unavailable"))
             incoming_reason = str(item.get("status_reason") or "").strip() or None
             incoming_reasons = self._normalize_status_reasons(item)
             listing.orderability_status, listing.status_reason = self._resolve_listing_status(
@@ -292,7 +343,7 @@ class ProductIngestService:
             variants = self._variant_payloads(item)
             self.products.replace_variants(listing_id=int(listing.id), variants=variants)
             listing_images = self.products.replace_listing_images(listing_id=int(listing.id), image_urls=self._image_urls(item))
-            self.products.replace_gallery_scope_with_source_images(
+            self.products.sync_gallery_scope_with_source_images(
                 product_id=int(product.id),
                 listing_id=int(listing.id),
                 listing_images=listing_images,
@@ -314,6 +365,7 @@ class ProductIngestService:
                 product = self.products.get_product_by_listing(int(listing.id))
                 if product is None or int(product.primary_listing_id or 0) != int(listing.id):
                     continue
+                affected_product_ids.add(int(product.id))
                 siblings = [
                     member_listing
                     for member_listing in self.products.list_product_listings(int(product.id))
@@ -323,4 +375,5 @@ class ProductIngestService:
                     product.primary_listing_id = int(siblings[0].id)
 
         self.db.flush()
+        ProductFilterAssignmentService(self.db).enqueue_product_ids_after_commit(affected_product_ids)
         return result

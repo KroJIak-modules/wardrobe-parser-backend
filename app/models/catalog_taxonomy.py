@@ -36,6 +36,10 @@ class Filter(Base):
     manual_products = relationship("FilterManualProduct", back_populates="filter", cascade="all, delete-orphan")
     showcase_attachments = relationship("ShowcaseCategoryAttachment", back_populates="filter")
 
+    __table_args__ = (
+        CheckConstraint("node_kind IN ('filter', 'multifilter')", name="ck_filters_node_kind"),
+    )
+
 
 class FilterNode(Base):
     __tablename__ = "filter_nodes"

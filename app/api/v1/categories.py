@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.schemas.taxonomy import TaxonomyState
+from app.schemas.taxonomy import TaxonomyState, TaxonomyWriteState
 from app.services.auth.admin_auth_service import require_permission
 from app.services.catalog.product_query_service import ProductQueryService
 from app.services.catalog.taxonomy_service import TaxonomyService
@@ -19,8 +19,8 @@ def get_taxonomy_state(db: Session = Depends(get_db)) -> TaxonomyState:
 
 
 @router.put("/state", response_model=TaxonomyState, dependencies=[Depends(require_permission("control.categories.edit"))])
-def replace_taxonomy_state(payload: TaxonomyState, db: Session = Depends(get_db)) -> TaxonomyState:
-    return TaxonomyService(db).replace_state(payload)
+def replace_taxonomy_state(payload: TaxonomyWriteState, db: Session = Depends(get_db)) -> TaxonomyState:
+    return TaxonomyService(db).replace_state_from_write(payload)
 
 
 @router.get("/products/search", dependencies=[Depends(require_permission("control.categories.read"))])

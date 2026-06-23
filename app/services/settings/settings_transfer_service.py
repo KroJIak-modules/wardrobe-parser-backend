@@ -28,9 +28,11 @@ from app.repositories import (
     CatalogSupplierRepository,
     CatalogWeightRuleRepository,
 )
+from app.services.catalog.designer_support import slugify_designer_name
 from app.services.catalog.source_registry_service import SourceRegistryService
+from app.core.source_identity import normalize_base_url
 from app.services.settings.pricing_service import PricingSettingsService
-from app.schemas.parser import (
+from app.schemas.admin_settings import (
     SettingsTransferAdminUiSettings,
     SettingsTransferDesignerSourceNameEntry,
     SettingsTransferPayload,
@@ -81,8 +83,7 @@ def _normalize_supplier_key(raw_key: str, fallback_name: str, index: int) -> str
 
 
 def _slugify_name(raw: str) -> str:
-    value = re.sub(r"[^a-z0-9]+", "-", str(raw or "").strip().lower())
-    return value.strip("-")[:255] or "designer"
+    return slugify_designer_name(raw)
 
 
 class SettingsTransferService:
@@ -134,7 +135,7 @@ class SettingsTransferService:
         ui_row = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
         admin_ui = SettingsTransferAdminUiSettings(
             designers_min_products=max(1, int(getattr(ui_row, "designers_min_products", 1) or 1)),
-            designers_exclude_store_vendors=bool(getattr(ui_row, "designers_exclude_store_vendors", False)),
+            designers_exclude_store_names=bool(getattr(ui_row, "designers_exclude_store_names", False)),
             auto_sync_period_minutes=max(60, int(getattr(ui_row, "auto_sync_period_minutes", 60) or 60)),
         )
 
@@ -181,6 +182,7 @@ class SettingsTransferService:
                     url=str(source.base_url),
                     enabled=bool(getattr(setting, "is_enabled", True)),
                     sync_enabled=bool(getattr(setting, "is_sync_enabled", True)),
+                    dedup_enabled=bool(getattr(setting, "dedup_enabled", True)),
                     hide_auto_added_products=bool(getattr(setting, "hide_auto_added_products", False)),
                     description_mode=str(getattr(setting, "description_mode", "text") or "text"),
                     show_images=bool(getattr(setting, "show_images", True)),
@@ -227,7 +229,7 @@ class SettingsTransferService:
             designer_source_names=[
                 SettingsTransferDesignerSourceNameEntry(
                     source_name=str(row.source_name),
-                    designer_name=(str(row.designer.name) if row.designer is not None else None),
+                    designer_name=(str(row.designer_name) if row.designer_name is not None else None),
                 )
                 for row in (
                     self.db.query(DesignerSourceName)
@@ -288,6 +290,7 @@ class SettingsTransferService:
             setting = self.source_repo.ensure_setting(source)
             setting.is_enabled = True
             setting.is_sync_enabled = True
+            setting.dedup_enabled = True
             setting.hide_auto_added_products = False
             setting.description_mode = "text"
             setting.show_images = True
@@ -356,7 +359,7 @@ class SettingsTransferService:
         values = payload.model_dump()
         normalized = {
             "designers_min_products": max(1, int(values.get("designers_min_products") or 1)),
-            "designers_exclude_store_vendors": bool(values.get("designers_exclude_store_vendors")),
+            "designers_exclude_store_names": bool(values.get("designers_exclude_store_names")),
             "auto_sync_period_minutes": max(60, int(values.get("auto_sync_period_minutes") or 60)),
         }
         for key, raw_value in normalized.items():
@@ -449,10 +452,12 @@ class SettingsTransferService:
             else:
                 existing.name = item.name
                 existing.base_url = item.url
+                existing.base_url_normalized = normalize_base_url(item.url)
                 existing.host_normalized = SourceRegistryService.normalize_source_key(item.url)
             setting = self.source_repo.ensure_setting(existing)
             setting.is_enabled = bool(item.enabled)
             setting.is_sync_enabled = bool(item.sync_enabled)
+            setting.dedup_enabled = bool(item.dedup_enabled)
             setting.hide_auto_added_products = bool(item.hide_auto_added_products)
             setting.description_mode = str(item.description_mode)
             setting.show_images = bool(item.show_images)
@@ -503,7 +508,7 @@ class SettingsTransferService:
         self.db.flush()
         inserted = 0
         designers_by_name = {
-            str(designer.name).strip().casefold(): designer
+            str(designer.name).strip(): designer
             for designer in self.db.query(Designer).order_by(Designer.id.asc()).all()
             if str(designer.name or "").strip()
         }
@@ -530,27 +535,34 @@ class SettingsTransferService:
             source_name = str(item.source_name or "").strip()
             if not source_name:
                 continue
-            normalized_source_name = source_name.casefold()
-            if normalized_source_name in seen_source_names:
+            if source_name in seen_source_names:
                 continue
-            seen_source_names.add(normalized_source_name)
+            seen_source_names.add(source_name)
 
             designer_id = None
             designer_name = str(item.designer_name or "").strip()
             if designer_name:
-                normalized_designer_name = designer_name.casefold()
-                designer = designers_by_name.get(normalized_designer_name)
+                designer = designers_by_name.get(designer_name)
                 if designer is None:
-                    designer = Designer(name=designer_name, slug=next_slug(designer_name), is_enabled=True)
+                    designer = Designer(
+                        name=designer_name,
+                        slug=next_slug(designer_name),
+                        origin_kind="manual",
+                        is_admin_touched=True,
+                        is_enabled=True,
+                    )
                     self.db.add(designer)
                     self.db.flush()
-                    designers_by_name[normalized_designer_name] = designer
+                    designers_by_name[designer_name] = designer
                 designer_id = int(designer.id)
 
             self.db.add(
                 DesignerSourceName(
                     source_name=source_name,
+                    designer_name=(designer_name or source_name),
                     designer_id=designer_id,
+                    is_enabled=True,
+                    is_admin_touched=True,
                 )
             )
             inserted += 1

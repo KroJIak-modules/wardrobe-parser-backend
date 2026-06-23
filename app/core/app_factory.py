@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import re
 from typing import Any
 
@@ -10,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from starlette import status
 
 from app.api.v1 import api_router
@@ -18,13 +17,15 @@ from app.api.v1.jobs import mark_interrupted_jobs_on_startup
 from app.core.database import SessionLocal
 from app.core.config import settings
 from app.core.exceptions import IntegrityError, NotFoundError, ValidationError
+from app.core.startup import run_db_bootstrap_with_retry
 from app.services.auth.admin_accounts_service import AdminAccountsService
+from app.services.catalog.catalog_defaults_service import CatalogDefaultsService
+from app.services.catalog.source_registry_service import SourceRegistryService
 
 
 HTTP_NOT_FOUND = status.HTTP_404_NOT_FOUND
 HTTP_BAD_REQUEST = status.HTTP_400_BAD_REQUEST
 HTTP_CONFLICT = status.HTTP_409_CONFLICT
-_DOCS_DIR = Path(__file__).resolve().parents[1] / "docs"
 _PUBLIC_OPENAPI_PATHS = {
     "/health",
     "/api/v1/products/{product_id}",
@@ -157,12 +158,18 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def _on_startup_sync_runtime() -> None:
-        db = SessionLocal()
-        try:
-            AdminAccountsService(db).ensure_superadmin_user()
-        finally:
-            db.close()
-        mark_interrupted_jobs_on_startup()
+        def _bootstrap() -> None:
+            db = SessionLocal()
+            try:
+                AdminAccountsService(db).ensure_superadmin_user()
+                SourceRegistryService(db).refresh_from_service()
+                CatalogDefaultsService(db).ensure()
+                mark_interrupted_jobs_on_startup()
+                db.commit()
+            finally:
+                db.close()
+
+        run_db_bootstrap_with_retry(_bootstrap, label="backend startup bootstrap")
 
     @app.get("/health", summary="Health check")
     def health() -> dict[str, str]:
@@ -186,32 +193,6 @@ def create_app() -> FastAPI:
         return get_redoc_html(
             openapi_url="/api/openapi/public.json",
             title="Wardrobe Public API - ReDoc",
-        )
-
-    @app.get("/api/openapi/showcase.json", include_in_schema=False)
-    def get_showcase_openapi_compat() -> dict[str, Any]:
-        return _build_public_openapi(app)
-
-    @app.get("/api/docs/showcase", include_in_schema=False)
-    def get_showcase_docs_compat():
-        return get_swagger_ui_html(
-            openapi_url="/api/openapi/public.json",
-            title="Wardrobe Public API - Swagger UI",
-        )
-
-    @app.get("/api/redoc/showcase", include_in_schema=False)
-    def get_showcase_redoc_compat():
-        return get_redoc_html(
-            openapi_url="/api/openapi/public.json",
-            title="Wardrobe Public API - ReDoc",
-        )
-
-    @app.get("/api/docs/public.md", include_in_schema=False)
-    def download_public_markdown() -> FileResponse:
-        return FileResponse(
-            _DOCS_DIR / "showcase-api.md",
-            media_type="text/markdown",
-            filename="public-api.md",
         )
 
     _register_exception_handlers(app)

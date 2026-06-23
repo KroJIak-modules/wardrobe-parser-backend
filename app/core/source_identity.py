@@ -17,6 +17,10 @@ def normalize_host(raw: str | None) -> str:
     return host
 
 
+def normalize_base_url(raw: str | None) -> str:
+    return normalize_host(raw)
+
+
 def normalize_listing_url(raw: str | None) -> str:
     value = str(raw or "").strip()
     if not value:
@@ -27,4 +31,3 @@ def normalize_listing_url(raw: str | None) -> str:
     if path != "/":
         path = path.rstrip("/") or "/"
     return f"{host}{path}" if host else path
-

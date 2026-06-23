@@ -4,7 +4,7 @@ import app.api.v1.auth as auth_module
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.schemas.parser import PricingSettingsResponse, PricingSupplierRateResponse, PricingSupplierResponse
+from app.schemas.admin_settings import PricingSettingsResponse, PricingSupplierRateResponse, PricingSupplierResponse
 from app.services.settings.pricing_service import PricingSettingsService
 
 
@@ -83,7 +83,6 @@ def test_resolve_supplier_rate_prefers_supplier_ranges_over_region_fallback() ->
     value, meta = PricingSettingsService._resolve_supplier_rate(
         supplier_id=1,
         billable_kg=0.4,
-        use_alt_rate=False,
         settings=settings,
     )
 
@@ -111,7 +110,6 @@ def test_resolve_supplier_rate_reports_missing_tariff_without_fallback() -> None
     value, meta = PricingSettingsService._resolve_supplier_rate(
         supplier_id=1,
         billable_kg=0.4,
-        use_alt_rate=False,
         settings=settings,
     )
 

@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     dedup_scan_limit: int = Field(default=2000, ge=10, le=100000, validation_alias="DEDUP_SCAN_LIMIT")
     dedup_score_threshold: float = Field(default=0.55, ge=0.0, le=1.0, validation_alias="DEDUP_SCORE_THRESHOLD")
     dedup_title_match_weight: float = Field(default=0.55, ge=0.0, le=1.0, validation_alias="DEDUP_TITLE_MATCH_WEIGHT")
-    dedup_vendor_match_weight: float = Field(default=0.25, ge=0.0, le=1.0, validation_alias="DEDUP_VENDOR_MATCH_WEIGHT")
+    dedup_designer_match_weight: float = Field(default=0.25, ge=0.0, le=1.0, validation_alias="DEDUP_DESIGNER_MATCH_WEIGHT")
     dedup_price_close_weight: float = Field(default=0.15, ge=0.0, le=1.0, validation_alias="DEDUP_PRICE_CLOSE_WEIGHT")
     dedup_handle_match_weight: float = Field(default=0.2, ge=0.0, le=1.0, validation_alias="DEDUP_HANDLE_MATCH_WEIGHT")
     dedup_price_diff_ratio_limit: float = Field(default=0.08, ge=0.0, le=1.0, validation_alias="DEDUP_PRICE_DIFF_RATIO_LIMIT")
@@ -55,6 +55,42 @@ class Settings(BaseSettings):
         ge=30,
         le=86400,
         validation_alias="PRICING_BYBIT_WORKER_INTERVAL_SEC",
+    )
+    weight_recalc_worker_idle_sec: int = Field(
+        default=5,
+        ge=1,
+        le=3600,
+        validation_alias="WEIGHT_RECALC_WORKER_IDLE_SEC",
+    )
+    weight_recalc_worker_batch_size: int = Field(
+        default=500,
+        ge=1,
+        le=10000,
+        validation_alias="WEIGHT_RECALC_WORKER_BATCH_SIZE",
+    )
+    weight_recalc_worker_debounce_sec: int = Field(
+        default=3,
+        ge=0,
+        le=300,
+        validation_alias="WEIGHT_RECALC_WORKER_DEBOUNCE_SEC",
+    )
+    filter_assignment_worker_idle_sec: int = Field(
+        default=5,
+        ge=1,
+        le=3600,
+        validation_alias="FILTER_ASSIGNMENT_WORKER_IDLE_SEC",
+    )
+    filter_assignment_worker_batch_size: int = Field(
+        default=500,
+        ge=1,
+        le=10000,
+        validation_alias="FILTER_ASSIGNMENT_WORKER_BATCH_SIZE",
+    )
+    filter_assignment_worker_debounce_sec: int = Field(
+        default=3,
+        ge=0,
+        le=300,
+        validation_alias="FILTER_ASSIGNMENT_WORKER_DEBOUNCE_SEC",
     )
     admin_superuser_login: str = Field(default="admin", validation_alias="ADMIN_SUPERUSER_LOGIN")
     admin_superuser_password: str = Field(default="", validation_alias="ADMIN_SUPERUSER_PASSWORD")

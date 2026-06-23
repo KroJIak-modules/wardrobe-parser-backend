@@ -72,7 +72,7 @@ class ShowcaseCarouselOrderRequest(BaseModel):
 
 class AdminUiSettingsResponse(BaseModel):
     designers_min_products: int = Field(ge=1, le=1_000_000)
-    designers_exclude_store_vendors: bool = False
+    designers_exclude_store_names: bool = False
     auto_sync_period_minutes: int = Field(ge=60, le=1_000_000, default=60)
     auto_sync_next_run_at: str | None = None
     auto_sync_last_started_at: str | None = None
@@ -83,7 +83,7 @@ class AdminUiSettingsResponse(BaseModel):
 
 class AdminUiSettingsUpdateRequest(BaseModel):
     designers_min_products: int | None = Field(default=None, ge=1, le=1_000_000)
-    designers_exclude_store_vendors: bool | None = None
+    designers_exclude_store_names: bool | None = None
     auto_sync_period_minutes: int | None = Field(default=None, ge=60, le=1_000_000)
 
 
@@ -168,7 +168,7 @@ class SettingsTransferPricingSettings(BaseModel):
 
 class SettingsTransferAdminUiSettings(BaseModel):
     designers_min_products: int = Field(ge=1, le=1_000_000)
-    designers_exclude_store_vendors: bool = False
+    designers_exclude_store_names: bool = False
     auto_sync_period_minutes: int = Field(ge=60, le=1_000_000, default=60)
 
 
@@ -194,6 +194,7 @@ class SettingsTransferSourceEntry(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     enabled: bool = True
     sync_enabled: bool = True
+    dedup_enabled: bool = True
     hide_auto_added_products: bool = False
     description_mode: Literal["hidden", "text", "html"] = "text"
     show_images: bool = True
@@ -207,21 +208,6 @@ class SettingsTransferSourceEntry(BaseModel):
 class SettingsTransferWeightRuleEntry(BaseModel):
     weight_grams: int = Field(ge=1, le=1000000)
     keywords: list[str] = Field(default_factory=list)
-
-
-class SettingsTransferCategoryEntry(BaseModel):
-    slug: str = Field(min_length=1, max_length=255)
-    name: str = Field(min_length=1, max_length=255)
-    parent_slug: str | None = Field(default=None, min_length=1, max_length=255)
-    is_fallback: bool = False
-    is_favorite: bool = False
-    is_enabled: bool = True
-
-
-class SettingsTransferCategoryKeywordEntry(BaseModel):
-    category_slug: str = Field(min_length=1, max_length=255)
-    keyword: str = Field(min_length=1, max_length=255)
-    scope: Literal["local", "title", "status"] = "local"
 
 
 class SettingsTransferDesignerSourceNameEntry(BaseModel):

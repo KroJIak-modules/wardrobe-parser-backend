@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Float,
@@ -27,11 +28,19 @@ class Designer(Base):
     name = Column(String(255), nullable=False)
     slug = Column(String(255), nullable=False, unique=True)
     description = Column(Text, nullable=True)
+    logo_image_asset_id = Column(BigInteger, ForeignKey("image_assets.id", ondelete="SET NULL"), nullable=True)
+    origin_kind = Column(String(16), nullable=False, default="manual", server_default="manual")
+    is_admin_touched = Column(Boolean, nullable=False, default=False, server_default="false")
     is_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     source_names = relationship("DesignerSourceName", back_populates="designer")
+    logo_image_asset = relationship("ImageAsset", foreign_keys=[logo_image_asset_id])
+
+    __table_args__ = (
+        CheckConstraint("origin_kind IN ('auto', 'manual')", name="ck_designers_origin_kind"),
+    )
 
 
 class DesignerSourceName(Base):
@@ -40,6 +49,9 @@ class DesignerSourceName(Base):
     id = Column(BigInteger, primary_key=True)
     designer_id = Column(BigInteger, ForeignKey("designers.id", ondelete="SET NULL"), nullable=True, index=True)
     source_name = Column(String(255), nullable=False, unique=True)
+    designer_name = Column(String(255), nullable=True)
+    is_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    is_admin_touched = Column(Boolean, nullable=False, default=False, server_default="false")
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
@@ -53,6 +65,7 @@ class Source(Base):
     key = Column(String(255), nullable=False, unique=True)
     name = Column(String(255), nullable=False)
     base_url = Column(String(2048), nullable=False)
+    base_url_normalized = Column(String(255), nullable=False, unique=True, default="", server_default="")
     host_normalized = Column(String(255), nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -68,6 +81,7 @@ class SourceSetting(Base):
     supplier_id = Column(BigInteger, ForeignKey("suppliers.id", ondelete="SET NULL"), nullable=True, index=True)
     is_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     is_sync_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    dedup_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     hide_auto_added_products = Column(Boolean, nullable=False, default=False, server_default="false")
     description_mode = Column(String(16), nullable=False, default="text", server_default="text")
     show_images = Column(Boolean, nullable=False, default=True, server_default="true")
@@ -79,6 +93,10 @@ class SourceSetting(Base):
 
     source = relationship("Source", back_populates="setting")
     supplier = relationship("Supplier")
+
+    __table_args__ = (
+        CheckConstraint("description_mode IN ('hidden', 'text', 'html')", name="ck_source_settings_description_mode"),
+    )
 
 
 class SourceSyncState(Base):
@@ -93,6 +111,13 @@ class SourceSyncState(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     source = relationship("Source", back_populates="sync_state")
+
+    __table_args__ = (
+        CheckConstraint(
+            "last_sync_status IS NULL OR last_sync_status IN ('success', 'partial', 'failed')",
+            name="ck_source_sync_state_last_sync_status",
+        ),
+    )
 
 
 class Supplier(Base):
@@ -110,6 +135,10 @@ class Supplier(Base):
 
     parent_supplier = relationship("Supplier", remote_side=[id], backref="children")
     shipping_rates = relationship("SupplierShippingRate", back_populates="supplier", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        CheckConstraint("provider_kind IN ('main', 'alternate')", name="ck_suppliers_provider_kind"),
+    )
 
 
 class SupplierShippingRate(Base):
@@ -234,6 +263,14 @@ class SyncJob(Base):
 
     triggered_by_admin_user = relationship("AdminUser")
 
+    __table_args__ = (
+        CheckConstraint("trigger_kind IN ('manual', 'scheduled', 'retry')", name="ck_sync_jobs_trigger_kind"),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'completed', 'failed', 'canceled')",
+            name="ck_sync_jobs_status",
+        ),
+    )
+
 
 class SyncJobSourceRun(Base):
     __tablename__ = "sync_job_source_runs"
@@ -252,6 +289,13 @@ class SyncJobSourceRun(Base):
 
     sync_job = relationship("SyncJob")
     source = relationship("Source")
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued', 'running', 'completed', 'failed', 'skipped')",
+            name="ck_sync_job_source_runs_status",
+        ),
+    )
 
 
 class SyncAppliedBatch(Base):

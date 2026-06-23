@@ -1,8 +1,10 @@
 from app.models.admin_ui_settings import AdminUiSettings
 from app.models.admin_auth import AdminRole, AdminUser
-from app.models.catalog_dedup import ProductDedupDecision, ProductDedupDecisionMember
+from app.models.catalog_dedup import ProductDedupCandidate, ProductDedupDecision, ProductDedupDecisionMember
 from app.models.catalog_product import (
+    FilterAssignmentRuntimeState,
     Product,
+    ProductFilterAssignment,
     ProductListing,
     ProductListingGalleryImage,
     ProductListingImage,
@@ -50,6 +52,7 @@ __all__ = [
     "CustomCatalogProduct",
     "Designer",
     "DesignerSourceName",
+    "FilterAssignmentRuntimeState",
     "Filter",
     "FilterLocalCategoryKeyword",
     "FilterManualProduct",
@@ -58,6 +61,8 @@ __all__ = [
     "ImageAsset",
     "PricingSetting",
     "Product",
+    "ProductFilterAssignment",
+    "ProductDedupCandidate",
     "ProductDedupDecision",
     "ProductDedupDecisionMember",
     "ProductListing",
