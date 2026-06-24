@@ -1,37 +1,9 @@
 from __future__ import annotations
 
-import base64
-from types import SimpleNamespace
-
-from fastapi.testclient import TestClient
-
-import app.api.v1.admin_editors as admin_editors_module
-import app.api.v1.auth as auth_module
 from app.core.database import SessionLocal
-from app.main import app
-from app.models import Designer, DesignerSourceName, ImageAsset, Product, ProductListing, ProductListingMember, Source
+from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductListingMember, Source
 from app.services.catalog.admin_editor_service import AdminEditorService
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
-from app.services.catalog.media_asset_service import MediaAssetService
-
-
-class DummyLimiter:
-    def __init__(self) -> None:
-        self.failed: dict[str, int] = {}
-
-    def is_limited(self, client_key: str) -> bool:
-        return self.failed.get(client_key, 0) >= 2
-
-    def register_failed_attempt(self, client_key: str) -> None:
-        self.failed[client_key] = self.failed.get(client_key, 0) + 1
-
-
-def _authorized_client(monkeypatch) -> TestClient:
-    monkeypatch.setattr(auth_module, "_login_rate_limiter", DummyLimiter())
-    client = TestClient(app)
-    login = client.post("/api/v1/auth/login", json={"login": "superadmin", "password": "Q7m2Lx9pRt"})
-    assert login.status_code == 200
-    return client
 
 
 def _create_source(db, *, key: str) -> Source:
@@ -76,113 +48,6 @@ def _create_sync_product(db, *, source: Source, brand: str, suffix: str, status:
     product.primary_listing_id = int(listing.id)
     db.flush()
     return product, listing
-
-
-def _create_image_asset(db, *, checksum: str) -> ImageAsset:
-    asset = ImageAsset(
-        storage_key=f"designers/{checksum}.png",
-        mime_type="image/png",
-        byte_size=128,
-        checksum_sha256=checksum,
-    )
-    db.add(asset)
-    db.flush()
-    return asset
-
-
-def test_admin_designers_logo_upload_endpoint_returns_asset_id(monkeypatch) -> None:
-    client = _authorized_client(monkeypatch)
-
-    monkeypatch.setattr(
-        admin_editors_module.MediaAssetService,
-        "save_upload",
-        lambda self, *, scope, upload: SimpleNamespace(id=987),
-    )
-
-    response = client.post(
-        "/api/v1/admin/designers/logo/upload",
-        files={"file": ("logo.svg", b"<svg xmlns='http://www.w3.org/2000/svg'></svg>", "image/svg+xml")},
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"ok": True, "image_asset_id": 987}
-
-
-def test_media_asset_service_detects_svg_mime_type(monkeypatch, tmp_path) -> None:
-    db = SessionLocal()
-    monkeypatch.setattr(MediaAssetService, "_ROOT_DIR", tmp_path / "uploads")
-    try:
-        asset = MediaAssetService(db).save_bytes(
-            scope="designers",
-            file_name="logo.svg",
-            content=b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'></svg>",
-        )
-
-        assert asset.mime_type == "image/svg+xml"
-        assert asset.width_px is None
-        assert asset.height_px is None
-        assert MediaAssetService(db).resolve_file_path(asset).exists()
-    finally:
-        db.rollback()
-        db.close()
-
-
-def test_designer_editor_round_trips_logo_asset_id(monkeypatch, tmp_path) -> None:
-    db = SessionLocal()
-    monkeypatch.setattr(MediaAssetService, "_ROOT_DIR", tmp_path / "uploads")
-    try:
-        png_bytes = base64.b64decode(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3Zf8sAAAAASUVORK5CYII="
-        )
-        asset = MediaAssetService(db).save_bytes(scope="designers", file_name="logo.png", content=png_bytes)
-
-        service = AdminEditorService(db)
-        result = service.save_designer_editor_state(
-            {
-                "rows": [],
-                "designers": [
-                    {
-                        "id": "designer-studio-c",
-                        "name": "Studio C",
-                        "description": "Brand logo",
-                        "logo_image_asset_id": int(asset.id),
-                    }
-                ],
-            }
-        )
-
-        designer = next(item for item in result["designers"] if item["name"] == "Studio C")
-        assert designer["logo_image_asset_id"] == int(asset.id)
-
-        persisted = db.query(Designer).filter(Designer.name == "Studio C").one()
-        assert int(persisted.logo_image_asset_id or 0) == int(asset.id)
-    finally:
-        db.rollback()
-        db.close()
-
-
-def test_designer_editor_ignores_blank_draft_designer(monkeypatch, tmp_path) -> None:
-    db = SessionLocal()
-    monkeypatch.setattr(MediaAssetService, "_ROOT_DIR", tmp_path / "uploads")
-    try:
-        result = AdminEditorService(db).save_designer_editor_state(
-            {
-                "rows": [],
-                "designers": [
-                    {
-                        "id": "designer-draft",
-                        "name": "",
-                        "description": "",
-                        "logo_image_asset_id": None,
-                    }
-                ],
-            }
-        )
-
-        assert all(designer["id"] != "designer-draft" for designer in result["designers"])
-    finally:
-        db.rollback()
-        db.close()
 
 
 def test_active_source_brand_creates_catalog_designer_automatically() -> None:
@@ -258,6 +123,10 @@ def test_source_brand_stays_after_admin_toggles_it() -> None:
         assert mapping.is_enabled is False
         assert designer.origin_kind == "auto"
         assert designer.is_admin_touched is False
+
+        editor_state = AdminEditorService(db).list_designer_editor_state()
+        assert all(item["source_brand"] != brand for item in editor_state["rows"])
+        assert any(item["name"] == brand for item in editor_state["designers"])
     finally:
         db.rollback()
         db.close()
@@ -284,33 +153,10 @@ def test_source_brand_stays_after_admin_changes_description() -> None:
         assert persisted_designer.description == "Los Angeles streetwear label"
         assert persisted_designer.is_admin_touched is True
         assert db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).count() == 1
-    finally:
-        db.rollback()
-        db.close()
 
-
-def test_source_brand_stays_after_admin_uploads_logo() -> None:
-    db = SessionLocal()
-    try:
-        source = _create_source(db, key="source-epsilon")
-        brand = "ZZ TEST Acronym"
-        _, listing = _create_sync_product(db, source=source, brand=brand, suffix="acronym")
-        asset = _create_image_asset(db, checksum="a" * 64)
-        DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
-
-        service = AdminEditorService(db)
-        state = service.list_designer_editor_state()
-        designer = next(item for item in state["designers"] if item["name"] == brand)
-        designer["logo_image_asset_id"] = int(asset.id)
-
-        service.save_designer_editor_state({"rows": state["rows"], "designers": state["designers"]})
-        listing.orderability_status = "unavailable"
-        DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
-
-        persisted_designer = db.query(Designer).filter(Designer.name == brand).one()
-        assert int(persisted_designer.logo_image_asset_id or 0) == int(asset.id)
-        assert persisted_designer.is_admin_touched is True
-        assert db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).count() == 1
+        editor_state = AdminEditorService(db).list_designer_editor_state()
+        assert all(item["source_brand"] != brand for item in editor_state["rows"])
+        assert any(item["name"] == brand for item in editor_state["designers"])
     finally:
         db.rollback()
         db.close()
@@ -319,6 +165,7 @@ def test_source_brand_stays_after_admin_uploads_logo() -> None:
 def test_manual_designer_stays_without_source_brands() -> None:
     db = SessionLocal()
     try:
+        designer_name = "ZZ TEST Manual Maison Margiela"
         service = AdminEditorService(db)
         result = service.save_designer_editor_state(
             {
@@ -326,9 +173,8 @@ def test_manual_designer_stays_without_source_brands() -> None:
                 "designers": [
                     {
                         "id": "designer-manual",
-                        "name": "Maison Margiela",
+                        "name": designer_name,
                         "description": "Manual catalog designer",
-                        "logo_image_asset_id": None,
                     }
                 ],
             }
@@ -336,10 +182,10 @@ def test_manual_designer_stays_without_source_brands() -> None:
 
         DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
 
-        persisted_designer = db.query(Designer).filter(Designer.name == "Maison Margiela").one()
+        persisted_designer = db.query(Designer).filter(Designer.name == designer_name).one()
         assert persisted_designer.origin_kind == "manual"
         assert persisted_designer.is_admin_touched is True
-        assert any(item["name"] == "Maison Margiela" for item in result["designers"])
+        assert any(item["name"] == designer_name for item in result["designers"])
     finally:
         db.rollback()
         db.close()

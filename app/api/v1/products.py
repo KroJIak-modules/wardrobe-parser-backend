@@ -290,8 +290,11 @@ def admin_products_table_facets(
 
 
 @router.get("/products/pricing-example", dependencies=[Depends(require_permission("control.pricing.read"))])
-def pricing_example(db: Session = Depends(get_db)) -> dict:
-    payload = ProductQueryService(db).get_pricing_example_payload()
+def pricing_example(
+    product_id: int | None = Query(default=None, ge=1),
+    db: Session = Depends(get_db),
+) -> dict:
+    payload = ProductQueryService(db).get_pricing_example_payload(product_id=product_id)
     if payload is None:
         raise NotFoundError("Не удалось выбрать товар для примера")
     return payload

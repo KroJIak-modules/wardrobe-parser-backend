@@ -11,7 +11,6 @@ from app.models import (
     CustomCatalogProduct,
     Designer,
     DesignerSourceName,
-    ImageAsset,
     Product,
     ProductListing,
     ProductListingMember,
@@ -207,15 +206,7 @@ class AdminEditorService:
             if self._normalize_text(row.source_name)
         }
 
-        all_source_names = sorted(
-            set(count_by_source_name)
-            | {
-                self._normalize_text(row.source_name)
-                for row in mapping_rows
-                if self._normalize_text(row.source_name)
-            },
-            key=lambda item: item,
-        )
+        all_source_names = sorted(set(count_by_source_name), key=lambda item: item)
 
         result_rows: list[dict] = []
         for source_name in all_source_names:
@@ -235,11 +226,6 @@ class AdminEditorService:
                 "id": str(designer.id),
                 "name": self._normalize_text(designer.name),
                 "description": str(designer.description or "").strip(),
-                "logo_image_asset_id": (
-                    int(designer.logo_image_asset_id)
-                    if designer.logo_image_asset_id is not None
-                    else None
-                ),
             }
             for designer in (
                 self.db.query(Designer)
@@ -275,21 +261,6 @@ class AdminEditorService:
             used_slugs.add(slug)
             return slug
 
-        logo_candidate_ids: set[int] = set()
-        for raw_designer in designers:
-            if not isinstance(raw_designer, dict) or "logo_image_asset_id" not in raw_designer:
-                continue
-            logo_image_asset_id = self._normalize_optional_positive_int(raw_designer.get("logo_image_asset_id"))
-            if logo_image_asset_id is not None:
-                logo_candidate_ids.add(logo_image_asset_id)
-        valid_logo_asset_ids = (
-            {
-                int(row[0])
-                for row in self.db.query(ImageAsset.id).filter(ImageAsset.id.in_(list(logo_candidate_ids))).all()
-            }
-            if logo_candidate_ids
-            else set()
-        )
         desired_designer_ids: set[int] = set()
 
         for raw_designer in designers:
@@ -314,21 +285,13 @@ class AdminEditorService:
                 self.db.flush()
                 existing_designers[int(entity.id)] = entity
             next_description = str(raw_designer.get("description") or "").strip() or None
-            next_logo_image_asset_id = entity.logo_image_asset_id
-            if "logo_image_asset_id" in raw_designer:
-                logo_image_asset_id = self._normalize_optional_positive_int(raw_designer.get("logo_image_asset_id"))
-                if logo_image_asset_id is not None and logo_image_asset_id not in valid_logo_asset_ids:
-                    raise ValidationError("Логотип не найден")
-                next_logo_image_asset_id = logo_image_asset_id
             if (
                 self._normalize_text(entity.name) != designer_name
                 or (entity.description or None) != next_description
-                or int(entity.logo_image_asset_id or 0) != int(next_logo_image_asset_id or 0)
             ):
                 entity.is_admin_touched = True
             entity.name = designer_name
             entity.description = next_description
-            entity.logo_image_asset_id = next_logo_image_asset_id
             entity.is_enabled = True
             desired_designer_ids.add(int(entity.id))
         existing_source_mappings = {

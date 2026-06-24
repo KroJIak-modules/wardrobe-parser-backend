@@ -342,12 +342,16 @@ class ProductIngestService:
 
             variants = self._variant_payloads(item)
             self.products.replace_variants(listing_id=int(listing.id), variants=variants)
-            listing_images = self.products.replace_listing_images(listing_id=int(listing.id), image_urls=self._image_urls(item))
+            listing_images, stale_listing_image_ids = self.products.replace_listing_images(
+                listing_id=int(listing.id),
+                image_urls=self._image_urls(item),
+            )
             self.products.sync_gallery_scope_with_source_images(
                 product_id=int(product.id),
                 listing_id=int(listing.id),
                 listing_images=listing_images,
             )
+            self.products.delete_listing_images(listing_image_ids=stale_listing_image_ids)
 
             if product.primary_listing_id is None:
                 product.primary_listing_id = int(listing.id)

@@ -18,6 +18,7 @@ from app.models import (
     ProductListing,
     ProductListingMember,
     ProductPresentation,
+    ProductPriceOverride,
     Source,
     ShowcaseCategory,
     ShowcaseCategoryAttachment,
@@ -33,54 +34,86 @@ UNMATCHED_FILTER_LABEL = "Без фильтров"
 
 
 class ProductQueryService:
+    _PRICING_EXAMPLE_SCAN_LIMIT = 500
+    _PRICING_EXAMPLE_BATCH_SIZE = 25
+
     def __init__(self, db: Session) -> None:
         self.db = db
         self.products = CatalogProductRepository(db)
         self.pricing = PricingSettingsService(db)
-        self._filters_cache: list[Filter] | None = None
-        self._custom_catalogs_cache: list[CustomCatalog] | None = None
+        self._filter_rows_cache: list[tuple[str, str, bool]] | None = None
+        self._custom_catalog_rows_cache: list[tuple[str, str]] | None = None
         self._showcase_cache: list[ShowcaseCategory] | None = None
-        self._all_sources_cache: list[Source] | None = None
+        self._source_rows_cache: list[tuple[int, str, str]] | None = None
         self._service_source_items_cache: dict[str, dict] | None = None
         self._source_mode_ids_cache: dict[str, list[int]] = {}
         self._assigned_filter_slug_by_product_id_cache: dict[int, str] | None = None
         self._assigned_filter_label_by_product_id_cache: dict[int, str] | None = None
         self._applied_filter_revision_cache: int | None = None
+        self._pricing_settings_cache: PricingSettingsResponse | None = None
 
-    def _taxonomy_filters(self) -> list[Filter]:
-        if self._filters_cache is None:
-            self._filters_cache = (
-                self.db.query(Filter)
-                .options(
-                    joinedload(Filter.local_category_keywords),
-                    joinedload(Filter.title_keywords),
-                    joinedload(Filter.manual_products),
+    def _filter_rows(self) -> list[tuple[str, str, bool]]:
+        if self._filter_rows_cache is None:
+            rows = (
+                self.db.query(
+                    Filter.slug.label("slug"),
+                    func.trim(func.coalesce(Filter.display_title, Filter.title)).label("label"),
+                    Filter.is_enabled.label("is_enabled"),
                 )
                 .order_by(Filter.slug.asc(), Filter.id.asc())
                 .all()
             )
-        return self._filters_cache
+            self._filter_rows_cache = [
+                (str(slug), str(label or "").strip(), bool(is_enabled))
+                for slug, label, is_enabled in rows
+                if str(slug or "").strip() and str(label or "").strip()
+            ]
+        return self._filter_rows_cache
 
-    def _custom_catalogs(self) -> list[CustomCatalog]:
-        if self._custom_catalogs_cache is None:
-            self._custom_catalogs_cache = (
-                self.db.query(CustomCatalog)
+    def _custom_catalog_rows(self) -> list[tuple[str, str]]:
+        if self._custom_catalog_rows_cache is None:
+            rows = (
+                self.db.query(
+                    CustomCatalog.slug.label("slug"),
+                    func.trim(CustomCatalog.title).label("title"),
+                )
                 .order_by(CustomCatalog.slug.asc(), CustomCatalog.id.asc())
                 .all()
             )
-        return self._custom_catalogs_cache
+            self._custom_catalog_rows_cache = [
+                (str(slug), str(title or "").strip())
+                for slug, title in rows
+                if str(slug or "").strip() and str(title or "").strip()
+            ]
+        return self._custom_catalog_rows_cache
 
     def _service_source_items(self) -> dict[str, dict]:
         if self._service_source_items_cache is None:
             self._service_source_items_cache = SourceRegistryService.fetch_service_sources_payload()
         return self._service_source_items_cache
 
-    def _all_sources(self) -> list[Source]:
-        if self._all_sources_cache is None:
-            registry = SourceRegistryService(self.db)
-            registry.refresh_from_service()
-            self._all_sources_cache = registry.repo.list_all()
-        return self._all_sources_cache
+    def _source_rows(self) -> list[tuple[int, str, str]]:
+        if self._source_rows_cache is None:
+            rows = (
+                self.db.query(
+                    Source.id.label("id"),
+                    Source.key.label("key"),
+                    Source.name.label("name"),
+                )
+                .order_by(Source.name.asc(), Source.id.asc())
+                .all()
+            )
+            self._source_rows_cache = [
+                (int(source_id), str(source_key or "").strip(), str(source_name or "").strip() or str(source_key or "").strip())
+                for source_id, source_key, source_name in rows
+                if source_id is not None and str(source_key or "").strip()
+            ]
+        return self._source_rows_cache
+
+    def _pricing_settings(self) -> PricingSettingsResponse:
+        if self._pricing_settings_cache is None:
+            self._pricing_settings_cache = self.pricing.get_settings(refresh_bybit=False)
+        return self._pricing_settings_cache
 
     def _filtered_product_ids_subquery(
         self,
@@ -228,14 +261,12 @@ class ProductQueryService:
         custom_catalog_slugs: list[str],
     ) -> list[str]:
         filter_title_by_slug = {
-            str(entity.slug): str(entity.display_title or entity.title or "").strip()
-            for entity in self._taxonomy_filters()
-            if str(entity.slug or "").strip()
+            slug: label
+            for slug, label, _ in self._filter_rows()
         }
         custom_catalog_title_by_slug = {
-            str(entity.slug): str(entity.title or "").strip()
-            for entity in self._custom_catalogs()
-            if str(entity.slug or "").strip()
+            slug: title
+            for slug, title in self._custom_catalog_rows()
         }
         titles: list[str] = []
         seen: set[str] = set()
@@ -567,7 +598,7 @@ class ProductQueryService:
             }
 
         try:
-            settings = self.pricing.get_settings(refresh_bybit=False)
+            settings = self._pricing_settings()
             computation = self.pricing.calculate_for_product(
                 source_price=source_price,
                 source_currency=source_currency,
@@ -618,6 +649,49 @@ class ProductQueryService:
         if product.get("source_price") is None or product.get("final_price") is None:
             return False
         return all(components.get(key) is not None for key in required_keys)
+
+    def _build_pricing_example_payload_from_product(self, product: Product) -> dict[str, Any] | None:
+        listing = product.primary_listing
+        if listing is None:
+            return None
+        if str(product.visibility_status or "") != "visible":
+            return None
+        if str(listing.orderability_status or "") != "orderable":
+            return None
+        if product.price_override is not None and product.price_override.manual_price_rub is not None:
+            return None
+
+        listing_variants = self._listing_variants(listing)
+        effective_weight_grams = self._effective_weight_grams(product, listing)
+        final_price, pricing_components = self._compute_pricing(product, listing, listing_variants, effective_weight_grams)
+        source_price = next((variant.get("price") for variant in listing_variants if variant.get("price") is not None), None)
+        source_currency = next((variant.get("currency") for variant in listing_variants if variant.get("currency")), None)
+
+        candidate_payload = {
+            "source_price": source_price,
+            "final_price": final_price,
+            "pricing_components": pricing_components or {},
+        }
+        if not self._is_pricing_example_candidate(candidate_payload):
+            return None
+
+        gallery = self._gallery_state(product, listing)
+        return {
+            "product_id": int(product.id),
+            "title": self._effective_title(product, listing),
+            "url": str(listing.url) if self._is_business_source_listing(listing) else None,
+            "source_name": (
+                str(getattr(getattr(listing, "source", None), "name", "") or "") or None
+                if self._is_business_source_listing(listing)
+                else None
+            ),
+            "image_url": (gallery.get("display_image_urls") or [None])[0],
+            "source_price": source_price,
+            "source_currency": source_currency,
+            "final_price": final_price,
+            "components": pricing_components or {},
+            "is_sample": False,
+        }
 
     @staticmethod
     def _sample_weight_grams_from_supplier(
@@ -725,39 +799,44 @@ class ProductQueryService:
             "is_sample": True,
         }
 
-    def get_pricing_example_payload(self) -> dict[str, Any] | None:
+    def get_pricing_example_payload(self, *, product_id: int | None = None) -> dict[str, Any] | None:
+        if product_id is not None and int(product_id) > 0:
+            products = self.products.list_products_for_pricing_example_by_ids([int(product_id)])
+            if products:
+                return self._build_pricing_example_payload_from_product(products[0])
+            return None
+
         product_ids = [
             int(row[0])
             for row in (
                 self.db.query(Product.id)
+                .join(ProductListing, ProductListing.id == Product.primary_listing_id)
+                .outerjoin(ProductPriceOverride, ProductPriceOverride.product_id == Product.id)
                 .filter(Product.lifecycle_status != "merged")
-                .order_by(Product.updated_at.desc(), Product.id.desc())
-                .limit(500)
+                .filter(Product.primary_listing_id.is_not(None))
+                .filter(Product.visibility_status == "visible")
+                .filter(ProductListing.orderability_status == "orderable")
+                .filter(ProductPriceOverride.product_id.is_(None))
+                .order_by(func.random())
+                .limit(self._PRICING_EXAMPLE_SCAN_LIMIT)
                 .all()
             )
         ]
-        products = self.products.list_products_by_ids(product_ids, include_merged=False)
-        product_by_id = {int(product.id): product for product in products}
-        for product_id in product_ids:
-            product = product_by_id.get(product_id)
-            if product is None:
-                continue
-            payload = self.build_admin_product_payload(product)
-            if not self._is_pricing_example_candidate(payload):
-                continue
-            return {
-                "product_id": int(payload["id"]),
-                "title": payload["title"],
-                "url": payload.get("url"),
-                "source_name": payload.get("source_name"),
-                "image_url": (payload.get("image_urls") or [None])[0],
-                "source_price": payload.get("source_price"),
-                "source_currency": payload.get("source_currency"),
-                "final_price": payload.get("final_price"),
-                "components": payload.get("pricing_components") or {},
-                "is_sample": False,
-            }
-        settings = self.pricing.get_settings(refresh_bybit=False)
+
+        batch_size = max(1, int(self._PRICING_EXAMPLE_BATCH_SIZE))
+        for start in range(0, len(product_ids), batch_size):
+            batch_ids = product_ids[start : start + batch_size]
+            products = self.products.list_products_for_pricing_example_by_ids(batch_ids)
+            product_by_id = {int(product.id): product for product in products}
+            for product_id in batch_ids:
+                product = product_by_id.get(product_id)
+                if product is None:
+                    continue
+                payload = self._build_pricing_example_payload_from_product(product)
+                if payload is not None:
+                    return payload
+
+        settings = self._pricing_settings()
         return self._build_sample_pricing_example_payload(settings)
 
     def _build_shared_payload(self, product: Product) -> tuple[dict, dict]:
@@ -1052,9 +1131,9 @@ class ProductQueryService:
             return list(cached_ids)
         service_items = self._service_source_items()
         source_ids = [
-            int(source.id)
-            for source in self._all_sources()
-            if SourceRegistryService.derive_source_mode(str(source.key), service_items.get(str(source.key))) == normalized_mode
+            int(source_id)
+            for source_id, source_key, _source_name in self._source_rows()
+            if SourceRegistryService.derive_source_mode(source_key, service_items.get(source_key)) == normalized_mode
         ]
         self._source_mode_ids_cache[normalized_mode] = list(source_ids)
         return list(source_ids)
@@ -1410,14 +1489,14 @@ class ProductQueryService:
         }
         service_items = self._service_source_items()
         source_options = []
-        for source in self._all_sources():
-            source_key = int(source.id)
+        for source_id_value, source_key_value, source_name_value in self._source_rows():
+            source_key = int(source_id_value)
             count = int(source_counts.get(source_key, 0))
-            source_mode_value = SourceRegistryService.derive_source_mode(str(source.key), service_items.get(str(source.key)))
+            source_mode_value = SourceRegistryService.derive_source_mode(source_key_value, service_items.get(source_key_value))
             source_options.append(
                 {
                     "value": str(source_key),
-                    "label": str(source.name or source.key or source_key),
+                    "label": source_name_value or source_key_value or str(source_key),
                     "count": count,
                     "disabled": count == 0,
                     "_mode": source_mode_value,
@@ -1459,32 +1538,39 @@ class ProductQueryService:
 
         catalogs = [
             {
-                "value": str(catalog.slug),
-                "label": str(catalog.title).strip(),
-                "count": int(catalog_count_map.get(str(catalog.slug), 0)),
-                "disabled": int(catalog_count_map.get(str(catalog.slug), 0)) == 0,
+                "value": slug,
+                "label": title,
+                "count": int(catalog_count_map.get(slug, 0)),
+                "disabled": int(catalog_count_map.get(slug, 0)) == 0,
             }
-            for catalog in self._custom_catalogs()
-            if str(catalog.slug or "").strip() and str(catalog.title or "").strip()
+            for slug, title in self._custom_catalog_rows()
         ]
         catalogs.sort(key=lambda item: (int(bool(item["disabled"])), -int(item["count"]), str(item["label"]).lower()))
-
-        section_context_product_ids = [
-            int(row[0])
-            for row in (
-                self.db.query(section_context_ids.c.product_id)
-                .all()
-            )
-        ]
-        assigned_filter_slug_by_product_id = self._assigned_filter_slug_by_product_id()
+        section_total = int(self.db.query(func.count()).select_from(section_context_ids).scalar() or 0)
         section_count_map: dict[str, int] = {}
-        unmatched_section_count = 0
-        for product_id in section_context_product_ids:
-            assigned_slug = assigned_filter_slug_by_product_id.get(int(product_id))
-            if not assigned_slug:
-                unmatched_section_count += 1
-                continue
-            section_count_map[assigned_slug] = int(section_count_map.get(assigned_slug, 0)) + 1
+        revision = self._applied_filter_revision()
+        if revision > 0:
+            section_count_map = {
+                str(slug): int(count)
+                for slug, count in (
+                    self.db.query(
+                        ProductFilterAssignment.filter_slug,
+                        func.count(func.distinct(section_context_ids.c.product_id)).label("product_count"),
+                    )
+                    .select_from(section_context_ids)
+                    .join(
+                        ProductFilterAssignment,
+                        and_(
+                            ProductFilterAssignment.product_id == section_context_ids.c.product_id,
+                            ProductFilterAssignment.revision == revision,
+                        ),
+                    )
+                    .group_by(ProductFilterAssignment.filter_slug)
+                    .all()
+                )
+                if str(slug or "").strip()
+            }
+        unmatched_section_count = max(0, section_total - sum(section_count_map.values()))
         sections = []
         sections.append(
             {
@@ -1494,10 +1580,8 @@ class ProductQueryService:
                 "disabled": unmatched_section_count == 0,
             }
         )
-        for entity in self._taxonomy_filters():
-            slug = str(entity.slug or "").strip()
-            label = str(entity.display_title or entity.title or "").strip()
-            if not slug or not label or not bool(entity.is_enabled):
+        for slug, label, is_enabled in self._filter_rows():
+            if not is_enabled:
                 continue
             count = int(section_count_map.get(slug, 0))
             sections.append(

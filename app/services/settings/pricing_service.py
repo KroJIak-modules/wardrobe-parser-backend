@@ -506,8 +506,6 @@ class PricingSettingsService:
             self.db.commit()
             self.db.refresh(entity)
         return AdminUiSettingsResponse(
-            designers_min_products=max(1, int(getattr(entity, "designers_min_products", 1) or 1)),
-            designers_exclude_store_names=bool(getattr(entity, "designers_exclude_store_names", False)),
             auto_sync_period_minutes=max(60, int(getattr(entity, "auto_sync_period_minutes", 60) or 60)),
             auto_sync_next_run_at=(
                 getattr(entity, "auto_sync_next_run_at", None).isoformat()
@@ -531,10 +529,6 @@ class PricingSettingsService:
     def update_admin_ui_settings(self, payload: AdminUiSettingsUpdateRequest) -> AdminUiSettingsResponse:
         patch = payload.model_dump(exclude_unset=True)
         reset_sync_timer = "auto_sync_period_minutes" in patch
-        if "designers_min_products" in patch:
-            patch["designers_min_products"] = max(1, int(patch.get("designers_min_products") or 1))
-        if "designers_exclude_store_names" in patch:
-            patch["designers_exclude_store_names"] = bool(patch.get("designers_exclude_store_names"))
         if "auto_sync_period_minutes" in patch:
             patch["auto_sync_period_minutes"] = max(60, int(patch.get("auto_sync_period_minutes") or 60))
         entity = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
@@ -1101,13 +1095,13 @@ class PricingSettingsService:
         subtotal_after_markup_rub = subtotal_rub * markup_multiplier
         tax_rub = subtotal_after_markup_rub * max(0.0, float(settings.tax_rate))
         pass_through_costs_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub
-        margin_rub = subtotal_after_markup_rub - pass_through_costs_rub
         raw_final_price_rub = float(subtotal_after_markup_rub + tax_rub)
         final_rounding_mode = PricingSettingsService._normalize_final_rounding_mode(
             getattr(settings, "final_rounding_mode", None),
             default="unit",
         )
         final_price_rub = PricingSettingsService._apply_final_rounding(raw_final_price_rub, final_rounding_mode)
+        margin_rub = final_price_rub - sp_rub
 
         return ProductPricingComputation(
             final_price_rub=final_price_rub,

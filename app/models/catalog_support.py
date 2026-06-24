@@ -15,7 +15,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text as sa_text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -28,7 +30,6 @@ class Designer(Base):
     name = Column(String(255), nullable=False)
     slug = Column(String(255), nullable=False, unique=True)
     description = Column(Text, nullable=True)
-    logo_image_asset_id = Column(BigInteger, ForeignKey("image_assets.id", ondelete="SET NULL"), nullable=True)
     origin_kind = Column(String(16), nullable=False, default="manual", server_default="manual")
     is_admin_touched = Column(Boolean, nullable=False, default=False, server_default="false")
     is_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
@@ -36,8 +37,6 @@ class Designer(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     source_names = relationship("DesignerSourceName", back_populates="designer")
-    logo_image_asset = relationship("ImageAsset", foreign_keys=[logo_image_asset_id])
-
     __table_args__ = (
         CheckConstraint("origin_kind IN ('auto', 'manual')", name="ck_designers_origin_kind"),
     )
@@ -67,11 +66,13 @@ class Source(Base):
     base_url = Column(String(2048), nullable=False)
     base_url_normalized = Column(String(255), nullable=False, unique=True, default="", server_default="")
     host_normalized = Column(String(255), nullable=False, index=True)
+    logo_image_asset_id = Column(BigInteger, ForeignKey("image_assets.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     setting = relationship("SourceSetting", back_populates="source", uselist=False, cascade="all, delete-orphan")
     sync_state = relationship("SourceSyncState", back_populates="source", uselist=False, cascade="all, delete-orphan")
+    logo_image_asset = relationship("ImageAsset", foreign_keys=[logo_image_asset_id])
 
 
 class SourceSetting(Base):
@@ -172,6 +173,9 @@ class PricingSetting(Base):
     customs_fixed_rub = Column(Numeric(12, 2), nullable=False, default=540, server_default="540")
     tax_rate = Column(Numeric(10, 4), nullable=False, default=0.06, server_default="0.06")
     final_rounding_mode = Column(String(32), nullable=False, default="unit", server_default="unit")
+    bybit_bucket_rates = Column(JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb"))
+    bybit_last_updated_at = Column(DateTime(timezone=True), nullable=True)
+    bybit_last_error = Column(String(1024), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 

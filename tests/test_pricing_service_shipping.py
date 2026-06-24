@@ -151,6 +151,7 @@ def test_calculate_for_product_uses_supplier_tariff_ranges_for_uk_supplier() -> 
     assert result.reason is None
     assert result.components["supplier_transport_rub"] == 3400.0
     assert result.components["shipping_rule_label"] == "0-0.5 кг"
+    assert result.components["margin_rub"] == result.final_price_rub - result.components["source_price_rub"]
 
 
 def test_calculate_for_product_requires_manual_when_supplier_has_no_tariff() -> None:

@@ -119,6 +119,29 @@ class CatalogProductRepository:
             .all()
         )
 
+    def list_products_for_pricing_example_by_ids(self, product_ids: Iterable[int]) -> list[Product]:
+        normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
+        if not normalized_ids:
+            return []
+        return (
+            self.session.query(Product)
+            .options(
+                joinedload(Product.presentation),
+                joinedload(Product.price_override),
+                joinedload(Product.weight_rule),
+                selectinload(Product.primary_listing).selectinload(ProductListing.source).selectinload(Source.setting),
+                selectinload(Product.primary_listing).selectinload(ProductListing.variants),
+                selectinload(Product.primary_listing).selectinload(ProductListing.images),
+                selectinload(Product.gallery_images).selectinload(ProductListingGalleryImage.listing_image),
+                selectinload(Product.gallery_images).selectinload(ProductListingGalleryImage.image_asset),
+            )
+            .filter(Product.id.in_(normalized_ids))
+            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.primary_listing_id.is_not(None))
+            .order_by(Product.id.asc())
+            .all()
+        )
+
     def list_products_for_filter_assignment_by_ids(self, product_ids: Iterable[int]) -> list[Product]:
         normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
         if not normalized_ids:
@@ -404,7 +427,12 @@ class CatalogProductRepository:
             )
         self.session.flush()
 
-    def replace_listing_images(self, *, listing_id: int, image_urls: list[str]) -> list[ProductListingImage]:
+    def replace_listing_images(
+        self,
+        *,
+        listing_id: int,
+        image_urls: list[str],
+    ) -> tuple[list[ProductListingImage], list[int]]:
         existing = (
             self.session.query(ProductListingImage)
             .filter(ProductListingImage.listing_id == int(listing_id))
@@ -423,17 +451,31 @@ class CatalogProductRepository:
             else:
                 entity.url = url
 
-        for entity in existing:
-            if int(entity.position) not in keep_positions:
-                self.session.delete(entity)
-
         self.session.flush()
+        stale_image_ids = [
+            int(entity.id)
+            for entity in existing
+            if int(entity.position) not in keep_positions
+        ]
         return (
             self.session.query(ProductListingImage)
             .filter(ProductListingImage.listing_id == int(listing_id))
+            .filter(ProductListingImage.position.in_(keep_positions) if keep_positions else False)
             .order_by(ProductListingImage.position.asc())
-            .all()
+            .all(),
+            stale_image_ids,
         )
+
+    def delete_listing_images(self, *, listing_image_ids: list[int]) -> None:
+        normalized_ids = sorted({int(image_id) for image_id in listing_image_ids if int(image_id) > 0})
+        if not normalized_ids:
+            return
+        (
+            self.session.query(ProductListingImage)
+            .filter(ProductListingImage.id.in_(normalized_ids))
+            .delete(synchronize_session=False)
+        )
+        self.session.flush()
 
     def ensure_presentation(self, product_id: int) -> ProductPresentation:
         entity = (

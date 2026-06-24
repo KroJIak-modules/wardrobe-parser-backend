@@ -76,7 +76,6 @@ class AdminDesignerEditorDesigner(BaseModel):
     id: str = Field(min_length=1)
     name: str = ""
     description: str = ""
-    logo_image_asset_id: int | None = None
 
 
 class AdminDesignerEditorPayload(BaseModel):

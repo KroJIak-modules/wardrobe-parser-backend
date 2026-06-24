@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from fastapi.responses import FileResponse
 from app.core.database import get_db
 from app.core.exceptions import NotFoundError, ValidationError
-from app.models import Product, ProductListing, ProductListingMember, Source
+from app.models import ImageAsset, Product, ProductListing, ProductListingMember, Source
 from app.services.auth.admin_auth_service import require_permission
+from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.source_registry_service import SourceRegistryService
 
 
@@ -41,6 +43,10 @@ class SupplierPatch(BaseModel):
     promo_only_no_discount: bool | None = None
     buyout_surcharge_value: float | None = None
     buyout_surcharge_currency: str | None = None
+
+
+class SourceLogoPatch(BaseModel):
+    logo_image_asset_id: int | None = None
 
 
 def _normalize_source_sync_status(raw: object) -> str | None:
@@ -89,6 +95,7 @@ def _source_payload(db: Session, source: Source, service_item: dict | None, coun
         "mode": mode,
         "name": source.name,
         "base_url": source.base_url,
+        "logo_image_asset_id": int(source.logo_image_asset_id) if source.logo_image_asset_id is not None else None,
         "enabled": bool(getattr(setting, "is_enabled", True)),
         "sync_enabled": bool(getattr(setting, "is_sync_enabled", True)),
         "dedup_enabled": bool(getattr(setting, "dedup_enabled", True)),
@@ -132,6 +139,21 @@ def list_sources(db: Session = Depends(get_db)) -> list[dict]:
         _source_payload(db, source, service_items.get(source.key), counts_by_source_id)
         for source in sources
     ]
+
+
+@router.post("/sources/logo/upload", dependencies=[Depends(require_permission("control.sources.edit"))])
+def upload_source_logo(file: UploadFile = File(...), db: Session = Depends(get_db)) -> dict:
+    asset = MediaAssetService(db).save_upload(scope="sources", upload=file)
+    db.commit()
+    return {"ok": True, "image_asset_id": int(asset.id)}
+
+
+@router.get("/sources/images/{image_id}")
+def get_source_logo_image(image_id: int, db: Session = Depends(get_db)) -> FileResponse:
+    asset = db.query(ImageAsset).filter(ImageAsset.id == int(image_id)).one_or_none()
+    if asset is None:
+        raise NotFoundError("Изображение не найдено")
+    return FileResponse(MediaAssetService(db).resolve_file_path(asset), media_type=asset.mime_type)
 
 
 @router.patch("/sources/{source_key}/enabled", dependencies=[Depends(require_permission("control.sources.edit"))])
@@ -231,3 +253,28 @@ def patch_source_supplier(source_key: str, payload: SupplierPatch, db: Session =
     db.commit()
     refreshed = repo.get_by_key(source_key)
     return _source_payload(db, refreshed, SourceRegistryService.fetch_service_sources_payload().get(refreshed.key), _source_counts_by_id(db))
+
+
+@router.patch("/sources/{source_key}/logo", dependencies=[Depends(require_permission("control.sources.edit"))])
+def patch_source_logo(source_key: str, payload: SourceLogoPatch, db: Session = Depends(get_db)) -> dict:
+    SourceRegistryService(db).refresh_from_service()
+    repo = SourceRegistryService(db).repo
+    entity = repo.get_by_key(source_key)
+    if entity is None:
+        raise NotFoundError("Источник не найден")
+    logo_image_asset_id = payload.logo_image_asset_id
+    if logo_image_asset_id is not None:
+        asset_exists = db.query(ImageAsset.id).filter(ImageAsset.id == int(logo_image_asset_id)).one_or_none()
+        if asset_exists is None:
+            raise ValidationError("Логотип не найден")
+        entity.logo_image_asset_id = int(logo_image_asset_id)
+    else:
+        entity.logo_image_asset_id = None
+    db.commit()
+    refreshed = repo.get_by_key(source_key)
+    return _source_payload(
+        db,
+        refreshed,
+        SourceRegistryService.fetch_service_sources_payload().get(refreshed.key),
+        _source_counts_by_id(db),
+    )

@@ -1,4 +1,11 @@
+from __future__ import annotations
+
+from uuid import uuid4
+
+from app.core.database import SessionLocal
+from app.models import Product, ProductListing, ProductPriceOverride, Source, SourceSetting, Supplier, SupplierShippingRate
 from app.schemas.admin_settings import PricingSettingsResponse, PricingSupplierRateResponse, PricingSupplierResponse
+from app.services.catalog.product_ingest_service import ProductIngestService
 from app.services.catalog.product_query_service import ProductQueryService
 
 
@@ -167,3 +174,222 @@ def test_build_sample_pricing_example_payload_falls_back_to_zero_tariff_when_sup
     assert payload["is_sample"] is True
     assert "тариф еще не настроен" in payload["source_name"].lower()
     assert payload["components"]["supplier_transport_rub"] == 0.0
+
+
+def test_pricing_example_uses_lightweight_lookup_without_legacy_full_product_load(monkeypatch) -> None:
+    db = SessionLocal()
+    marker = uuid4().hex[:10]
+    try:
+        source = Source(
+            key=f"pricing-example-{marker}.example",
+            name=f"Pricing Example {marker}",
+            base_url=f"https://pricing-example-{marker}.example",
+            base_url_normalized=f"pricing-example-{marker}.example",
+            host_normalized=f"pricing-example-{marker}.example",
+        )
+        db.add(source)
+        db.flush()
+
+        supplier = Supplier(
+            key=f"supplier-{marker}",
+            name=f"Supplier {marker}",
+            provider_kind="main",
+            rate_currency="RUB",
+            is_enabled=True,
+        )
+        db.add(supplier)
+        db.flush()
+        db.add(
+            SupplierShippingRate(
+                supplier_id=int(supplier.id),
+                min_weight_kg=0.0,
+                max_weight_kg=1.0,
+                price_rub=2500.0,
+            )
+        )
+        db.add(
+            SourceSetting(
+                source_id=int(source.id),
+                supplier_id=int(supplier.id),
+                is_enabled=True,
+                is_sync_enabled=True,
+                show_images=True,
+                description_mode="text",
+            )
+        )
+        db.flush()
+
+        ProductIngestService(db).apply_batch(
+            source_id=int(source.id),
+            items=[
+                {
+                    "url": f"https://pricing-example-{marker}.example/products/archive-jacket",
+                    "handle": f"archive-jacket-{marker}",
+                    "title": "Archive Designer Jacket",
+                    "description": "Structured archive jacket",
+                    "designer": "Archive Designer",
+                    "category": "Outerwear",
+                    "tags": ["archive", "jacket"],
+                    "gender": "unisex",
+                    "source_weight_grams": 700,
+                    "orderability_status": "orderable",
+                    "variants": [{"title": "48", "price": 120.0, "currency": "USD", "available": True}],
+                    "images": [f"https://cdn.example/{marker}.jpg"],
+                }
+            ],
+        )
+        db.flush()
+
+        listing = (
+            db.query(ProductListing)
+            .filter(ProductListing.source_id == int(source.id), ProductListing.handle == f"archive-jacket-{marker}")
+            .one()
+        )
+        product = db.query(Product).filter(Product.primary_listing_id == int(listing.id)).one()
+
+        service = ProductQueryService(db)
+
+        def _legacy_repo_call(*args, **kwargs):
+            raise AssertionError("legacy list_products_by_ids path must not be used for pricing example")
+
+        def _legacy_payload_call(*args, **kwargs):
+            raise AssertionError("legacy build_admin_product_payload path must not be used for pricing example")
+
+        monkeypatch.setattr(service.products, "list_products_by_ids", _legacy_repo_call)
+        monkeypatch.setattr(service, "build_admin_product_payload", _legacy_payload_call)
+        monkeypatch.setattr(service, "_is_pricing_example_candidate", lambda _payload: True)
+
+        payload = service.get_pricing_example_payload(product_id=int(product.id))
+
+        assert payload is not None
+        assert payload["is_sample"] is False
+        assert int(payload["product_id"]) == int(product.id)
+        assert payload["title"] == "Jacket"
+        assert payload["source_name"] == f"Pricing Example {marker}"
+        assert payload["source_currency"] == "USD"
+        assert payload["source_price"] == 120.0
+        assert payload["final_price"] is not None
+        assert payload["image_url"] == f"https://cdn.example/{marker}.jpg"
+        explicit_payload = service.get_pricing_example_payload(product_id=int(product.id))
+        assert explicit_payload is not None
+        assert int(explicit_payload["product_id"]) == int(product.id)
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_pricing_example_ignores_hidden_unavailable_and_manual_price_products(monkeypatch) -> None:
+    db = SessionLocal()
+    marker = uuid4().hex[:10]
+    try:
+        source = Source(
+            key=f"pricing-filter-{marker}.example",
+            name=f"Pricing Filter {marker}",
+            base_url=f"https://pricing-filter-{marker}.example",
+            base_url_normalized=f"pricing-filter-{marker}.example",
+            host_normalized=f"pricing-filter-{marker}.example",
+        )
+        db.add(source)
+        db.flush()
+
+        supplier = Supplier(
+            key=f"supplier-filter-{marker}",
+            name=f"Supplier Filter {marker}",
+            provider_kind="main",
+            rate_currency="RUB",
+            is_enabled=True,
+        )
+        db.add(supplier)
+        db.flush()
+        db.add(
+            SupplierShippingRate(
+                supplier_id=int(supplier.id),
+                min_weight_kg=0.0,
+                max_weight_kg=1.0,
+                price_rub=2500.0,
+            )
+        )
+        db.add(
+            SourceSetting(
+                source_id=int(source.id),
+                supplier_id=int(supplier.id),
+                is_enabled=True,
+                is_sync_enabled=True,
+                show_images=True,
+                description_mode="text",
+            )
+        )
+        db.flush()
+
+        service = ProductIngestService(db)
+
+        def _create_product(handle: str, title: str) -> tuple[Product, ProductListing]:
+            service.apply_batch(
+                source_id=int(source.id),
+                items=[
+                    {
+                        "url": f"https://pricing-filter-{marker}.example/products/{handle}",
+                        "handle": handle,
+                        "title": title,
+                        "description": "Structured pricing example item",
+                        "designer": "Archive Designer",
+                        "category": "Outerwear",
+                        "tags": ["archive", "jacket"],
+                        "gender": "unisex",
+                        "source_weight_grams": 700,
+                        "orderability_status": "orderable",
+                        "variants": [{"title": "48", "price": 120.0, "currency": "USD", "available": True}],
+                        "images": [f"https://cdn.example/{handle}.jpg"],
+                    }
+                ],
+            )
+            db.flush()
+            listing = (
+                db.query(ProductListing)
+                .filter(ProductListing.source_id == int(source.id), ProductListing.handle == handle)
+                .one()
+            )
+            product = db.query(Product).filter(Product.primary_listing_id == int(listing.id)).one()
+            return product, listing
+
+        eligible_product, _eligible_listing = _create_product(f"eligible-{marker}", "Eligible Example Jacket")
+        hidden_product, _hidden_listing = _create_product(f"hidden-{marker}", "Hidden Example Jacket")
+        unavailable_product, unavailable_listing = _create_product(f"unavailable-{marker}", "Unavailable Example Jacket")
+        manual_price_product, _manual_price_listing = _create_product(f"manual-price-{marker}", "Manual Price Example Jacket")
+
+        hidden_product.visibility_status = "hidden"
+        unavailable_listing.orderability_status = "unavailable"
+        unavailable_listing.status_reason = "source_removed"
+        db.add(
+            ProductPriceOverride(
+                product_id=int(manual_price_product.id),
+                manual_price_rub=99999.0,
+                manual_compare_at_price_rub=None,
+            )
+        )
+        db.flush()
+
+        service_query = ProductQueryService(db)
+        monkeypatch.setattr(service_query, "_is_pricing_example_candidate", lambda _payload: True)
+        payload = service_query.get_pricing_example_payload(product_id=int(eligible_product.id))
+
+        assert payload is not None
+        assert payload["is_sample"] is False
+        assert int(payload["product_id"]) == int(eligible_product.id)
+        fallback_payload = service_query.get_pricing_example_payload()
+        hidden_payload = service_query.get_pricing_example_payload(product_id=int(hidden_product.id))
+        unavailable_payload = service_query.get_pricing_example_payload(product_id=int(unavailable_product.id))
+        manual_price_payload = service_query.get_pricing_example_payload(product_id=int(manual_price_product.id))
+
+        assert fallback_payload is not None
+        assert int(fallback_payload["product_id"]) not in {
+            int(hidden_product.id),
+            int(unavailable_product.id),
+            int(manual_price_product.id),
+        }
+        assert hidden_payload is None
+        assert unavailable_payload is None
+        assert manual_price_payload is None
+    finally:
+        db.rollback()
+        db.close()

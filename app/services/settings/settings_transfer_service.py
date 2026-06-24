@@ -43,7 +43,7 @@ from app.schemas.admin_settings import (
     SettingsTransferWeightRuleEntry,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _PROJECT_NAME = "wardrobe-parser-platform"
 
 _PRICING_EXPORT_FIELDS = [
@@ -134,8 +134,6 @@ class SettingsTransferService:
         )
         ui_row = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
         admin_ui = SettingsTransferAdminUiSettings(
-            designers_min_products=max(1, int(getattr(ui_row, "designers_min_products", 1) or 1)),
-            designers_exclude_store_names=bool(getattr(ui_row, "designers_exclude_store_names", False)),
             auto_sync_period_minutes=max(60, int(getattr(ui_row, "auto_sync_period_minutes", 60) or 60)),
         )
 
@@ -358,8 +356,6 @@ class SettingsTransferService:
         updated_fields = 0
         values = payload.model_dump()
         normalized = {
-            "designers_min_products": max(1, int(values.get("designers_min_products") or 1)),
-            "designers_exclude_store_names": bool(values.get("designers_exclude_store_names")),
             "auto_sync_period_minutes": max(60, int(values.get("auto_sync_period_minutes") or 60)),
         }
         for key, raw_value in normalized.items():

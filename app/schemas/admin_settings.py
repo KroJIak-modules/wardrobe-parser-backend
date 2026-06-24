@@ -71,8 +71,6 @@ class ShowcaseCarouselOrderRequest(BaseModel):
 
 
 class AdminUiSettingsResponse(BaseModel):
-    designers_min_products: int = Field(ge=1, le=1_000_000)
-    designers_exclude_store_names: bool = False
     auto_sync_period_minutes: int = Field(ge=60, le=1_000_000, default=60)
     auto_sync_next_run_at: str | None = None
     auto_sync_last_started_at: str | None = None
@@ -82,8 +80,6 @@ class AdminUiSettingsResponse(BaseModel):
 
 
 class AdminUiSettingsUpdateRequest(BaseModel):
-    designers_min_products: int | None = Field(default=None, ge=1, le=1_000_000)
-    designers_exclude_store_names: bool | None = None
     auto_sync_period_minutes: int | None = Field(default=None, ge=60, le=1_000_000)
 
 
@@ -167,8 +163,6 @@ class SettingsTransferPricingSettings(BaseModel):
 
 
 class SettingsTransferAdminUiSettings(BaseModel):
-    designers_min_products: int = Field(ge=1, le=1_000_000)
-    designers_exclude_store_names: bool = False
     auto_sync_period_minutes: int = Field(ge=60, le=1_000_000, default=60)
 
 
@@ -216,7 +210,7 @@ class SettingsTransferDesignerSourceNameEntry(BaseModel):
 
 
 class SettingsTransferPayload(BaseModel):
-    schema_version: int = Field(default=1, ge=1, le=1000)
+    schema_version: int = Field(default=2, ge=1, le=1000)
     exported_at: str | None = None
     project: str | None = None
     pricing_settings: SettingsTransferPricingSettings
