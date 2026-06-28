@@ -186,6 +186,8 @@ class SettingsTransferSourceEntry(BaseModel):
     key: str = Field(min_length=1, max_length=255)
     name: str = Field(min_length=1, max_length=255)
     url: str = Field(min_length=1, max_length=2048)
+    adapter_key: str = Field(min_length=1, max_length=255)
+    parser_config: dict = Field(default_factory=dict)
     enabled: bool = True
     sync_enabled: bool = True
     dedup_enabled: bool = True
@@ -210,7 +212,7 @@ class SettingsTransferDesignerSourceNameEntry(BaseModel):
 
 
 class SettingsTransferPayload(BaseModel):
-    schema_version: int = Field(default=2, ge=1, le=1000)
+    schema_version: int = Field(default=3, ge=1, le=1000)
     exported_at: str | None = None
     project: str | None = None
     pricing_settings: SettingsTransferPricingSettings

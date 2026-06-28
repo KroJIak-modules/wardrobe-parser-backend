@@ -10,10 +10,12 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import SessionLocal
+from app.core.exceptions import ValidationError
 from app.models import SyncJob
 from app.repositories.catalog_sources import CatalogSourceRepository
 from app.repositories.catalog_sync import CatalogSyncRepository
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
+from app.services.catalog.sync_error_humanizer import humanize_sync_error, normalize_sync_error_code
 from app.services.catalog.product_ingest_service import ProductIngestService
 from app.services.catalog.source_registry_service import SourceRegistryService
 
@@ -76,10 +78,7 @@ class SyncJobService:
 
     @staticmethod
     def _derive_error_code(error_message: str | None) -> str | None:
-        value = str(error_message or "").strip()
-        if not value:
-            return None
-        return value.split(":", 1)[0].strip().lower().replace(" ", "_")[:255] or "sync_failed"
+        return normalize_sync_error_code(error_message)
 
     @classmethod
     def mark_interrupted_jobs_on_startup(cls) -> None:
@@ -88,7 +87,7 @@ class SyncJobService:
             for job in db.query(SyncJob).filter(SyncJob.status.in_(["queued", "running"])).all():
                 job.status = "failed"
                 job.finished_at = cls._utcnow()
-                job.error_message = "backend_restarted"
+                job.error_message = humanize_sync_error("backend_restarted", "backend_restarted")
             db.commit()
         except Exception:
             db.rollback()
@@ -104,12 +103,11 @@ class SyncJobService:
         trigger_kind: str = "manual",
     ) -> dict:
         registry = SourceRegistryService(self.db)
-        sources = registry.refresh_from_service()
-        service_items = SourceRegistryService.fetch_service_sources_payload()
+        sources = registry.list_all()
         normalized_requested = [str(key or "").strip().lower() for key in (source_keys or []) if str(key or "").strip()]
         selected_sources = []
         for source in sources:
-            source_mode = SourceRegistryService.derive_source_mode(source.key, service_items.get(source.key))
+            source_mode = SourceRegistryService.derive_source_mode(source)
             if source_mode == "personal":
                 continue
             if not bool(getattr(getattr(source, "setting", None), "is_enabled", True)):
@@ -125,16 +123,19 @@ class SyncJobService:
         if not selected_sources:
             raise ValueError("Нет доступных источников для синхронизации")
 
-        response = requests.post(
-            self._service_url("/jobs"),
-            json={
-                "triggered_by": "backend",
-                "dry_run": False,
-                "sources": [source.key for source in selected_sources],
-            },
-            timeout=(5, 30),
-        )
-        response.raise_for_status()
+        try:
+            response = requests.post(
+                self._service_url("/jobs"),
+                json={
+                    "triggered_by": "backend",
+                    "dry_run": False,
+                    "sources": [source.key for source in selected_sources],
+                },
+                timeout=(5, 30),
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise ValidationError(humanize_sync_error(str(exc), exc.__class__.__name__) or "Сервис синхронизации временно недоступен.") from exc
         payload = response.json()
         service_job_id = str(payload.get("job_id") or "").strip()
         if not service_job_id:
@@ -231,6 +232,7 @@ class SyncJobService:
         backend_job_id: int,
         source_key: str,
         status_value: str,
+        error_code: str | None = None,
         error_message: str | None = None,
         unavailable_products: int = 0,
     ) -> None:
@@ -260,8 +262,8 @@ class SyncJobService:
         source_run.failed_products = failed_products
         normalized_source_state_status = cls._normalize_source_state_status(status_value)
         if normalized_source_state_status == "failed":
-            source_run.error_message = str(error_message or "").strip() or None
-            source_run.error_code = cls._derive_error_code(source_run.error_message)
+            source_run.error_code = normalize_sync_error_code(error_message, error_code)
+            source_run.error_message = humanize_sync_error(error_message, source_run.error_code)
         elif normalized_source_state_status is not None:
             source_run.error_message = None
             source_run.error_code = None
@@ -289,7 +291,7 @@ class SyncJobService:
         cursor = 0
         try:
             registry = SourceRegistryService(db)
-            registry.refresh_from_service()
+            registry.list_all()
             sync_repo = CatalogSyncRepository(db)
             job = sync_repo.get_job(backend_job_id)
             if job is None:
@@ -343,6 +345,7 @@ class SyncJobService:
                             backend_job_id=backend_job_id,
                             source_key=source_key,
                             status_value=str(payload.get("status") or "completed").strip().lower(),
+                            error_code=(str(payload.get("error_code") or "").strip() or None),
                             error_message=(str(payload.get("error") or "").strip() or None),
                             unavailable_products=int(payload.get("unavailable_products") or 0),
                         )
@@ -352,7 +355,7 @@ class SyncJobService:
                 service_status = str(status_payload.get("status") or "").strip().lower()
                 if service_status in {"completed", "failed", "canceled"}:
                     final_status = cls._normalize_job_status(service_status)
-                    error_message = str(status_payload.get("error") or "").strip() or None
+                    error_message = humanize_sync_error(str(status_payload.get("error") or "").strip() or None)
                     break
                 time.sleep(2.0)
 
@@ -370,7 +373,7 @@ class SyncJobService:
             if job is not None:
                 job.status = "failed"
                 job.finished_at = cls._utcnow()
-                job.error_message = str(exc)
+                job.error_message = humanize_sync_error(str(exc), exc.__class__.__name__)
                 db.commit()
         finally:
             with cls._lock:
@@ -398,7 +401,7 @@ class SyncJobService:
             "products_seen": expected_products,
             "products_applied": processed_products,
             "failed_products": max(0, expected_products - processed_products),
-            "error": job.error_message,
+            "error": humanize_sync_error(job.error_message),
             "can_cancel": self._normalize_job_status(getattr(job, "status", "")) in {"queued", "running"},
         }
 

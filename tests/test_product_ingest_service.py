@@ -17,7 +17,6 @@ def test_product_ingest_service_preserves_existing_optional_source_snapshot_fiel
             name=source_key,
             base_url=f"https://{source_key}",
             base_url_normalized=source_key,
-            host_normalized=source_key,
         )
         db.add(source)
         db.flush()
@@ -94,7 +93,6 @@ def test_product_ingest_service_matches_weight_rule_from_handle() -> None:
             name=source_key,
             base_url=f"https://{source_key}",
             base_url_normalized=source_key,
-            host_normalized=source_key,
         )
         db.add(source)
         db.flush()
@@ -143,7 +141,6 @@ def test_product_ingest_service_accepts_service_variant_shape() -> None:
             name=source_key,
             base_url=f"https://{source_key}",
             base_url_normalized=source_key,
-            host_normalized=source_key,
         )
         db.add(source)
         db.flush()
@@ -202,7 +199,6 @@ def test_product_ingest_service_replaces_source_images_without_gallery_trigger_f
             name=source_key,
             base_url=f"https://{source_key}",
             base_url_normalized=source_key,
-            host_normalized=source_key,
         )
         db.add(source)
         db.flush()

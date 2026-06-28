@@ -67,7 +67,7 @@ class CatalogTaxonomyRepository:
         rows = (
             self.session.query(Product.id)
             .filter(Product.id.in_(list(product_ids)))
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
             .all()
         )
         return {int(row.id) for row in rows}

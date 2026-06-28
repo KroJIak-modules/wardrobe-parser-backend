@@ -15,6 +15,8 @@ from app.services.catalog.filter_assignment_service import ProductFilterAssignme
 
 
 class DedupServiceV2:
+    _DECISION_ACTIONS = {"combine", "keep_left", "keep_right", "reject"}
+
     def __init__(self, db: Session) -> None:
         self.db = db
         self.products = CatalogProductRepository(db)
@@ -82,8 +84,63 @@ class DedupServiceV2:
             return int(rule_weight_grams)
         return None
 
+    @staticmethod
+    def _source_price_summary_for_listing(listing) -> dict[str, Any] | None:
+        if listing is None:
+            return None
+        variants = [variant for variant in list(getattr(listing, "variants", []) or []) if getattr(variant, "price_amount", None) is not None]
+        if not variants:
+            return None
+        variants.sort(key=lambda item: (0 if bool(getattr(item, "is_orderable", False)) else 1, float(getattr(item, "price_amount", 0) or 0), int(getattr(item, "position", 0)), int(getattr(item, "id", 0))))
+        representative = variants[0]
+        baseline_currency = str(getattr(representative, "currency_code", "") or "").upper() or None
+        baseline_price = DedupServiceV2._candidate_price(getattr(representative, "price_amount", None))
+        has_range = any(
+            (str(getattr(variant, "currency_code", "") or "").upper() or None) != baseline_currency
+            or DedupServiceV2._candidate_price(getattr(variant, "price_amount", None)) != baseline_price
+            for variant in variants[1:]
+        )
+        compare_at_price = DedupServiceV2._candidate_price(getattr(representative, "compare_at_price_amount", None))
+        if compare_at_price is not None and baseline_price is not None and compare_at_price <= baseline_price:
+            compare_at_price = None
+        return {
+            "source_display_price": baseline_price,
+            "source_currency": baseline_currency,
+            "source_compare_at_price": compare_at_price,
+            "source_has_range": has_range,
+            "final_display_price": None,
+            "final_currency": None,
+            "final_compare_at_price": None,
+            "final_has_range": False,
+            "pricing_manual_required": False,
+            "pricing_reason": None,
+            "representative_variant_id": int(getattr(representative, "id", 0) or 0) or None,
+            "representative_listing_id": int(getattr(listing, "id", 0) or 0) or None,
+            "representative_source_ref_id": str(getattr(representative, "source_ref_id", "") or "").strip() or None,
+        }
+
+    @staticmethod
+    def _row_price_summary(*, price: float | None, currency: str | None) -> dict[str, Any] | None:
+        if price is None:
+            return None
+        normalized_currency = str(currency or "").upper() or None
+        return {
+            "source_display_price": price,
+            "source_currency": normalized_currency,
+            "source_compare_at_price": None,
+            "source_has_range": False,
+            "final_display_price": None,
+            "final_currency": None,
+            "final_compare_at_price": None,
+            "final_has_range": False,
+            "pricing_manual_required": False,
+            "pricing_reason": None,
+            "representative_variant_id": None,
+            "representative_listing_id": None,
+            "representative_source_ref_id": None,
+        }
+
     def _candidate_payload_from_row(self, row) -> dict:
-        manual_price = self._candidate_price(getattr(row, "manual_price_rub", None))
         variant_price = self._candidate_price(getattr(row, "variant_price_amount", None))
         image_url = str(getattr(row, "image_url", "") or "").strip()
         show_images = bool(getattr(row, "show_images", True))
@@ -99,11 +156,9 @@ class DedupServiceV2:
             "source_designer_name": source_designer_name,
             "display_designer_name": designer_name or source_designer_name,
             "url": (str(getattr(row, "url", "") or "").strip() or None) if ingest_mode != "manual" else None,
-            "price": manual_price if manual_price is not None else variant_price,
-            "currency": (
-                "RUB"
-                if manual_price is not None
-                else str(getattr(row, "variant_currency_code", "") or "").upper() or "RUB"
+            "price_summary": self._row_price_summary(
+                price=variant_price,
+                currency=str(getattr(row, "variant_currency_code", "") or "").upper() or None,
             ),
             "visibility_status": str(getattr(row, "visibility_status", "") or "visible"),
             "effective_weight_grams": self._candidate_effective_weight(
@@ -118,7 +173,6 @@ class DedupServiceV2:
 
     def _candidate_payload_from_product(self, product: Product) -> dict:
         listing = getattr(product, "primary_listing", None)
-        price_override = getattr(product, "price_override", None)
         weight_rule = getattr(product, "weight_rule", None)
         designer_name = str(getattr(getattr(product, "designer", None), "name", "") or "").strip() or None
         source_designer_name = str(getattr(listing, "source_designer_raw", "") or "").strip() or None
@@ -135,15 +189,6 @@ class DedupServiceV2:
             if listing_images:
                 listing_images.sort(key=lambda item: (int(getattr(item, "position", 0)), int(getattr(item, "id", 0))))
                 image_url = str(getattr(listing_images[0], "url", "") or "").strip()
-        variant_price = None
-        variant_currency = None
-        if listing is not None:
-            variants = [variant for variant in list(getattr(listing, "variants", []) or []) if getattr(variant, "price_amount", None) is not None]
-            if variants:
-                variants.sort(key=lambda item: (int(getattr(item, "position", 0)), int(getattr(item, "id", 0))))
-                variant_price = self._candidate_price(getattr(variants[0], "price_amount", None))
-                variant_currency = str(getattr(variants[0], "currency_code", "") or "").upper() or "RUB"
-        manual_price = self._candidate_price(getattr(price_override, "manual_price_rub", None))
         return {
             "id": int(product.id),
             "title": title_override or source_title or f"Товар {int(product.id)}",
@@ -151,8 +196,7 @@ class DedupServiceV2:
             "source_designer_name": source_designer_name,
             "display_designer_name": designer_name or source_designer_name,
             "url": (str(getattr(listing, "url", "") or "").strip() or None) if listing is not None and ingest_mode != "manual" else None,
-            "price": manual_price if manual_price is not None else variant_price,
-            "currency": "RUB" if manual_price is not None else (variant_currency or "RUB"),
+            "price_summary": self._source_price_summary_for_listing(listing),
             "visibility_status": str(getattr(product, "visibility_status", "") or "visible"),
             "effective_weight_grams": self._candidate_effective_weight(
                 manual_weight_grams=getattr(product, "manual_weight_grams", None),
@@ -359,18 +403,86 @@ class DedupServiceV2:
         self.decisions.replace_candidates(candidates=serialized)
         return len(serialized)
 
+    @classmethod
+    def _normalize_decision_action(cls, value: str | None, *, fallback: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in cls._DECISION_ACTIONS:
+            return normalized
+        return str(fallback or "").strip().lower()
+
+    def describe_decision_action(self, decision) -> str:
+        decision_kind = str(getattr(decision, "decision_kind", "") or "").strip().lower()
+        undo_payload = getattr(decision, "undo_payload", None)
+        if isinstance(undo_payload, dict):
+            return self._normalize_decision_action(undo_payload.get("decision_action"), fallback=decision_kind)
+        return self._normalize_decision_action(None, fallback=decision_kind)
+
+    @staticmethod
+    def _decision_kind_from_merge_mode(merge_mode: str | None) -> str:
+        normalized = str(merge_mode or "").strip().lower()
+        if normalized in {"combine", "keep_left", "keep_right"}:
+            return normalized
+        return "combine"
+
+    @staticmethod
+    def _product_snapshot(product: Product) -> dict[str, Any]:
+        return {
+            "product_id": int(product.id),
+            "lifecycle_status": str(product.lifecycle_status or "active"),
+            "primary_listing_id": int(product.primary_listing_id) if product.primary_listing_id is not None else None,
+            "source_gender": str(getattr(product, "source_gender", "") or ""),
+            "gender_is_manual": bool(getattr(product, "gender_is_manual", False)),
+            "dedup_status": str(getattr(product, "dedup_status", "") or "independent"),
+            "dedup_decision_id": (
+                int(getattr(product, "dedup_decision_id"))
+                if getattr(product, "dedup_decision_id", None) is not None
+                else None
+            ),
+            "dedup_target_product_id": (
+                int(getattr(product, "dedup_target_product_id"))
+                if getattr(product, "dedup_target_product_id", None) is not None
+                else None
+            ),
+        }
+
+    def _restore_product_snapshot(self, snapshot: dict[str, Any]) -> None:
+        product_id = int(snapshot["product_id"])
+        product = self.products.get_product(product_id)
+        self.products.set_product_lifecycle_status(
+            product_id=product_id,
+            lifecycle_status=str(snapshot.get("lifecycle_status") or "active"),
+        )
+        self.products.set_product_primary_listing(
+            product_id=product_id,
+            primary_listing_id=(int(snapshot["primary_listing_id"]) if snapshot.get("primary_listing_id") is not None else None),
+        )
+        if product is not None and "source_gender" in snapshot:
+            product.source_gender = str(snapshot.get("source_gender") or product.gender)
+        if product is not None and "gender_is_manual" in snapshot:
+            product.gender_is_manual = bool(snapshot.get("gender_is_manual"))
+        self.products.set_product_dedup_state(
+            product_id=product_id,
+            dedup_status=str(snapshot.get("dedup_status") or "independent"),
+            dedup_decision_id=(int(snapshot["dedup_decision_id"]) if snapshot.get("dedup_decision_id") is not None else None),
+            dedup_target_product_id=(
+                int(snapshot["dedup_target_product_id"])
+                if snapshot.get("dedup_target_product_id") is not None
+                else None
+            ),
+        )
+
     def reject(self, *, product_ids: list[int]) -> None:
         candidate = self.decisions.get_candidate_by_pair(product_ids=product_ids)
         decision = self.decisions.create_decision(decision_kind="reject", created_product_id=None)
+        undo_payload: dict[str, Any] = {"decision_action": "reject"}
         if candidate is not None:
-            decision.undo_payload = {
-                "candidate": self._serialize_candidate_snapshot(
-                    left_product_id=int(candidate.left_product_id),
-                    right_product_id=int(candidate.right_product_id),
-                    score=float(candidate.score),
-                    reasons=list(candidate.reasons or []),
-                )
-            }
+            undo_payload["candidate"] = self._serialize_candidate_snapshot(
+                left_product_id=int(candidate.left_product_id),
+                right_product_id=int(candidate.right_product_id),
+                score=float(candidate.score),
+                reasons=list(candidate.reasons or []),
+            )
+        decision.undo_payload = undo_payload
         self.decisions.add_members(decision_id=int(decision.id), product_ids=product_ids)
         self.decisions.delete_candidate_by_pair(product_ids=product_ids)
 
@@ -380,6 +492,7 @@ class DedupServiceV2:
         product_ids: list[int],
         primary_product_id: int | None = None,
         primary_listing_id: int | None = None,
+        merge_mode: str | None = None,
     ) -> int:
         unique_product_ids = []
         seen_product_ids: set[int] = set()
@@ -392,11 +505,22 @@ class DedupServiceV2:
         if len(unique_product_ids) < 2:
             raise ValidationError("Для merge нужно минимум два разных товара")
 
+        normalized_merge_mode = str(merge_mode or "").strip().lower()
+        if normalized_merge_mode and normalized_merge_mode not in {"combine", "keep_left", "keep_right"}:
+            raise ValidationError("Неизвестный merge_mode")
+        if normalized_merge_mode == "keep_left":
+            primary_product_id = unique_product_ids[0]
+        elif normalized_merge_mode == "keep_right":
+            primary_product_id = unique_product_ids[-1]
+        decision_kind = self._decision_kind_from_merge_mode(normalized_merge_mode)
+
         products = []
         for product_id in unique_product_ids:
             product = self.products.get_product(product_id)
             if product is None:
                 raise ValidationError(f"Товар {product_id} не найден")
+            if str(getattr(product, "dedup_status", "") or "independent") != "independent":
+                raise ValidationError(f"Товар {product_id} уже исключен дедубликацией")
             products.append(product)
 
         if primary_product_id is None:
@@ -408,6 +532,8 @@ class DedupServiceV2:
             "product_id": int(primary.id),
             "designer_id": primary.designer_id,
             "gender": primary.gender,
+            "source_gender": str(getattr(primary, "source_gender", "") or primary.gender),
+            "gender_is_manual": bool(getattr(primary, "gender_is_manual", False)),
             "availability_mode": primary.availability_mode,
             "manual_weight_grams": primary.manual_weight_grams,
             "weight_rule_id": primary.weight_rule_id,
@@ -423,33 +549,21 @@ class DedupServiceV2:
                 if primary.presentation is not None
                 else None
             ),
-            "price_override": (
-                {
-                    "manual_price_rub": float(primary.price_override.manual_price_rub),
-                    "manual_compare_at_price_rub": (
-                        float(primary.price_override.manual_compare_at_price_rub)
-                        if primary.price_override.manual_compare_at_price_rub is not None
-                        else None
-                    ),
-                }
-                if primary.price_override is not None and primary.price_override.manual_price_rub is not None
-                else None
-            ),
         }
         candidate = self.decisions.get_candidate_by_pair(product_ids=unique_product_ids)
 
+        created_product_id: int | None = None
+        affected_products = list(products)
+        hidden_products = list(products)
+        if decision_kind == "keep_left":
+            hidden_products = [product for product in products if int(product.id) != int(unique_product_ids[0])]
+        elif decision_kind == "keep_right":
+            hidden_products = [product for product in products if int(product.id) != int(unique_product_ids[-1])]
+
         undo_payload: dict[str, Any] = {
-            "version": 1,
-            "products": [
-                {
-                    "product_id": int(product.id),
-                    "lifecycle_status": str(product.lifecycle_status),
-                    "primary_listing_id": int(product.primary_listing_id) if product.primary_listing_id is not None else None,
-                }
-                for product in products
-            ],
-            "listing_owners": [],
-            "gallery_scopes": [],
+            "version": 2,
+            "decision_action": decision_kind,
+            "products": [self._product_snapshot(product) for product in affected_products],
         }
         if candidate is not None:
             undo_payload["candidate"] = self._serialize_candidate_snapshot(
@@ -458,103 +572,92 @@ class DedupServiceV2:
                 score=float(candidate.score),
                 reasons=list(candidate.reasons or []),
             )
-        self.db.expunge_all()
-
-        created = self.products.create_product(
-            designer_id=primary_snapshot["designer_id"],
-            gender=primary_snapshot["gender"],
-            availability_mode=primary_snapshot["availability_mode"],
-            manual_weight_grams=primary_snapshot["manual_weight_grams"],
-            weight_rule_id=primary_snapshot["weight_rule_id"],
-            lifecycle_status="active",
-            visibility_status=primary_snapshot["visibility_status"],
-        )
-        merged_members = []
-        owner_by_listing_id: dict[int, int] = {}
-        for source_product_id in unique_product_ids:
-            product_listings = self.products.list_product_listings(int(source_product_id))
-            if not product_listings:
-                source_product = self.products.get_product(int(source_product_id))
-                fallback_primary_listing_id = (
-                    int(source_product.primary_listing_id)
-                    if source_product is not None and source_product.primary_listing_id is not None
-                    else None
-                )
-                if fallback_primary_listing_id is not None:
-                    self.products.ensure_membership(product_id=int(source_product_id), listing_id=fallback_primary_listing_id)
-                    product_listings = self.products.list_product_listings(int(source_product_id))
-            for listing in product_listings:
-                listing_id = int(listing.id)
-                if listing_id in owner_by_listing_id:
-                    continue
-                owner_by_listing_id[listing_id] = int(source_product_id)
-                merged_members.append(listing)
-                undo_payload["listing_owners"].append({"listing_id": listing_id, "product_id": int(source_product_id)})
-                undo_payload["gallery_scopes"].append(
-                    {
-                        "product_id": int(source_product_id),
-                        "listing_id": listing_id,
-                        "rows": self._serialize_gallery_rows(self.products.list_gallery_scope(product_id=int(source_product_id), listing_id=listing_id)),
-                    }
-                )
-        for listing in merged_members:
-            self.products.ensure_membership(product_id=int(created.id), listing_id=int(listing.id))
-            source_product_id = owner_by_listing_id.get(int(listing.id))
-            if source_product_id is None:
-                continue
-            scope_rows = self.products.list_gallery_scope(product_id=int(source_product_id), listing_id=int(listing.id))
-            if not scope_rows:
-                self.products.replace_gallery_scope_with_source_images(
-                    product_id=int(created.id),
-                    listing_id=int(listing.id),
-                    listing_images=listing.images,
-                )
-                continue
-            for row in scope_rows:
-                row.product_id = int(created.id)
-
-        allowed_primary_listing_ids = {int(listing.id) for listing in merged_members}
-        selected_primary_listing_id: int | None
-        if primary_listing_id is not None:
-            if int(primary_listing_id) not in allowed_primary_listing_ids:
-                raise ValidationError("primary_listing_id не входит в merged union")
-            selected_primary_listing_id = int(primary_listing_id)
-        else:
-            primary_members = self.products.list_product_listings(int(primary_snapshot["product_id"]))
-            selected_primary_listing_id = primary_snapshot["primary_listing_id"] or (primary_members[0].id if primary_members else None)
-        self.products.set_product_primary_listing(product_id=int(created.id), primary_listing_id=selected_primary_listing_id)
-        if primary_snapshot["presentation"] is not None:
-            self.db.add(
-                ProductPresentation(
-                    product_id=int(created.id),
-                    title_override=primary_snapshot["presentation"]["title_override"],
-                    description_text=primary_snapshot["presentation"]["description_text"],
-                    description_html=primary_snapshot["presentation"]["description_html"],
-                    description_visibility=primary_snapshot["presentation"]["description_visibility"],
-                )
+        if decision_kind == "combine":
+            created = self.products.create_product(
+                designer_id=primary_snapshot["designer_id"],
+                gender=primary_snapshot["gender"],
+                source_gender=primary_snapshot["source_gender"],
+                gender_is_manual=bool(primary_snapshot.get("gender_is_manual", False)),
+                availability_mode=primary_snapshot["availability_mode"],
+                manual_weight_grams=primary_snapshot["manual_weight_grams"],
+                weight_rule_id=primary_snapshot["weight_rule_id"],
+                lifecycle_status="active",
+                visibility_status=primary_snapshot["visibility_status"],
+                dedup_status="independent",
+                dedup_decision_id=None,
+                dedup_target_product_id=None,
             )
-        if primary_snapshot["price_override"] is not None:
-            self.products.upsert_price_override(
-                product_id=int(created.id),
-                manual_price_rub=float(primary_snapshot["price_override"]["manual_price_rub"]),
-                manual_compare_at_price_rub=primary_snapshot["price_override"]["manual_compare_at_price_rub"],
+            created_product_id = int(created.id)
+            unique_listings: dict[int, tuple[Any, int]] = {}
+            for source_product_id in unique_product_ids:
+                for listing in self.products.list_product_listings(int(source_product_id)):
+                    unique_listings.setdefault(int(listing.id), (listing, int(source_product_id)))
+            allowed_primary_listing_ids = set(unique_listings.keys())
+            if primary_listing_id is not None and int(primary_listing_id) not in allowed_primary_listing_ids:
+                raise ValidationError("primary_listing_id не входит в объединенный товар")
+            selected_primary_listing_id = (
+                int(primary_listing_id)
+                if primary_listing_id is not None
+                else primary_snapshot["primary_listing_id"]
+                or (min(allowed_primary_listing_ids) if allowed_primary_listing_ids else None)
             )
-
-        for source_product_id in unique_product_ids:
-            self.products.set_product_lifecycle_status(product_id=int(source_product_id), lifecycle_status="merged")
-        decision = self.decisions.create_decision(decision_kind="merge", created_product_id=int(created.id))
+            for listing_id, (listing, source_product_id) in unique_listings.items():
+                self.products.ensure_included_membership(product_id=created_product_id, listing_id=int(listing_id))
+                source_scope_rows = self.products.list_gallery_scope(product_id=source_product_id, listing_id=int(listing_id))
+                if source_scope_rows:
+                    for row in self._restore_gallery_rows(
+                        created_product_id,
+                        int(listing_id),
+                        self._serialize_gallery_rows(source_scope_rows),
+                    ):
+                        self.db.add(row)
+                else:
+                    self.products.replace_gallery_scope_with_source_images(
+                        product_id=created_product_id,
+                        listing_id=int(listing_id),
+                        listing_images=listing.images,
+                    )
+            self.products.set_product_primary_listing(product_id=created_product_id, primary_listing_id=selected_primary_listing_id)
+            if primary_snapshot["presentation"] is not None:
+                self.db.add(
+                    ProductPresentation(
+                        product_id=created_product_id,
+                        title_override=primary_snapshot["presentation"]["title_override"],
+                        description_text=primary_snapshot["presentation"]["description_text"],
+                        description_html=primary_snapshot["presentation"]["description_html"],
+                        description_visibility=primary_snapshot["presentation"]["description_visibility"],
+                    )
+                )
+        decision = self.decisions.create_decision(decision_kind=decision_kind, created_product_id=created_product_id)
         decision.undo_payload = undo_payload
         self.decisions.add_members(decision_id=int(decision.id), product_ids=unique_product_ids)
+
+        if hidden_products:
+            hidden_status = "combined_source" if decision_kind == "combine" else "hidden_by_keep"
+            target_product_id = created_product_id if decision_kind == "combine" else int(primary_product_id)
+            for product in hidden_products:
+                self.products.set_product_dedup_state(
+                    product_id=int(product.id),
+                    dedup_status=hidden_status,
+                    dedup_decision_id=int(decision.id),
+                    dedup_target_product_id=target_product_id,
+                )
+
         self.decisions.delete_candidates_for_product_ids(product_ids=unique_product_ids)
+        affected_ids = set(unique_product_ids)
+        if created_product_id is not None:
+            affected_ids.add(created_product_id)
         self.db.flush()
-        self.filter_assignments.enqueue_product_ids_after_commit([*unique_product_ids, int(created.id)])
-        return int(created.id)
+        self.filter_assignments.enqueue_product_ids_after_commit(sorted(affected_ids))
+        return int(created_product_id or primary_product_id)
 
     def can_undo_decision(self, decision) -> tuple[bool, str | None]:
         decision_kind = str(getattr(decision, "decision_kind", "") or "").lower()
         if decision_kind == "reject":
             return True, None
-        if decision_kind != "merge":
+        if decision_kind in {"keep_left", "keep_right"}:
+            return True, None
+        if decision_kind != "combine":
             return False, "Неизвестный тип решения"
         created_product_id = int(getattr(decision, "created_product_id", 0) or 0)
         undo_payload = getattr(decision, "undo_payload", None) or {}
@@ -565,14 +668,6 @@ class DedupServiceV2:
         created_product = self.products.get_product(created_product_id)
         if created_product is None:
             return False, "Объединенный товар уже недоступен"
-        expected_listing_ids = {
-            int(item.get("listing_id"))
-            for item in list(undo_payload.get("listing_owners") or [])
-            if isinstance(item, dict) and item.get("listing_id") is not None
-        }
-        current_listing_ids = {int(listing.id) for listing in self.products.list_product_listings(created_product_id)}
-        if current_listing_ids != expected_listing_ids:
-            return False, "Состав объединенного товара уже изменился"
         return True, None
 
     def undo(self, *, decision_id: int) -> None:
@@ -597,61 +692,45 @@ class DedupServiceV2:
         if not can_undo:
             raise ValidationError(blocked_reason or "Отмена этого решения недоступна")
 
-        created_product_id = int(decision.created_product_id or 0)
-        created_product = self.products.get_product(created_product_id)
-        if created_product is None:
-            raise ValidationError("Объединенный товар не найден")
-
         undo_payload = decision.undo_payload or {}
-        product_snapshot = {
-            int(item["product_id"]): item
-            for item in list(undo_payload.get("products") or [])
-            if isinstance(item, dict) and item.get("product_id") is not None
-        }
-        listing_owners = {
-            int(item["listing_id"]): int(item["product_id"])
+        legacy_listing_owners = [
+            item
             for item in list(undo_payload.get("listing_owners") or [])
             if isinstance(item, dict) and item.get("listing_id") is not None and item.get("product_id") is not None
-        }
-        gallery_scopes = [
+        ]
+        if legacy_listing_owners:
+            for item in legacy_listing_owners:
+                self.products.ensure_owner_membership(
+                    product_id=int(item["product_id"]),
+                    listing_id=int(item["listing_id"]),
+                )
+
+        legacy_gallery_scopes = [
             item
             for item in list(undo_payload.get("gallery_scopes") or [])
-            if isinstance(item, dict) and item.get("listing_id") is not None and item.get("product_id") is not None
+            if isinstance(item, dict) and item.get("product_id") is not None and item.get("listing_id") is not None
         ]
+        if legacy_gallery_scopes:
+            for scope in legacy_gallery_scopes:
+                product_id = int(scope["product_id"])
+                listing_id = int(scope["listing_id"])
+                for row in self.products.list_gallery_scope(product_id=product_id, listing_id=listing_id):
+                    self.db.delete(row)
+            self.db.flush()
+            for scope in legacy_gallery_scopes:
+                product_id = int(scope["product_id"])
+                listing_id = int(scope["listing_id"])
+                for row in self._restore_gallery_rows(product_id, listing_id, list(scope.get("rows") or [])):
+                    self.db.add(row)
+            self.db.flush()
 
-        for listing_id, product_id in listing_owners.items():
-            self.products.ensure_membership(product_id=product_id, listing_id=listing_id)
-
-        for product_id, snapshot in product_snapshot.items():
-            product = self.products.get_product(product_id)
-            if product is None:
-                continue
-            self.products.set_product_lifecycle_status(
-                product_id=product_id,
-                lifecycle_status=str(snapshot.get("lifecycle_status") or "active"),
-            )
-            self.products.set_product_primary_listing(
-                product_id=product_id,
-                primary_listing_id=(
-                    int(snapshot["primary_listing_id"])
-                    if snapshot.get("primary_listing_id") is not None
-                    else None
-                ),
-            )
-
-        for scope in gallery_scopes:
-            product_id = int(scope["product_id"])
-            listing_id = int(scope["listing_id"])
-            for row in self.products.list_gallery_scope(product_id=product_id, listing_id=listing_id):
-                self.db.delete(row)
-        self.db.flush()
-
-        for scope in gallery_scopes:
-            product_id = int(scope["product_id"])
-            listing_id = int(scope["listing_id"])
-            for row in self._restore_gallery_rows(product_id, listing_id, list(scope.get("rows") or [])):
-                self.db.add(row)
-        self.db.flush()
+        product_snapshots = [
+            item
+            for item in list(undo_payload.get("products") or [])
+            if isinstance(item, dict) and item.get("product_id") is not None
+        ]
+        for snapshot in product_snapshots:
+            self._restore_product_snapshot(snapshot)
 
         candidate_snapshot = undo_payload.get("candidate") if isinstance(undo_payload, dict) else None
         if isinstance(candidate_snapshot, dict):
@@ -662,8 +741,14 @@ class DedupServiceV2:
                 reasons=[str(item) for item in list(candidate_snapshot.get("reasons") or [])],
             )
         self.decisions.delete_decision(decision)
-        self.products.delete_product_hard(created_product_id)
-        self.filter_assignments.enqueue_product_ids_after_commit([*product_snapshot.keys(), int(created_product_id)])
+        affected_ids = {int(snapshot["product_id"]) for snapshot in product_snapshots}
+        if decision_kind == "combine":
+            created_product_id = int(decision.created_product_id or 0)
+            if created_product_id <= 0:
+                raise ValidationError("Объединенный товар не найден")
+            self.products.delete_product_hard(created_product_id)
+            affected_ids.add(created_product_id)
+        self.filter_assignments.enqueue_product_ids_after_commit(sorted(affected_ids))
 
     def _decided_pair_keys(self) -> set[str]:
         decided: set[str] = set()

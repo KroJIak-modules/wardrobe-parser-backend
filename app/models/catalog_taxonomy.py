@@ -26,6 +26,7 @@ class Filter(Base):
     display_title = Column(Text, nullable=True)
     slug = Column(String(255), nullable=False, unique=True)
     node_kind = Column(String(16), nullable=False, default="filter", server_default="filter")
+    mobile_menu_group_code = Column(String(64), nullable=True)
     is_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

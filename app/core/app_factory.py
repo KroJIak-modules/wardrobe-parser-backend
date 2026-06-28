@@ -162,7 +162,7 @@ def create_app() -> FastAPI:
             db = SessionLocal()
             try:
                 AdminAccountsService(db).ensure_superadmin_user()
-                SourceRegistryService(db).refresh_from_service()
+                SourceRegistryService(db).list_all()
                 CatalogDefaultsService(db).ensure()
                 mark_interrupted_jobs_on_startup()
                 db.commit()

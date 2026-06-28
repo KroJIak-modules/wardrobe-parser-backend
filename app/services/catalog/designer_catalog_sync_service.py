@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductListingMember
+from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductListingMember, ProductPresentation
 from app.services.catalog.designer_support import normalize_designer_text, slugify_designer_name
 
 
@@ -15,17 +15,19 @@ class DesignerCatalogSyncService:
         self.db.flush()
         rows = (
             self.db.query(
-                ProductListing.source_designer_raw.label("source_brand"),
+                func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw).label("source_brand"),
                 func.count(func.distinct(Product.id)).label("source_product_count"),
             )
+            .select_from(ProductListing)
             .join(ProductListingMember, ProductListingMember.listing_id == ProductListing.id)
             .join(Product, Product.id == ProductListingMember.product_id)
-            .filter(Product.lifecycle_status != "merged")
-            .filter(ProductListing.ingest_mode != "manual")
+            .outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
+            .filter(Product.lifecycle_status == "active")
             .filter(or_(ProductListing.orderability_status.is_(None), ProductListing.orderability_status != "unavailable"))
             .filter(func.length(func.trim(func.coalesce(ProductListing.source_designer_raw, ""))) > 0)
-            .group_by(ProductListing.source_designer_raw)
-            .order_by(func.lower(ProductListing.source_designer_raw).asc())
+            .filter(func.length(func.trim(func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw, ""))) > 0)
+            .group_by(func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw))
+            .order_by(func.lower(func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw)).asc())
             .all()
         )
         return {
@@ -138,25 +140,40 @@ class DesignerCatalogSyncService:
         if sync_product_links:
             products = (
                 self.db.query(Product)
-                .options(joinedload(Product.primary_listing))
-                .filter(Product.lifecycle_status != "merged")
+                .options(joinedload(Product.primary_listing), joinedload(Product.presentation), joinedload(Product.designer))
+                .filter(Product.lifecycle_status == "active")
                 .all()
             )
             for product in products:
                 listing = product.primary_listing
                 desired_designer_id: int | None = None
-                if listing is not None and str(listing.ingest_mode or "") != "manual":
-                    source_name = normalize_designer_text(listing.source_designer_raw)
-                    if source_name:
-                        mapping = mapping_by_source_name.get(source_name)
+                if listing is not None:
+                    override_name = normalize_designer_text(getattr(getattr(product, "presentation", None), "brand_override_name", None))
+                    if override_name:
+                        mapping = mapping_by_source_name.get(override_name)
                         linked = (
                             designers_by_id.get(int(mapping.designer_id))
                             if mapping is not None and mapping.designer_id is not None
                             else None
                         )
-                        if mapping is not None and bool(mapping.is_enabled):
-                            if source_name in active_counts or mapping_is_protected(mapping, linked):
-                                desired_designer_id = int(mapping.designer_id) if mapping.designer_id is not None else None
+                        if mapping is not None and bool(mapping.is_enabled) and (override_name in active_counts or mapping_is_protected(mapping, linked)):
+                            desired_designer_id = int(mapping.designer_id) if mapping.designer_id is not None else None
+                        else:
+                            existing = designers_by_name.get(override_name)
+                            if existing is not None:
+                                desired_designer_id = int(existing.id)
+                    else:
+                        source_name = normalize_designer_text(listing.source_designer_raw)
+                        if source_name:
+                            mapping = mapping_by_source_name.get(source_name)
+                            linked = (
+                                designers_by_id.get(int(mapping.designer_id))
+                                if mapping is not None and mapping.designer_id is not None
+                                else None
+                            )
+                            if mapping is not None and bool(mapping.is_enabled):
+                                if source_name in active_counts or mapping_is_protected(mapping, linked):
+                                    desired_designer_id = int(mapping.designer_id) if mapping.designer_id is not None else None
                 if int(product.designer_id or 0) != int(desired_designer_id or 0):
                     product.designer_id = desired_designer_id
 

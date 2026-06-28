@@ -15,7 +15,6 @@ def _create_source(db, source_key: str) -> Source:
         name=source_key,
         base_url=f"https://{source_key}",
         base_url_normalized=source_key,
-        host_normalized=source_key,
     )
     db.add(source)
     db.flush()

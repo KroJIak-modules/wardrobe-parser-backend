@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import re
-from typing import Any
 
-import requests
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.models import (
     AdminUiSettings,
     Designer,
@@ -43,7 +40,7 @@ from app.schemas.admin_settings import (
     SettingsTransferWeightRuleEntry,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _PROJECT_NAME = "wardrobe-parser-platform"
 
 _PRICING_EXPORT_FIELDS = [
@@ -96,32 +93,10 @@ class SettingsTransferService:
         self.source_repo = CatalogSourceRepository(db)
         self.weight_rule_repo = CatalogWeightRuleRepository(db)
 
-    @staticmethod
-    def _service_sources_base() -> str:
-        return f"{settings.service_base_url.rstrip('/')}/api/v1/sync/sources"
-
-    def _service_list(self) -> list[dict[str, Any]]:
-        try:
-            res = requests.get(self._service_sources_base(), timeout=(5, 30))
-            res.raise_for_status()
-            payload = res.json()
-        except requests.RequestException as exc:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Service API unavailable: {exc}") from exc
-        if not isinstance(payload, list):
-            return []
-        return [item for item in payload if isinstance(item, dict)]
-
-    def _service_patch(self, source_key: str, payload: dict[str, Any]) -> None:
-        try:
-            res = requests.patch(f"{self._service_sources_base()}/{source_key}", json=payload, timeout=(5, 30))
-            res.raise_for_status()
-        except requests.RequestException as exc:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Service API unavailable: {exc}") from exc
-
     def export_payload(self) -> SettingsTransferPayload:
         pricing_row, _ = self.pricing_repo.get_or_create_default()
         suppliers = self.supplier_repo.list_all_with_rates()
-        sources = SourceRegistryService(self.db).refresh_from_service()
+        sources = SourceRegistryService(self.db).list_all()
         weight_rules = self.weight_rule_repo.list_active()
 
         supplier_by_id = {int(supplier.id): supplier for supplier in suppliers}
@@ -172,12 +147,16 @@ class SettingsTransferService:
         for source in sources:
             if str(source.key) == SourceRegistryService.MANUAL_SOURCE_KEY:
                 continue
+            if not str(getattr(source, "adapter_key", "") or "").strip():
+                continue
             setting = self.source_repo.ensure_setting(source)
             source_entries.append(
                 SettingsTransferSourceEntry(
                     key=str(source.key),
                     name=str(source.name),
                     url=str(source.base_url),
+                    adapter_key=str(getattr(source, "adapter_key", "") or "").strip(),
+                    parser_config=dict(getattr(source, "parser_config", None) or {}),
                     enabled=bool(getattr(setting, "is_enabled", True)),
                     sync_enabled=bool(getattr(setting, "is_sync_enabled", True)),
                     dedup_enabled=bool(getattr(setting, "dedup_enabled", True)),
@@ -424,7 +403,6 @@ class SettingsTransferService:
         if not supplier_map:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет тарифов для назначения источникам")
         updated = 0
-        SourceRegistryService(self.db).refresh_from_service()
         for item in sources:
             source_key = SourceRegistryService.normalize_source_key(item.key)
             if not source_key or source_key == SourceRegistryService.MANUAL_SOURCE_KEY:
@@ -444,12 +422,15 @@ class SettingsTransferService:
                     key=source_key,
                     name=item.name,
                     base_url=item.url,
+                    adapter_key=item.adapter_key,
+                    parser_config=dict(item.parser_config or {}),
                 )
             else:
                 existing.name = item.name
                 existing.base_url = item.url
                 existing.base_url_normalized = normalize_base_url(item.url)
-                existing.host_normalized = SourceRegistryService.normalize_source_key(item.url)
+                existing.adapter_key = str(item.adapter_key).strip()
+                existing.parser_config = dict(item.parser_config or {})
             setting = self.source_repo.ensure_setting(existing)
             setting.is_enabled = bool(item.enabled)
             setting.is_sync_enabled = bool(item.sync_enabled)
@@ -471,8 +452,6 @@ class SettingsTransferService:
                 else None
             )
             updated += 1
-
-            self._service_patch(source_key, {"sync_enabled": bool(item.sync_enabled), "enabled": bool(item.enabled)})
         return updated
 
     def _import_weight_rules(self, rules: list[SettingsTransferWeightRuleEntry]) -> int:

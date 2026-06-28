@@ -11,7 +11,6 @@ from app.models.catalog_product import (
     ProductListingMember,
     ProductListingVariant,
     ProductPresentation,
-    ProductPriceOverride,
 )
 from app.models.catalog_support import (
     Designer,
@@ -71,7 +70,6 @@ __all__ = [
     "ProductListingMember",
     "ProductListingVariant",
     "ProductPresentation",
-    "ProductPriceOverride",
     "ShowcaseCarouselImage",
     "ShowcaseCategory",
     "ShowcaseCategoryAttachment",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 
 from fastapi import HTTPException, status
@@ -86,11 +87,31 @@ class TaxonomyService:
             result.append(value)
         return result
 
+    @staticmethod
+    def _clean_optional_slug(value: object | None) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None
+
     def _serialize_filter_tree(self) -> list[TaxonomyFilterNode]:
         filters = self.repo.list_filters()
         nodes = self.repo.list_filter_nodes()
         filters_by_id = {int(item.id): item for item in filters}
         node_by_filter_id = {int(item.filter_id): item for item in nodes}
+        group_members_by_code: dict[str, list[str]] = {}
+        for entity in filters:
+            group_code = str(entity.mobile_menu_group_code or "").strip()
+            slug = str(entity.slug or "").strip()
+            if not group_code or not slug:
+                continue
+            group_members_by_code.setdefault(group_code, []).append(slug)
+        mobile_pair_slug_by_slug: dict[str, str] = {}
+        for slugs in group_members_by_code.values():
+            unique_slugs = sorted({slug for slug in slugs if slug})
+            if len(unique_slugs) != 2:
+                continue
+            left_slug, right_slug = unique_slugs
+            mobile_pair_slug_by_slug[left_slug] = right_slug
+            mobile_pair_slug_by_slug[right_slug] = left_slug
         children_by_parent: dict[int | None, list[FilterNode]] = {}
         for node in nodes:
             parent_id = int(node.parent_node_id) if node.parent_node_id is not None else None
@@ -104,6 +125,7 @@ class TaxonomyService:
                 slug=str(entity.slug),
                 title=str(entity.title),
                 display_title=(str(entity.display_title) if entity.display_title else None),
+                mobile_pair_slug=mobile_pair_slug_by_slug.get(str(entity.slug)),
                 node_kind=str(entity.node_kind),
                 is_enabled=bool(entity.is_enabled),
                 local_category_keywords=[str(item.keyword) for item in sorted(entity.local_category_keywords, key=lambda value: int(value.id))],
@@ -199,6 +221,7 @@ class TaxonomyService:
                         slug=new_slug,
                         title=node.title,
                         display_title=node.display_title,
+                        mobile_pair_slug=self._clean_optional_slug(node.mobile_pair_slug),
                         node_kind=node.node_kind,
                         is_enabled=node.is_enabled,
                         local_category_keywords=node.local_category_keywords,
@@ -209,7 +232,31 @@ class TaxonomyService:
                 )
             return out
 
-        prepared_filters = rewrite_nodes(payload.filters)
+        def rewrite_mobile_pairs(nodes: list[TaxonomyFilterNode]) -> list[TaxonomyFilterNode]:
+            return [
+                TaxonomyFilterNode(
+                    slug=node.slug,
+                    title=node.title,
+                    display_title=node.display_title,
+                    mobile_pair_slug=(
+                        filter_slug_aliases.get(
+                            self._clean_optional_slug(node.mobile_pair_slug) or "",
+                            self._clean_optional_slug(node.mobile_pair_slug) or "",
+                        )
+                        if self._clean_optional_slug(node.mobile_pair_slug)
+                        else None
+                    ),
+                    node_kind=node.node_kind,
+                    is_enabled=node.is_enabled,
+                    local_category_keywords=node.local_category_keywords,
+                    title_keywords=node.title_keywords,
+                    manual_product_ids=node.manual_product_ids,
+                    children=rewrite_mobile_pairs(node.children),
+                )
+                for node in nodes
+            ]
+
+        prepared_filters = rewrite_mobile_pairs(rewrite_nodes(payload.filters))
         prepared_catalogs: list[TaxonomyCustomCatalog] = []
         for catalog in payload.custom_catalogs:
             old_slug = str(catalog.slug).strip()
@@ -260,6 +307,7 @@ class TaxonomyService:
                     slug=(str(node.ref_slug).strip() or None),
                     title=node.title,
                     display_title=node.display_title,
+                    mobile_pair_slug=self._clean_optional_slug(node.mobile_pair_slug),
                     node_kind=node.node_kind,
                     is_enabled=node.is_enabled,
                     local_category_keywords=node.local_category_keywords,
@@ -300,7 +348,12 @@ class TaxonomyService:
             ],
         )
 
-    def _validate_state(self, payload: TaxonomyState) -> tuple[dict[str, TaxonomyFilterNode], dict[str, TaxonomyCustomCatalog]]:
+    @staticmethod
+    def _build_mobile_menu_group_code(left_slug: str, right_slug: str) -> str:
+        pair_key = "::".join(sorted([left_slug, right_slug]))
+        return f"pair-{hashlib.sha1(pair_key.encode('utf-8')).hexdigest()[:16]}"
+
+    def _validate_state(self, payload: TaxonomyState) -> tuple[dict[str, TaxonomyFilterNode], dict[str, TaxonomyCustomCatalog], dict[str, str]]:
         filters_by_slug: dict[str, TaxonomyFilterNode] = {}
         filter_child_parent_by_slug: dict[str, str | None] = {}
         filter_branch_slugs_by_slug: dict[str, set[str]] = {}
@@ -309,9 +362,9 @@ class TaxonomyService:
             for node in nodes:
                 slug = str(node.slug).strip()
                 if slug in filters_by_slug:
-                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Duplicate filter slug: {slug}")
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Duplicate filter slug: {slug}")
                 if str(node.node_kind).strip() == "filter" and node.children:
-                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Filter node cannot have children: {slug}")
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Filter node cannot have children: {slug}")
                 filters_by_slug[slug] = node
                 filter_child_parent_by_slug[slug] = parent_slug
                 walk(node.children, slug)
@@ -328,40 +381,86 @@ class TaxonomyService:
         for root in payload.filters:
             collect_branch_slugs(root)
 
+        mobile_group_code_by_slug: dict[str, str] = {}
+        for slug, node in filters_by_slug.items():
+            mobile_pair_slug = str(node.mobile_pair_slug or "").strip()
+            if not mobile_pair_slug:
+                continue
+            if filter_child_parent_by_slug.get(slug) is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=f"Only root multifilters can be grouped in mobile menu: {slug}",
+                )
+            if str(node.node_kind).strip() != "multifilter":
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=f"Only multifilters can be grouped in mobile menu: {slug}",
+                )
+            if mobile_pair_slug == slug:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=f"Mobile menu pair cannot reference itself: {slug}",
+                )
+            target = filters_by_slug.get(mobile_pair_slug)
+            if target is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=f"Unknown mobile menu pair slug: {mobile_pair_slug}",
+                )
+            if filter_child_parent_by_slug.get(mobile_pair_slug) is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=f"Mobile menu pair must point to another root multifilter: {mobile_pair_slug}",
+                )
+            if str(target.node_kind).strip() != "multifilter":
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=f"Mobile menu pair must point to multifilter: {mobile_pair_slug}",
+                )
+            target_pair_slug = str(target.mobile_pair_slug or "").strip()
+            if target_pair_slug != slug:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=f"Mobile menu pair must be mutual between {slug} and {mobile_pair_slug}",
+                )
+            group_code = self._build_mobile_menu_group_code(slug, mobile_pair_slug)
+            mobile_group_code_by_slug[slug] = group_code
+            mobile_group_code_by_slug[mobile_pair_slug] = group_code
+
         catalogs_by_slug: dict[str, TaxonomyCustomCatalog] = {}
         for catalog in payload.custom_catalogs:
             slug = str(catalog.slug).strip()
             if slug in catalogs_by_slug:
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Duplicate custom catalog slug: {slug}")
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Duplicate custom catalog slug: {slug}")
             catalogs_by_slug[slug] = catalog
 
         category_codes: set[str] = set()
         for showcase_category in payload.showcase_categories:
             code = str(showcase_category.code).strip()
             if code in category_codes:
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Duplicate showcase category code: {code}")
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Duplicate showcase category code: {code}")
             if code not in self._SHOWCASE_CATEGORY_SEED:
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unknown showcase category code: {code}")
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Unknown showcase category code: {code}")
             category_codes.add(code)
             for attachment in showcase_category.attachments:
                 if attachment.kind == "filter":
                     if not attachment.filter_slug or attachment.custom_catalog_slug:
-                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid filter attachment in showcase category: {code}")
+                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Invalid filter attachment in showcase category: {code}")
                     if attachment.filter_slug not in filters_by_slug:
-                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unknown filter slug in attachment: {attachment.filter_slug}")
+                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Unknown filter slug in attachment: {attachment.filter_slug}")
                 else:
                     if not attachment.custom_catalog_slug or attachment.filter_slug:
-                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid custom catalog attachment in showcase category: {code}")
+                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Invalid custom catalog attachment in showcase category: {code}")
                     if attachment.custom_catalog_slug not in catalogs_by_slug:
-                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unknown custom catalog slug in attachment: {attachment.custom_catalog_slug}")
+                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Unknown custom catalog slug in attachment: {attachment.custom_catalog_slug}")
                     if self._clean_text_list(attachment.hidden_filter_slugs):
-                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Custom catalog attachment cannot have hidden filter slugs: {code}")
+                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Custom catalog attachment cannot have hidden filter slugs: {code}")
                 attachment_filter_slug = attachment.filter_slug if attachment.kind == "filter" else None
                 for hidden_slug in self._clean_text_list(attachment.hidden_filter_slugs):
                     if hidden_slug not in filters_by_slug:
-                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unknown hidden filter slug: {hidden_slug}")
+                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Unknown hidden filter slug: {hidden_slug}")
                     if attachment_filter_slug is not None and hidden_slug not in filter_branch_slugs_by_slug.get(attachment_filter_slug, set()):
-                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Hidden filter slug must belong to the same filter branch: {hidden_slug}")
+                        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Hidden filter slug must belong to the same filter branch: {hidden_slug}")
 
         product_ids: set[int] = set()
         for node in filters_by_slug.values():
@@ -372,15 +471,15 @@ class TaxonomyService:
         missing_product_ids = sorted(product_ids - existing_product_ids)
         if missing_product_ids:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Unknown or inactive product ids: {', '.join(str(item) for item in missing_product_ids)}",
             )
 
-        return filters_by_slug, catalogs_by_slug
+        return filters_by_slug, catalogs_by_slug, mobile_group_code_by_slug
 
     def replace_state(self, payload: TaxonomyState) -> TaxonomyState:
         prepared = self._prepare_payload(payload)
-        filters_by_slug, catalogs_by_slug = self._validate_state(prepared)
+        filters_by_slug, catalogs_by_slug, mobile_group_code_by_slug = self._validate_state(prepared)
         try:
             self.repo.clear_editable_state()
             self.repo.flush()
@@ -395,6 +494,7 @@ class TaxonomyService:
                         display_title=(str(node.display_title).strip() if node.display_title else None),
                         slug=str(node.slug).strip(),
                         node_kind=str(node.node_kind).strip() or "filter",
+                        mobile_menu_group_code=mobile_group_code_by_slug.get(str(node.slug).strip()),
                         is_enabled=bool(node.is_enabled),
                     )
                     self.repo.add(entity)
@@ -446,7 +546,7 @@ class TaxonomyService:
             for showcase_category in prepared.showcase_categories:
                 category_entity = seeded_categories.get(str(showcase_category.code).strip())
                 if category_entity is None:
-                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unknown showcase category code: {showcase_category.code}")
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Unknown showcase category code: {showcase_category.code}")
                 category_entity.title = self._SHOWCASE_CATEGORY_SEED.get(str(showcase_category.code).strip(), str(showcase_category.title).strip())
                 for position, attachment in enumerate(showcase_category.attachments, start=1):
                     attachment_entity = ShowcaseCategoryAttachment(

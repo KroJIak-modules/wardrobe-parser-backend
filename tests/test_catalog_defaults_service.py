@@ -16,7 +16,6 @@ def test_catalog_defaults_service_seeds_canonical_suppliers_and_assigns_default_
             name=source_key,
             base_url=f"https://{source_key}",
             base_url_normalized=source_key,
-            host_normalized=source_key,
         )
         db.add(source)
         db.flush()
@@ -49,7 +48,6 @@ def test_catalog_defaults_service_does_not_assign_supplier_to_manual_source() ->
                 name="Manual",
                 base_url="manual://catalog",
                 base_url_normalized="manual.local",
-                host_normalized="manual.local",
             )
             db.add(source)
             db.flush()

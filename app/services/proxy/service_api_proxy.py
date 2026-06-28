@@ -8,6 +8,7 @@ import requests
 from fastapi import HTTPException, Request, Response, status
 
 from app.core.config import settings
+from app.services.catalog.sync_error_humanizer import humanize_sync_error
 
 
 _HOP_BY_HOP_HEADERS = {
@@ -73,7 +74,7 @@ def forward_service_request(request: Request, path: str, body: bytes) -> Respons
     except requests.RequestException as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Service API unavailable: {exc}",
+            detail=humanize_sync_error(str(exc), exc.__class__.__name__) or "Сервис временно недоступен.",
         ) from exc
 
     return Response(
@@ -81,4 +82,3 @@ def forward_service_request(request: Request, path: str, body: bytes) -> Respons
         status_code=upstream.status_code,
         headers=_response_headers(upstream),
     )
-

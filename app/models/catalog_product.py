@@ -29,10 +29,25 @@ class Product(Base):
     designer_id = Column(BigInteger, ForeignKey("designers.id", ondelete="RESTRICT"), nullable=True, index=True)
     primary_listing_id = Column(BigInteger, ForeignKey("product_listings.id", ondelete="SET NULL"), nullable=True, index=True)
     gender = Column(String(16), nullable=False, default="unisex", server_default="unisex")
+    source_gender = Column(String(16), nullable=False, default="unisex", server_default="unisex")
+    gender_is_manual = Column(Boolean, nullable=False, default=False, server_default="false")
     availability_mode = Column(String(16), nullable=False, default="by_order", server_default="by_order")
     manual_weight_grams = Column(Integer, nullable=True)
     weight_rule_id = Column(BigInteger, ForeignKey("weight_rules.id", ondelete="SET NULL"), nullable=True, index=True)
     lifecycle_status = Column(String(16), nullable=False, default="active", server_default="active")
+    dedup_status = Column(String(32), nullable=False, default="independent", server_default="independent")
+    dedup_decision_id = Column(
+        BigInteger,
+        ForeignKey("product_dedup_decisions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    dedup_target_product_id = Column(
+        BigInteger,
+        ForeignKey("products.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     visibility_status = Column(String(16), nullable=False, default="visible", server_default="visible")
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -42,13 +57,16 @@ class Product(Base):
     weight_rule = relationship("WeightRule")
     memberships = relationship("ProductListingMember", back_populates="product", cascade="all, delete-orphan")
     presentation = relationship("ProductPresentation", back_populates="product", uselist=False, cascade="all, delete-orphan")
-    price_override = relationship("ProductPriceOverride", back_populates="product", uselist=False, cascade="all, delete-orphan")
     gallery_images = relationship("ProductListingGalleryImage", back_populates="product", cascade="all, delete-orphan")
 
     __table_args__ = (
         CheckConstraint("gender IN ('male', 'female', 'unisex')", name="ck_products_gender"),
         CheckConstraint("availability_mode IN ('in_stock', 'by_order')", name="ck_products_availability_mode"),
-        CheckConstraint("lifecycle_status IN ('active', 'merged')", name="ck_products_lifecycle_status"),
+        CheckConstraint("lifecycle_status IN ('active')", name="ck_products_lifecycle_status"),
+        CheckConstraint(
+            "dedup_status IN ('independent', 'combined_source', 'hidden_by_keep')",
+            name="ck_products_dedup_status",
+        ),
         CheckConstraint("visibility_status IN ('visible', 'hidden')", name="ck_products_visibility_status"),
     )
 
@@ -104,12 +122,19 @@ class ProductListingMember(Base):
 
     product_id = Column(BigInteger, ForeignKey("products.id", ondelete="CASCADE"), primary_key=True)
     listing_id = Column(BigInteger, ForeignKey("product_listings.id", ondelete="CASCADE"), primary_key=True)
+    membership_kind = Column(String(16), nullable=False, default="owner", server_default="owner")
 
     product = relationship("Product", back_populates="memberships")
     listing = relationship("ProductListing", back_populates="memberships")
 
     __table_args__ = (
-        UniqueConstraint("listing_id", name="uq_product_listing_members_listing_id"),
+        CheckConstraint("membership_kind IN ('owner', 'included')", name="ck_product_listing_members_membership_kind"),
+        Index(
+            "ux_product_listing_members_owner_listing_id",
+            "listing_id",
+            unique=True,
+            postgresql_where=text("membership_kind = 'owner'"),
+        ),
     )
 
 
@@ -125,6 +150,7 @@ class ProductListingVariant(Base):
     price_amount = Column(Numeric(12, 2), nullable=True)
     compare_at_price_amount = Column(Numeric(12, 2), nullable=True)
     currency_code = Column(String(3), nullable=True)
+    pricing_mode = Column(String(32), nullable=False, default="source", server_default="source")
     is_orderable = Column(Boolean, nullable=False, default=True, server_default="true")
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -133,6 +159,7 @@ class ProductListingVariant(Base):
 
     __table_args__ = (
         CheckConstraint("currency_code IS NULL OR char_length(currency_code) = 3", name="ck_product_listing_variants_currency_code"),
+        CheckConstraint("pricing_mode IN ('source', 'fixed_final_rub')", name="ck_product_listing_variants_pricing_mode"),
         UniqueConstraint("listing_id", "position", name="uq_product_listing_variants_listing_position"),
         UniqueConstraint("listing_id", "source_ref_id", name="uq_product_listing_variants_listing_source_ref_id"),
         Index("idx_product_listing_variants_listing_source_ref_id", "listing_id", "source_ref_id"),
@@ -160,6 +187,7 @@ class ProductPresentation(Base):
 
     product_id = Column(BigInteger, ForeignKey("products.id", ondelete="CASCADE"), primary_key=True)
     title_override = Column(Text, nullable=True)
+    brand_override_name = Column(String(255), nullable=True)
     description_text = Column(Text, nullable=True)
     description_html = Column(Text, nullable=True)
     description_visibility = Column(Boolean, nullable=True)
@@ -167,26 +195,6 @@ class ProductPresentation(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     product = relationship("Product", back_populates="presentation")
-
-
-class ProductPriceOverride(Base):
-    __tablename__ = "product_price_overrides"
-
-    product_id = Column(BigInteger, ForeignKey("products.id", ondelete="CASCADE"), primary_key=True)
-    manual_price_rub = Column(Numeric(12, 2), nullable=False)
-    manual_compare_at_price_rub = Column(Numeric(12, 2), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
-
-    product = relationship("Product", back_populates="price_override")
-
-    __table_args__ = (
-        CheckConstraint("manual_price_rub > 0", name="ck_product_price_overrides_manual_price_positive"),
-        CheckConstraint(
-            "manual_compare_at_price_rub IS NULL OR manual_compare_at_price_rub > manual_price_rub",
-            name="ck_product_price_overrides_compare_at_gt_price",
-        ),
-    )
 
 
 class ProductListingGalleryImage(Base):

@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 from app.core.database import SessionLocal
-from app.models import Product, ProductListing, ProductPriceOverride, Source, SourceSetting, Supplier, SupplierShippingRate
+from app.models import Product, ProductListing, Source, SourceSetting, Supplier, SupplierShippingRate
 from app.schemas.admin_settings import PricingSettingsResponse, PricingSupplierRateResponse, PricingSupplierResponse
 from app.services.catalog.product_ingest_service import ProductIngestService
 from app.services.catalog.product_query_service import ProductQueryService
@@ -34,32 +34,6 @@ def test_pricing_example_candidate_accepts_complete_derived_pricing_payload() ->
     }
 
     assert ProductQueryService._is_pricing_example_candidate(product) is True
-
-
-def test_pricing_example_candidate_rejects_manual_override_payload() -> None:
-    product = {
-        "source_price": 100.0,
-        "final_price": 21500.0,
-        "pricing_components": {
-            "manual_override": True,
-            "source_price_rub": 9500.0,
-            "source_price_usd": 100.0,
-            "source_price_eur": 88.5,
-            "buyout_rub": 10000.0,
-            "payment_fee_rub": 200.0,
-            "customs_duty_rub": 0.0,
-            "supplier_transport_rub": 3500.0,
-            "subtotal_rub": 13700.0,
-            "subtotal_after_markup_rub": 20550.0,
-            "tax_rub": 1233.0,
-            "usdt_extra_rub": 1.0,
-            "bybit_bucket_rate_rub": 95.0,
-            "derived_eur_to_usd_rate": 1.07,
-            "derived_gbp_to_usd_rate": 1.27,
-        },
-    }
-
-    assert ProductQueryService._is_pricing_example_candidate(product) is False
 
 
 def test_pricing_example_candidate_rejects_incomplete_components() -> None:
@@ -122,8 +96,8 @@ def test_build_sample_pricing_example_payload_uses_enabled_supplier_tariff() -> 
     assert payload is not None
     assert payload["is_sample"] is True
     assert payload["product_id"] is None
-    assert payload["source_currency"] == "EUR"
-    assert payload["final_price"] is not None
+    assert payload["price_summary"]["source_currency"] == "EUR"
+    assert payload["price_summary"]["final_display_price"] is not None
     assert payload["components"]["supplier_transport_rub"] == 2500.0
 
 
@@ -185,7 +159,6 @@ def test_pricing_example_uses_lightweight_lookup_without_legacy_full_product_loa
             name=f"Pricing Example {marker}",
             base_url=f"https://pricing-example-{marker}.example",
             base_url_normalized=f"pricing-example-{marker}.example",
-            host_normalized=f"pricing-example-{marker}.example",
         )
         db.add(source)
         db.flush()
@@ -266,9 +239,9 @@ def test_pricing_example_uses_lightweight_lookup_without_legacy_full_product_loa
         assert int(payload["product_id"]) == int(product.id)
         assert payload["title"] == "Jacket"
         assert payload["source_name"] == f"Pricing Example {marker}"
-        assert payload["source_currency"] == "USD"
-        assert payload["source_price"] == 120.0
-        assert payload["final_price"] is not None
+        assert payload["price_summary"]["source_currency"] == "USD"
+        assert payload["price_summary"]["source_display_price"] == 120.0
+        assert payload["price_summary"]["final_display_price"] is not None
         assert payload["image_url"] == f"https://cdn.example/{marker}.jpg"
         explicit_payload = service.get_pricing_example_payload(product_id=int(product.id))
         assert explicit_payload is not None
@@ -278,7 +251,7 @@ def test_pricing_example_uses_lightweight_lookup_without_legacy_full_product_loa
         db.close()
 
 
-def test_pricing_example_ignores_hidden_unavailable_and_manual_price_products(monkeypatch) -> None:
+def test_pricing_example_ignores_hidden_and_unavailable_products(monkeypatch) -> None:
     db = SessionLocal()
     marker = uuid4().hex[:10]
     try:
@@ -287,7 +260,6 @@ def test_pricing_example_ignores_hidden_unavailable_and_manual_price_products(mo
             name=f"Pricing Filter {marker}",
             base_url=f"https://pricing-filter-{marker}.example",
             base_url_normalized=f"pricing-filter-{marker}.example",
-            host_normalized=f"pricing-filter-{marker}.example",
         )
         db.add(source)
         db.flush()
@@ -355,18 +327,11 @@ def test_pricing_example_ignores_hidden_unavailable_and_manual_price_products(mo
         eligible_product, _eligible_listing = _create_product(f"eligible-{marker}", "Eligible Example Jacket")
         hidden_product, _hidden_listing = _create_product(f"hidden-{marker}", "Hidden Example Jacket")
         unavailable_product, unavailable_listing = _create_product(f"unavailable-{marker}", "Unavailable Example Jacket")
-        manual_price_product, _manual_price_listing = _create_product(f"manual-price-{marker}", "Manual Price Example Jacket")
+        _fallback_product, _fallback_listing = _create_product(f"fallback-{marker}", "Fallback Example Jacket")
 
         hidden_product.visibility_status = "hidden"
         unavailable_listing.orderability_status = "unavailable"
         unavailable_listing.status_reason = "source_removed"
-        db.add(
-            ProductPriceOverride(
-                product_id=int(manual_price_product.id),
-                manual_price_rub=99999.0,
-                manual_compare_at_price_rub=None,
-            )
-        )
         db.flush()
 
         service_query = ProductQueryService(db)
@@ -379,17 +344,13 @@ def test_pricing_example_ignores_hidden_unavailable_and_manual_price_products(mo
         fallback_payload = service_query.get_pricing_example_payload()
         hidden_payload = service_query.get_pricing_example_payload(product_id=int(hidden_product.id))
         unavailable_payload = service_query.get_pricing_example_payload(product_id=int(unavailable_product.id))
-        manual_price_payload = service_query.get_pricing_example_payload(product_id=int(manual_price_product.id))
-
         assert fallback_payload is not None
         assert int(fallback_payload["product_id"]) not in {
             int(hidden_product.id),
             int(unavailable_product.id),
-            int(manual_price_product.id),
         }
         assert hidden_payload is None
         assert unavailable_payload is None
-        assert manual_price_payload is None
     finally:
         db.rollback()
         db.close()

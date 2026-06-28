@@ -230,6 +230,7 @@ class ProductIngestService:
                         else None
                     ),
                     "currency_code": str(raw_currency or "").strip().upper() or None,
+                    "pricing_mode": "source",
                     "is_orderable": bool(variant.get("available", variant.get("is_orderable", True))),
                 }
             )
@@ -312,11 +313,14 @@ class ProductIngestService:
 
             previous_owner = self.products.get_product_by_listing(int(listing.id))
             product = self._resolve_product(listing_id=int(listing.id), target_product_id=target_product_id)
+            normalized_gender = self._normalize_gender(item.get("gender"))
             if product is None:
                 source_setting = getattr(getattr(listing, "source", None), "setting", None)
                 visibility_status = "hidden" if bool(getattr(source_setting, "hide_auto_added_products", False)) else "visible"
                 product = self.products.create_product(
-                    gender=self._normalize_gender(item.get("gender")),
+                    gender=normalized_gender,
+                    source_gender=normalized_gender,
+                    gender_is_manual=False,
                     availability_mode="by_order",
                     lifecycle_status="active",
                     visibility_status=visibility_status,
@@ -325,6 +329,9 @@ class ProductIngestService:
                 product.primary_listing_id = int(listing.id)
             elif target_product_id is not None and force_primary_listing:
                 product.primary_listing_id = int(listing.id)
+            product.source_gender = normalized_gender
+            if not bool(getattr(product, "gender_is_manual", False)):
+                product.gender = normalized_gender
             if previous_owner is not None:
                 affected_product_ids.add(int(previous_owner.id))
             affected_product_ids.add(int(product.id))

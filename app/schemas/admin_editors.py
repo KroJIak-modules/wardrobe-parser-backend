@@ -25,6 +25,7 @@ class AdminEditorFilterNode(BaseModel):
     id: int = Field(ge=0)
     label: str = Field(min_length=1)
     display_label: str = ""
+    mobile_pair_root_id: int | None = Field(default=None, ge=0)
     node_kind: Literal["filter", "multifilter"] = "filter"
     is_enabled: bool = True
     rules: AdminEditorRuleSet

@@ -232,7 +232,7 @@ class WeightRuleService:
         rows = (
             self.db.query(Product.id)
             .join(Product.primary_listing)
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
             .filter((Product.manual_weight_grams.is_(None)) | (Product.manual_weight_grams <= 0))
             .filter((ProductListing.source_weight_grams.is_(None)) | (ProductListing.source_weight_grams <= 0))
             .filter(or_(*conditions))
@@ -392,7 +392,7 @@ class WeightRuleService:
             self.db.query(Product, ProductListing, Source)
             .join(Product.primary_listing)
             .join(Source, Source.id == ProductListing.source_id)
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
             .filter((Product.manual_weight_grams.is_(None)) | (Product.manual_weight_grams <= 0))
             .filter((ProductListing.source_weight_grams.is_(None)) | (ProductListing.source_weight_grams <= 0))
             .filter(Product.weight_rule_id.is_(None))

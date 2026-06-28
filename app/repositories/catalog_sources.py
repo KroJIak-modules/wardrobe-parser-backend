@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy.orm import Session, joinedload
 
-from app.core.source_identity import normalize_base_url, normalize_host
+from app.core.source_identity import normalize_base_url
 from app.models import Source, SourceSetting, SourceSyncState
 
 
@@ -16,6 +18,22 @@ class CatalogSourceRepository:
             .options(joinedload(Source.setting), joinedload(Source.sync_state))
             .order_by(Source.name.asc(), Source.id.asc())
             .all()
+        )
+
+    def list_registry_sources(self) -> list[Source]:
+        return (
+            self.session.query(Source)
+            .options(joinedload(Source.setting), joinedload(Source.sync_state))
+            .filter(Source.adapter_key.is_not(None))
+            .order_by(Source.name.asc(), Source.id.asc())
+            .all()
+        )
+
+    def count_registry_sources(self) -> int:
+        return int(
+            self.session.query(Source)
+            .filter(Source.adapter_key.is_not(None))
+            .count()
         )
 
     def get_by_id(self, source_id: int) -> Source | None:
@@ -48,13 +66,22 @@ class CatalogSourceRepository:
             .one_or_none()
         )
 
-    def create(self, *, key: str, name: str, base_url: str) -> Source:
+    def create(
+        self,
+        *,
+        key: str,
+        name: str,
+        base_url: str,
+        adapter_key: str | None = None,
+        parser_config: dict[str, Any] | None = None,
+    ) -> Source:
         entity = Source(
             key=key,
             name=name,
             base_url=base_url,
             base_url_normalized=normalize_base_url(base_url),
-            host_normalized=normalize_host(base_url),
+            adapter_key=(str(adapter_key).strip() or None) if adapter_key is not None else None,
+            parser_config=dict(parser_config or {}),
         )
         self.session.add(entity)
         self.session.flush()

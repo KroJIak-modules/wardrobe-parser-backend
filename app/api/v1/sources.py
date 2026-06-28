@@ -1,15 +1,21 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from typing import Any
+
+from fastapi import APIRouter, Depends, File, Header, UploadFile
+from fastapi import HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from fastapi.responses import FileResponse
+from starlette import status
 from app.core.database import get_db
+from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models import ImageAsset, Product, ProductListing, ProductListingMember, Source
 from app.services.auth.admin_auth_service import require_permission
 from app.services.catalog.media_asset_service import MediaAssetService
+from app.services.catalog.sync_error_humanizer import humanize_sync_error
 from app.services.catalog.source_registry_service import SourceRegistryService
 
 
@@ -49,6 +55,25 @@ class SourceLogoPatch(BaseModel):
     logo_image_asset_id: int | None = None
 
 
+class InternalSourceEntryResponse(BaseModel):
+    id: int
+    key: str
+    url: str
+    adapter_key: str
+    enabled: bool
+    sync_enabled: bool
+    config: dict[str, Any]
+
+
+class InternalSourceBootstrapRequest(BaseModel):
+    sources: list[InternalSourceEntryResponse]
+
+
+def _require_internal_api_token(x_internal_token: str | None = Header(default=None)) -> None:
+    if str(x_internal_token or "").strip() != str(settings.internal_api_token or "").strip():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="invalid internal token")
+
+
 def _normalize_source_sync_status(raw: object) -> str | None:
     value = str(raw or "").strip().lower()
     if value in {"success", "partial", "failed"}:
@@ -67,7 +92,7 @@ def _source_counts_by_id(db: Session) -> dict[int, dict[str, int]]:
         )
         .join(ProductListingMember, ProductListingMember.product_id == Product.id)
         .join(ProductListing, ProductListing.id == ProductListingMember.listing_id)
-        .filter(Product.lifecycle_status != "merged")
+        .filter(Product.lifecycle_status == "active")
         .group_by(ProductListing.source_id, ProductListing.ingest_mode)
         .all()
     )
@@ -83,12 +108,12 @@ def _source_counts_by_id(db: Session) -> dict[int, dict[str, int]]:
     return counts
 
 
-def _source_payload(db: Session, source: Source, service_item: dict | None, counts_by_source_id: dict[int, dict[str, int]] | None = None) -> dict:
+def _source_payload(source: Source, counts_by_source_id: dict[int, dict[str, int]] | None = None) -> dict:
     counts = (counts_by_source_id or {}).get(int(source.id), {})
     setting = source.setting
     sync_state = source.sync_state
     supplier = getattr(setting, "supplier", None) if setting is not None else None
-    mode = SourceRegistryService.derive_source_mode(str(source.key), service_item)
+    mode = SourceRegistryService.derive_source_mode(source)
     return {
         "key": source.key,
         "source_id": int(source.id),
@@ -109,7 +134,10 @@ def _source_payload(db: Session, source: Source, service_item: dict | None, coun
         "last_sync_duration_sec": getattr(sync_state, "last_sync_duration_sec", None),
         "last_sync_status": _normalize_source_sync_status(getattr(sync_state, "last_sync_status", None)),
         "last_error_code": getattr(sync_state, "last_error_code", None),
-        "last_error_message": getattr(sync_state, "last_error_message", None),
+        "last_error_message": humanize_sync_error(
+            getattr(sync_state, "last_error_message", None),
+            getattr(sync_state, "last_error_code", None),
+        ),
         "supplier_id": int(getattr(setting, "supplier_id", 0) or 0) or None,
         "supplier_key": getattr(supplier, "key", None),
         "supplier_name": getattr(supplier, "name", None),
@@ -131,12 +159,10 @@ def _source_payload(db: Session, source: Source, service_item: dict | None, coun
 @router.get("/sources", dependencies=[Depends(require_permission("control.sources.read"))])
 def list_sources(db: Session = Depends(get_db)) -> list[dict]:
     registry = SourceRegistryService(db)
-    sources = registry.refresh_from_service()
-    db.commit()
-    service_items = SourceRegistryService.fetch_service_sources_payload()
+    sources = registry.list_all()
     counts_by_source_id = _source_counts_by_id(db)
     return [
-        _source_payload(db, source, service_items.get(source.key), counts_by_source_id)
+        _source_payload(source, counts_by_source_id)
         for source in sources
     ]
 
@@ -158,7 +184,6 @@ def get_source_logo_image(image_id: int, db: Session = Depends(get_db)) -> FileR
 
 @router.patch("/sources/{source_key}/enabled", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_enabled(source_key: str, payload: EnabledPatch, db: Session = Depends(get_db)) -> dict:
-    SourceRegistryService(db).refresh_from_service()
     repo = SourceRegistryService(db).repo
     entity = repo.get_by_key(source_key)
     if entity is None:
@@ -166,12 +191,11 @@ def patch_enabled(source_key: str, payload: EnabledPatch, db: Session = Depends(
     setting = repo.ensure_setting(entity)
     setting.is_enabled = bool(payload.enabled)
     db.commit()
-    return _source_payload(db, entity, SourceRegistryService.fetch_service_sources_payload().get(entity.key), _source_counts_by_id(db))
+    return _source_payload(entity, _source_counts_by_id(db))
 
 
 @router.patch("/sources/{source_key}/sync-enabled", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_sync_enabled(source_key: str, payload: SyncEnabledPatch, db: Session = Depends(get_db)) -> dict:
-    SourceRegistryService(db).refresh_from_service()
     repo = SourceRegistryService(db).repo
     entity = repo.get_by_key(source_key)
     if entity is None:
@@ -179,12 +203,11 @@ def patch_sync_enabled(source_key: str, payload: SyncEnabledPatch, db: Session =
     setting = repo.ensure_setting(entity)
     setting.is_sync_enabled = bool(payload.sync_enabled)
     db.commit()
-    return _source_payload(db, entity, SourceRegistryService.fetch_service_sources_payload().get(entity.key), _source_counts_by_id(db))
+    return _source_payload(entity, _source_counts_by_id(db))
 
 
 @router.patch("/sources/{source_key}/dedup-enabled", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_dedup_enabled(source_key: str, payload: DedupEnabledPatch, db: Session = Depends(get_db)) -> dict:
-    SourceRegistryService(db).refresh_from_service()
     repo = SourceRegistryService(db).repo
     entity = repo.get_by_key(source_key)
     if entity is None:
@@ -192,12 +215,11 @@ def patch_dedup_enabled(source_key: str, payload: DedupEnabledPatch, db: Session
     setting = repo.ensure_setting(entity)
     setting.dedup_enabled = bool(payload.dedup_enabled)
     db.commit()
-    return _source_payload(db, entity, SourceRegistryService.fetch_service_sources_payload().get(entity.key), _source_counts_by_id(db))
+    return _source_payload(entity, _source_counts_by_id(db))
 
 
 @router.patch("/sources/{source_key}/hide-auto-added-products", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_hide_auto_added(source_key: str, payload: AutoHidePatch, db: Session = Depends(get_db)) -> dict:
-    SourceRegistryService(db).refresh_from_service()
     repo = SourceRegistryService(db).repo
     entity = repo.get_by_key(source_key)
     if entity is None:
@@ -205,12 +227,11 @@ def patch_hide_auto_added(source_key: str, payload: AutoHidePatch, db: Session =
     setting = repo.ensure_setting(entity)
     setting.hide_auto_added_products = bool(payload.hide_auto_added_products)
     db.commit()
-    return _source_payload(db, entity, SourceRegistryService.fetch_service_sources_payload().get(entity.key), _source_counts_by_id(db))
+    return _source_payload(entity, _source_counts_by_id(db))
 
 
 @router.patch("/sources/{source_key}/attribute-visibility", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_attribute_visibility(source_key: str, payload: AttributeVisibilityPatch, db: Session = Depends(get_db)) -> dict:
-    SourceRegistryService(db).refresh_from_service()
     repo = SourceRegistryService(db).repo
     entity = repo.get_by_key(source_key)
     if entity is None:
@@ -224,12 +245,11 @@ def patch_attribute_visibility(source_key: str, payload: AttributeVisibilityPatc
     if payload.show_images is not None:
         setting.show_images = bool(payload.show_images)
     db.commit()
-    return _source_payload(db, entity, SourceRegistryService.fetch_service_sources_payload().get(entity.key), _source_counts_by_id(db))
+    return _source_payload(entity, _source_counts_by_id(db))
 
 
 @router.patch("/sources/{source_key}/supplier", dependencies=[Depends(require_permission("control.pricing.edit"))])
 def patch_source_supplier(source_key: str, payload: SupplierPatch, db: Session = Depends(get_db)) -> dict:
-    SourceRegistryService(db).refresh_from_service()
     repo = SourceRegistryService(db).repo
     entity = repo.get_by_key(source_key)
     if entity is None:
@@ -252,12 +272,11 @@ def patch_source_supplier(source_key: str, payload: SupplierPatch, db: Session =
         setting.buyout_surcharge_currency = value
     db.commit()
     refreshed = repo.get_by_key(source_key)
-    return _source_payload(db, refreshed, SourceRegistryService.fetch_service_sources_payload().get(refreshed.key), _source_counts_by_id(db))
+    return _source_payload(refreshed, _source_counts_by_id(db))
 
 
 @router.patch("/sources/{source_key}/logo", dependencies=[Depends(require_permission("control.sources.edit"))])
 def patch_source_logo(source_key: str, payload: SourceLogoPatch, db: Session = Depends(get_db)) -> dict:
-    SourceRegistryService(db).refresh_from_service()
     repo = SourceRegistryService(db).repo
     entity = repo.get_by_key(source_key)
     if entity is None:
@@ -272,9 +291,44 @@ def patch_source_logo(source_key: str, payload: SourceLogoPatch, db: Session = D
         entity.logo_image_asset_id = None
     db.commit()
     refreshed = repo.get_by_key(source_key)
-    return _source_payload(
-        db,
-        refreshed,
-        SourceRegistryService.fetch_service_sources_payload().get(refreshed.key),
-        _source_counts_by_id(db),
-    )
+    return _source_payload(refreshed, _source_counts_by_id(db))
+
+
+@router.get(
+    "/internal/service/sources",
+    include_in_schema=False,
+    dependencies=[Depends(_require_internal_api_token)],
+    response_model=list[InternalSourceEntryResponse],
+)
+def list_internal_service_sources(db: Session = Depends(get_db)) -> list[InternalSourceEntryResponse]:
+    sources = SourceRegistryService(db).repo.list_registry_sources()
+    items: list[InternalSourceEntryResponse] = []
+    for source in sources:
+        setting = SourceRegistryService(db).repo.ensure_setting(source)
+        adapter_key = str(getattr(source, "adapter_key", "") or "").strip()
+        if not adapter_key:
+            continue
+        items.append(
+            InternalSourceEntryResponse(
+                id=int(source.id),
+                key=str(source.key),
+                url=str(source.base_url),
+                adapter_key=adapter_key,
+                enabled=bool(getattr(setting, "is_enabled", True)),
+                sync_enabled=bool(getattr(setting, "is_sync_enabled", True)),
+                config=dict(getattr(source, "parser_config", None) or {}),
+            )
+        )
+    return items
+
+
+@router.post(
+    "/internal/service/sources/bootstrap",
+    include_in_schema=False,
+    dependencies=[Depends(_require_internal_api_token)],
+    status_code=status.HTTP_200_OK,
+)
+def bootstrap_internal_service_sources(payload: InternalSourceBootstrapRequest, db: Session = Depends(get_db)) -> dict:
+    sources = SourceRegistryService(db).seed_from_payload([item.model_dump() for item in payload.sources])
+    db.commit()
+    return {"ok": True, "sources_count": len(sources)}

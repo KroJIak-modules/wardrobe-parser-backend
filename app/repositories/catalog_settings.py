@@ -127,7 +127,7 @@ class CatalogWeightRuleRepository:
                 joinedload(Product.primary_listing).joinedload(ProductListing.source),
                 joinedload(Product.weight_rule),
             )
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
             .order_by(Product.id.asc())
         )
         if product_ids:

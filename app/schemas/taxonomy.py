@@ -11,6 +11,7 @@ class TaxonomyFilterNode(BaseModel):
     slug: str | None = Field(default=None, min_length=1, max_length=255)
     title: str = Field(min_length=1)
     display_title: str | None = None
+    mobile_pair_slug: str | None = Field(default=None, min_length=1, max_length=255)
     node_kind: Literal["filter", "multifilter"] = "filter"
     is_enabled: bool = True
     local_category_keywords: list[str] = Field(default_factory=list)
@@ -51,6 +52,7 @@ class TaxonomyFilterWriteNode(BaseModel):
     ref_slug: str | None = Field(default=None, min_length=1, max_length=255)
     title: str = Field(min_length=1)
     display_title: str | None = None
+    mobile_pair_slug: str | None = Field(default=None, min_length=1, max_length=255)
     node_kind: Literal["filter", "multifilter"] = "filter"
     is_enabled: bool = True
     local_category_keywords: list[str] = Field(default_factory=list)

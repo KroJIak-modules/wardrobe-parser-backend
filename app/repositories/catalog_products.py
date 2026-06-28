@@ -14,7 +14,6 @@ from app.models import (
     ProductListingMember,
     ProductListingVariant,
     ProductPresentation,
-    ProductPriceOverride,
     Source,
     SourceSetting,
     WeightRule,
@@ -35,7 +34,6 @@ class CatalogProductRepository:
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.variants),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.images),
                 joinedload(Product.presentation),
-                joinedload(Product.price_override),
                 joinedload(Product.gallery_images).joinedload(ProductListingGalleryImage.image_asset),
                 joinedload(Product.gallery_images).joinedload(ProductListingGalleryImage.listing_image),
                 joinedload(Product.designer),
@@ -44,13 +42,13 @@ class CatalogProductRepository:
             .order_by(Product.updated_at.desc(), Product.id.desc())
         )
         if not include_merged:
-            query = query.filter(Product.lifecycle_status != "merged")
+            query = query.filter(Product.lifecycle_status == "active")
         return query.offset(max(0, int(offset))).limit(max(1, int(limit))).all()
 
     def count_products(self, *, include_merged: bool = False) -> int:
         query = self.session.query(Product)
         if not include_merged:
-            query = query.filter(Product.lifecycle_status != "merged")
+            query = query.filter(Product.lifecycle_status == "active")
         return int(query.count())
 
     def get_product(self, product_id: int) -> Product | None:
@@ -62,7 +60,6 @@ class CatalogProductRepository:
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.variants),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.images),
                 joinedload(Product.presentation),
-                joinedload(Product.price_override),
                 joinedload(Product.gallery_images).joinedload(ProductListingGalleryImage.image_asset),
                 joinedload(Product.gallery_images).joinedload(ProductListingGalleryImage.listing_image),
                 joinedload(Product.designer),
@@ -84,7 +81,6 @@ class CatalogProductRepository:
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.variants),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.images),
                 joinedload(Product.presentation),
-                joinedload(Product.price_override),
                 joinedload(Product.gallery_images).joinedload(ProductListingGalleryImage.image_asset),
                 joinedload(Product.gallery_images).joinedload(ProductListingGalleryImage.listing_image),
                 joinedload(Product.designer),
@@ -94,7 +90,7 @@ class CatalogProductRepository:
             .order_by(Product.id.asc())
         )
         if not include_merged:
-            query = query.filter(Product.lifecycle_status != "merged")
+            query = query.filter(Product.lifecycle_status == "active")
         return query.all()
 
     def list_products_for_admin_table_by_ids(self, product_ids: Iterable[int]) -> list[Product]:
@@ -109,12 +105,11 @@ class CatalogProductRepository:
                 selectinload(Product.primary_listing).selectinload(ProductListing.variants),
                 selectinload(Product.primary_listing).selectinload(ProductListing.images),
                 selectinload(Product.memberships).selectinload(ProductListingMember.listing),
-                joinedload(Product.price_override),
                 joinedload(Product.weight_rule),
                 selectinload(Product.gallery_images).selectinload(ProductListingGalleryImage.listing_image),
             )
             .filter(Product.id.in_(normalized_ids))
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
             .order_by(Product.id.asc())
             .all()
         )
@@ -127,7 +122,6 @@ class CatalogProductRepository:
             self.session.query(Product)
             .options(
                 joinedload(Product.presentation),
-                joinedload(Product.price_override),
                 joinedload(Product.weight_rule),
                 selectinload(Product.primary_listing).selectinload(ProductListing.source).selectinload(Source.setting),
                 selectinload(Product.primary_listing).selectinload(ProductListing.variants),
@@ -136,7 +130,7 @@ class CatalogProductRepository:
                 selectinload(Product.gallery_images).selectinload(ProductListingGalleryImage.image_asset),
             )
             .filter(Product.id.in_(normalized_ids))
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
             .filter(Product.primary_listing_id.is_not(None))
             .order_by(Product.id.asc())
             .all()
@@ -149,7 +143,7 @@ class CatalogProductRepository:
         return (
             self.session.query(Product)
             .options(
-                load_only(Product.id, Product.lifecycle_status),
+                load_only(Product.id, Product.lifecycle_status, Product.dedup_status),
                 selectinload(Product.memberships)
                 .selectinload(ProductListingMember.listing)
                 .load_only(
@@ -160,7 +154,7 @@ class CatalogProductRepository:
                 ),
             )
             .filter(Product.id.in_(normalized_ids))
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
             .order_by(Product.id.asc())
             .all()
         )
@@ -170,7 +164,7 @@ class CatalogProductRepository:
             int(product_id)
             for product_id, in (
                 self.session.query(Product.id)
-                .filter(Product.lifecycle_status != "merged")
+                .filter(Product.lifecycle_status == "active")
                 .order_by(Product.id.asc())
                 .offset(max(0, int(offset)))
                 .limit(max(1, int(limit)))
@@ -181,7 +175,7 @@ class CatalogProductRepository:
     def count_active_products(self) -> int:
         return int(
             self.session.query(func.count(Product.id))
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
             .scalar()
             or 0
         )
@@ -198,7 +192,6 @@ class CatalogProductRepository:
                 joinedload(Product.primary_listing).joinedload(ProductListing.variants),
                 joinedload(Product.primary_listing).joinedload(ProductListing.images),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.source),
-                joinedload(Product.price_override),
                 joinedload(Product.weight_rule),
             )
             .filter(Product.id.in_(normalized_ids))
@@ -250,7 +243,6 @@ class CatalogProductRepository:
                 Product.visibility_status.label("visibility_status"),
                 Product.manual_weight_grams.label("manual_weight_grams"),
                 ProductPresentation.title_override.label("title_override"),
-                ProductPriceOverride.manual_price_rub.label("manual_price_rub"),
                 WeightRule.weight_grams.label("rule_weight_grams"),
                 Designer.name.label("designer_name"),
                 ProductListing.id.label("listing_id"),
@@ -265,7 +257,6 @@ class CatalogProductRepository:
                 first_priced_variant_sq.c.currency_code.label("variant_currency_code"),
             )
             .outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
-            .outerjoin(ProductPriceOverride, ProductPriceOverride.product_id == Product.id)
             .outerjoin(WeightRule, WeightRule.id == Product.weight_rule_id)
             .outerjoin(Designer, Designer.id == Product.designer_id)
             .outerjoin(ProductListing, ProductListing.id == Product.primary_listing_id)
@@ -285,7 +276,8 @@ class CatalogProductRepository:
                     first_priced_variant_sq.c.rn == 1,
                 ),
             )
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
+            .filter(Product.dedup_status == "independent")
             .filter(Product.id.in_(self.session.query(dedup_enabled_product_ids_sq.c.product_id)))
             .order_by(Product.updated_at.desc(), Product.id.desc())
             .all()
@@ -299,7 +291,8 @@ class CatalogProductRepository:
                 func.max(ProductListing.updated_at),
             )
             .outerjoin(ProductListing, ProductListing.id == Product.primary_listing_id)
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
+            .filter(Product.dedup_status == "independent")
             .one()
         )
         product_count, max_product_updated_at, max_primary_listing_updated_at = row
@@ -328,6 +321,8 @@ class CatalogProductRepository:
         return query.filter(ProductListing.url_normalized == normalized_url).one_or_none()
 
     def create_product(self, **kwargs) -> Product:
+        if "gender" in kwargs and "source_gender" not in kwargs:
+            kwargs["source_gender"] = kwargs["gender"]
         entity = Product(**kwargs)
         self.session.add(entity)
         self.session.flush()
@@ -342,26 +337,65 @@ class CatalogProductRepository:
         self.session.flush()
         return entity
 
-    def ensure_membership(self, *, product_id: int, listing_id: int) -> ProductListingMember:
+    def ensure_owner_membership(self, *, product_id: int, listing_id: int) -> ProductListingMember:
         listing_id = int(listing_id)
         product_id = int(product_id)
-        updated = self.session.execute(
-            sa_update(ProductListingMember)
-            .where(ProductListingMember.listing_id == listing_id)
-            .values(product_id=product_id)
-        )
-        if int(updated.rowcount or 0) > 0:
-            self.session.flush()
-            self.session.expire_all()
-            return (
-                self.session.query(ProductListingMember)
-                .filter(ProductListingMember.listing_id == listing_id)
-                .one()
+        same_pair = (
+            self.session.query(ProductListingMember)
+            .filter(
+                ProductListingMember.product_id == product_id,
+                ProductListingMember.listing_id == listing_id,
             )
-        membership = ProductListingMember(product_id=product_id, listing_id=listing_id)
+            .one_or_none()
+        )
+        if same_pair is not None and str(same_pair.membership_kind or "") == "owner":
+            return same_pair
+        current_owner = (
+            self.session.query(ProductListingMember)
+            .filter(
+                ProductListingMember.listing_id == listing_id,
+                ProductListingMember.membership_kind == "owner",
+            )
+            .one_or_none()
+        )
+        if same_pair is not None and current_owner is not None and int(current_owner.product_id) != product_id:
+            self.session.delete(same_pair)
+            self.session.flush()
+            same_pair = None
+        if current_owner is not None:
+            current_owner.product_id = product_id
+            current_owner.membership_kind = "owner"
+            self.session.flush()
+            return current_owner
+        if same_pair is not None:
+            same_pair.membership_kind = "owner"
+            self.session.flush()
+            return same_pair
+        membership = ProductListingMember(product_id=product_id, listing_id=listing_id, membership_kind="owner")
         self.session.add(membership)
         self.session.flush()
         return membership
+
+    def ensure_included_membership(self, *, product_id: int, listing_id: int) -> ProductListingMember:
+        listing_id = int(listing_id)
+        product_id = int(product_id)
+        existing = (
+            self.session.query(ProductListingMember)
+            .filter(
+                ProductListingMember.product_id == product_id,
+                ProductListingMember.listing_id == listing_id,
+            )
+            .one_or_none()
+        )
+        if existing is not None:
+            return existing
+        membership = ProductListingMember(product_id=product_id, listing_id=listing_id, membership_kind="included")
+        self.session.add(membership)
+        self.session.flush()
+        return membership
+
+    def ensure_membership(self, *, product_id: int, listing_id: int) -> ProductListingMember:
+        return self.ensure_owner_membership(product_id=product_id, listing_id=listing_id)
 
     def delete_product_hard(self, product_id: int) -> None:
         self.session.execute(sa_delete(Product).where(Product.id == int(product_id)))
@@ -386,6 +420,26 @@ class CatalogProductRepository:
         self.session.flush()
         self.session.expire_all()
 
+    def set_product_dedup_state(
+        self,
+        *,
+        product_id: int,
+        dedup_status: str,
+        dedup_decision_id: int | None,
+        dedup_target_product_id: int | None,
+    ) -> None:
+        self.session.execute(
+            sa_update(Product)
+            .where(Product.id == int(product_id))
+            .values(
+                dedup_status=str(dedup_status),
+                dedup_decision_id=(int(dedup_decision_id) if dedup_decision_id is not None else None),
+                dedup_target_product_id=(int(dedup_target_product_id) if dedup_target_product_id is not None else None),
+            )
+        )
+        self.session.flush()
+        self.session.expire_all()
+
     def list_product_listings(self, product_id: int) -> list[ProductListing]:
         return (
             self.session.query(ProductListing)
@@ -406,6 +460,7 @@ class CatalogProductRepository:
             self.session.query(Product)
             .join(ProductListingMember, ProductListingMember.product_id == Product.id)
             .filter(ProductListingMember.listing_id == int(listing_id))
+            .filter(ProductListingMember.membership_kind == "owner")
             .one_or_none()
         )
 
@@ -422,6 +477,7 @@ class CatalogProductRepository:
                     price_amount=item.get("price_amount"),
                     compare_at_price_amount=item.get("compare_at_price_amount"),
                     currency_code=item.get("currency_code"),
+                    pricing_mode=item.get("pricing_mode") or "source",
                     is_orderable=bool(item.get("is_orderable", True)),
                 )
             )
@@ -489,40 +545,6 @@ class CatalogProductRepository:
         self.session.add(entity)
         self.session.flush()
         return entity
-
-    def get_price_override(self, product_id: int) -> ProductPriceOverride | None:
-        return (
-            self.session.query(ProductPriceOverride)
-            .filter(ProductPriceOverride.product_id == int(product_id))
-            .one_or_none()
-        )
-
-    def upsert_price_override(
-        self,
-        *,
-        product_id: int,
-        manual_price_rub: float,
-        manual_compare_at_price_rub: float | None,
-    ) -> ProductPriceOverride:
-        entity = self.get_price_override(product_id)
-        if entity is None:
-            entity = ProductPriceOverride(
-                product_id=int(product_id),
-                manual_price_rub=manual_price_rub,
-                manual_compare_at_price_rub=manual_compare_at_price_rub,
-            )
-            self.session.add(entity)
-        else:
-            entity.manual_price_rub = manual_price_rub
-            entity.manual_compare_at_price_rub = manual_compare_at_price_rub
-        self.session.flush()
-        return entity
-
-    def delete_price_override(self, product_id: int) -> None:
-        entity = self.get_price_override(product_id)
-        if entity is not None:
-            self.session.delete(entity)
-            self.session.flush()
 
     def list_gallery_scope(self, *, product_id: int, listing_id: int) -> list[ProductListingGalleryImage]:
         return (

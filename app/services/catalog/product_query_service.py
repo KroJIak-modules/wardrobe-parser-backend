@@ -18,7 +18,6 @@ from app.models import (
     ProductListing,
     ProductListingMember,
     ProductPresentation,
-    ProductPriceOverride,
     Source,
     ShowcaseCategory,
     ShowcaseCategoryAttachment,
@@ -44,13 +43,13 @@ class ProductQueryService:
         self._filter_rows_cache: list[tuple[str, str, bool]] | None = None
         self._custom_catalog_rows_cache: list[tuple[str, str]] | None = None
         self._showcase_cache: list[ShowcaseCategory] | None = None
-        self._source_rows_cache: list[tuple[int, str, str]] | None = None
-        self._service_source_items_cache: dict[str, dict] | None = None
+        self._source_rows_cache: list[tuple[int, str, str, str]] | None = None
         self._source_mode_ids_cache: dict[str, list[int]] = {}
         self._assigned_filter_slug_by_product_id_cache: dict[int, str] | None = None
         self._assigned_filter_label_by_product_id_cache: dict[int, str] | None = None
         self._applied_filter_revision_cache: int | None = None
         self._pricing_settings_cache: PricingSettingsResponse | None = None
+        self._variant_pricing_cache: dict[tuple[int, float | None, str | None, float | None, int | None], tuple[float | None, dict | None]] = {}
 
     def _filter_rows(self) -> list[tuple[str, str, bool]]:
         if self._filter_rows_cache is None:
@@ -87,25 +86,26 @@ class ProductQueryService:
             ]
         return self._custom_catalog_rows_cache
 
-    def _service_source_items(self) -> dict[str, dict]:
-        if self._service_source_items_cache is None:
-            self._service_source_items_cache = SourceRegistryService.fetch_service_sources_payload()
-        return self._service_source_items_cache
-
-    def _source_rows(self) -> list[tuple[int, str, str]]:
+    def _source_rows(self) -> list[tuple[int, str, str, str]]:
         if self._source_rows_cache is None:
             rows = (
                 self.db.query(
                     Source.id.label("id"),
                     Source.key.label("key"),
                     Source.name.label("name"),
+                    Source.parser_config.label("parser_config"),
                 )
                 .order_by(Source.name.asc(), Source.id.asc())
                 .all()
             )
             self._source_rows_cache = [
-                (int(source_id), str(source_key or "").strip(), str(source_name or "").strip() or str(source_key or "").strip())
-                for source_id, source_key, source_name in rows
+                (
+                    int(source_id),
+                    str(source_key or "").strip(),
+                    str(source_name or "").strip() or str(source_key or "").strip(),
+                    SourceRegistryService.normalize_parser_mode((parser_config or {}).get("mode") if isinstance(parser_config, dict) else None),
+                )
+                for source_id, source_key, source_name, parser_config in rows
                 if source_id is not None and str(source_key or "").strip()
             ]
         return self._source_rows_cache
@@ -128,6 +128,7 @@ class ProductQueryService:
         visibility_status: str | None = None,
         availability_mode: str | None = None,
         orderability_status: str | None = None,
+        audience: str = "admin",
         alias: str = "filtered_products",
     ):
         return (
@@ -142,6 +143,7 @@ class ProductQueryService:
                 visibility_status=visibility_status,
                 availability_mode=availability_mode,
                 orderability_status=orderability_status,
+                audience=audience,
             )
             .distinct()
             .subquery(alias)
@@ -312,7 +314,10 @@ class ProductQueryService:
 
     def _designer_option_rows(self, context_subquery) -> list[tuple[str, str, int]]:
         designer_listing = ProductListing.__table__.alias("designer_listing")
-        normalized_designer_name = func.lower(func.trim(func.coalesce(designer_listing.c.source_designer_raw, "")))
+        designer_presentation = ProductPresentation.__table__.alias("designer_presentation")
+        normalized_designer_name = func.lower(
+            func.trim(func.coalesce(designer_presentation.c.brand_override_name, designer_listing.c.source_designer_raw, ""))
+        )
         designer_key_expr = case(
             (Product.designer_id.is_not(None), cast(Product.designer_id, String())),
             else_=func.concat(literal("name:"), normalized_designer_name),
@@ -322,7 +327,7 @@ class ProductQueryService:
                 and_(Product.designer_id.is_not(None), func.length(func.trim(func.coalesce(Designer.name, ""))) > 0),
                 func.trim(Designer.name),
             ),
-            else_=func.trim(func.coalesce(designer_listing.c.source_designer_raw, "")),
+            else_=func.trim(func.coalesce(designer_presentation.c.brand_override_name, designer_listing.c.source_designer_raw, "")),
         )
         rows = (
             self.db.query(
@@ -333,6 +338,7 @@ class ProductQueryService:
             .select_from(context_subquery)
             .join(Product, Product.id == context_subquery.c.product_id)
             .outerjoin(Designer, Designer.id == Product.designer_id)
+            .outerjoin(designer_presentation, designer_presentation.c.product_id == Product.id)
             .outerjoin(designer_listing, designer_listing.c.id == Product.primary_listing_id)
             .filter(func.length(designer_label_expr) > 0)
             .group_by(designer_key_expr, designer_label_expr)
@@ -345,11 +351,40 @@ class ProductQueryService:
         return listing is not None and str(listing.ingest_mode or "") != "manual"
 
     @staticmethod
+    def _source_mode_for_listing(listing: ProductListing | None) -> str | None:
+        if listing is None:
+            return None
+        source = getattr(listing, "source", None)
+        source_key = str(getattr(source, "key", "") or "").strip().lower()
+        if source_key == SourceRegistryService.MANUAL_SOURCE_KEY:
+            return "personal"
+        parser_config = getattr(source, "parser_config", None)
+        return SourceRegistryService.normalize_parser_mode((parser_config or {}).get("mode") if isinstance(parser_config, dict) else None)
+
+    @staticmethod
     def _resolved_primary_listing(product: Product) -> ProductListing | None:
         if product.primary_listing is not None:
             return product.primary_listing
         listings = [membership.listing for membership in product.memberships if membership.listing is not None]
         return listings[0] if listings else None
+
+    @staticmethod
+    def _dedup_status(product: Product) -> str:
+        return str(getattr(product, "dedup_status", "") or "independent").strip().lower() or "independent"
+
+    @classmethod
+    def _effective_orderability_state(cls, product: Product, listing: ProductListing | None) -> tuple[str, str | None]:
+        dedup_status = cls._dedup_status(product)
+        if dedup_status == "combined_source":
+            return "unavailable", "dedup_combined_source"
+        if dedup_status == "hidden_by_keep":
+            return "unavailable", "dedup_hidden_by_keep"
+        if listing is None:
+            return "unavailable", None
+        return (
+            str(listing.orderability_status or "unavailable").strip().lower() or "unavailable",
+            str(listing.status_reason).strip() if listing.status_reason else None,
+        )
 
     @staticmethod
     def _effective_weight_grams(product: Product, listing: ProductListing | None) -> int | None:
@@ -489,10 +524,11 @@ class ProductQueryService:
         if product.presentation is not None and product.presentation.title_override:
             return str(product.presentation.title_override)
         if listing is not None and listing.source_title:
+            source_brand = ProductQueryService._effective_brand_name(product, listing)
             return (
                 ProductTitleService.display_title(
                     source_title=str(listing.source_title),
-                    source_designer_name=str(listing.source_designer_raw or "") or None,
+                    source_designer_name=source_brand,
                     source_category_name=str(listing.source_category_raw or "") or None,
                 )
                 or str(listing.source_title)
@@ -500,9 +536,269 @@ class ProductQueryService:
         return f"Product {int(product.id)}"
 
     @staticmethod
-    def _listing_payload(product: Product, listing: ProductListing) -> dict:
-        gallery = ProductQueryService._gallery_state(product, listing)
-        is_business_source = ProductQueryService._is_business_source_listing(listing)
+    def _effective_brand_name(product: Product, listing: ProductListing | None) -> str | None:
+        presentation = product.presentation
+        if presentation is not None and str(getattr(presentation, "brand_override_name", "") or "").strip():
+            return str(presentation.brand_override_name)
+        if listing is not None and str(listing.source_designer_raw or "").strip():
+            return str(listing.source_designer_raw)
+        if product.designer is not None and str(product.designer.name or "").strip():
+            return str(product.designer.name)
+        return None
+
+    @staticmethod
+    def _amounts_differ(left: float | int | None, right: float | int | None) -> bool:
+        if left is None or right is None:
+            return left is not right
+        return abs(float(left) - float(right)) >= 0.01
+
+    @staticmethod
+    def _variant_summary_sort_key(variant: dict[str, Any]) -> tuple[int, float, float, int, int]:
+        final_price = variant.get("final_price")
+        source_price = variant.get("price")
+        return (
+            0 if variant.get("available") else 1,
+            float(final_price) if final_price is not None else float("inf"),
+            float(source_price) if source_price is not None else float("inf"),
+            int(variant.get("listing_id") or 0),
+            int(variant.get("position") or 0),
+        )
+
+    @staticmethod
+    def _range_candidates_for_summary(variants: list[dict[str, Any]], price_key: str) -> list[dict[str, Any]]:
+        available = [variant for variant in variants if variant.get("available") and variant.get(price_key) is not None]
+        if available:
+            return available
+        any_priced = [variant for variant in variants if variant.get(price_key) is not None]
+        if any_priced:
+            return any_priced
+        return []
+
+    @classmethod
+    def _build_price_summary(cls, variants: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not variants:
+            return None
+        final_candidates = cls._range_candidates_for_summary(variants, "final_price")
+        source_candidates = cls._range_candidates_for_summary(variants, "price")
+        representative_pool = final_candidates or source_candidates
+        if not representative_pool:
+            return None
+        representative = min(representative_pool, key=cls._variant_summary_sort_key)
+
+        final_has_range = False
+        if len(final_candidates) > 1:
+            baseline_final = float(final_candidates[0]["final_price"])
+            final_has_range = any(cls._amounts_differ(baseline_final, variant.get("final_price")) for variant in final_candidates[1:])
+
+        source_has_range = False
+        if len(source_candidates) > 1:
+            baseline_source = source_candidates[0]
+            baseline_currency = str(baseline_source.get("currency") or "").upper() or None
+            baseline_price = baseline_source.get("price")
+            source_has_range = any(
+                (str(variant.get("currency") or "").upper() or None) != baseline_currency
+                or cls._amounts_differ(baseline_price, variant.get("price"))
+                for variant in source_candidates[1:]
+            )
+
+        final_display_price = representative.get("final_price")
+        final_compare_at_price = representative.get("final_compare_at_price")
+        if (
+            final_display_price is not None
+            and final_compare_at_price is not None
+            and not cls._amounts_differ(final_compare_at_price, final_display_price)
+        ):
+            final_compare_at_price = None
+        if (
+            final_display_price is not None
+            and final_compare_at_price is not None
+            and float(final_compare_at_price) < float(final_display_price)
+        ):
+            final_compare_at_price = None
+
+        return {
+            "source_display_price": representative.get("price"),
+            "source_currency": representative.get("currency"),
+            "source_compare_at_price": representative.get("compare_at_price"),
+            "source_has_range": source_has_range,
+            "final_display_price": final_display_price,
+            "final_currency": representative.get("final_currency"),
+            "final_compare_at_price": final_compare_at_price,
+            "final_has_range": final_has_range,
+            "pricing_reason": representative.get("pricing_reason"),
+            "pricing_manual_required": bool(representative.get("pricing_manual_required")),
+            "representative_variant_id": representative.get("id"),
+            "representative_listing_id": representative.get("listing_id"),
+            "representative_source_ref_id": representative.get("source_ref_id"),
+        }
+
+    @staticmethod
+    def _representative_pricing_components(
+        variants: list[dict[str, Any]],
+        price_summary: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not variants or not isinstance(price_summary, dict):
+            return None
+        representative_variant_id = int(price_summary.get("representative_variant_id") or 0)
+        representative_listing_id = int(price_summary.get("representative_listing_id") or 0)
+        representative_source_ref_id = str(price_summary.get("representative_source_ref_id") or "").strip() or None
+        for variant in variants:
+            if representative_variant_id > 0 and int(variant.get("id") or 0) != representative_variant_id:
+                continue
+            if representative_listing_id > 0 and int(variant.get("listing_id") or 0) != representative_listing_id:
+                continue
+            if representative_source_ref_id and str(variant.get("source_ref_id") or "").strip() != representative_source_ref_id:
+                continue
+            components = variant.get("pricing_components")
+            return dict(components) if isinstance(components, dict) else None
+        return None
+
+    def _compute_variant_pricing(
+        self,
+        listing: ProductListing | None,
+        *,
+        source_price: float | int | None,
+        source_currency: str | None,
+        compare_at_price: float | int | None,
+        weight_grams: int | None,
+        pricing_mode: str | None = None,
+    ) -> tuple[float | None, dict | None]:
+        if listing is None:
+            return None, None
+        normalized_currency = str(source_currency or "").upper() or None
+        normalized_price = float(source_price) if source_price is not None else None
+        normalized_compare_at = float(compare_at_price) if compare_at_price is not None else None
+        normalized_pricing_mode = str(pricing_mode or "").strip().lower() or "source"
+        cache_key = (
+            int(listing.id),
+            round(normalized_price, 4) if normalized_price is not None else None,
+            normalized_currency,
+            round(normalized_compare_at, 4) if normalized_compare_at is not None else None,
+            int(weight_grams) if weight_grams is not None else None,
+            normalized_pricing_mode,
+        )
+        cached = self._variant_pricing_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if normalized_pricing_mode == "fixed_final_rub":
+            result = (
+                normalized_price,
+                {
+                    "manual_required": False,
+                    "reason": None,
+                    "pricing_mode": "fixed_final_rub",
+                    "fixed_final_price_rub": normalized_price,
+                    "fixed_compare_at_price_rub": normalized_compare_at,
+                },
+            )
+            self._variant_pricing_cache[cache_key] = result
+            return result
+
+        supplier_id = getattr(getattr(listing.source, "setting", None), "supplier_id", None)
+        promo_factor = getattr(getattr(listing.source, "setting", None), "promo_factor", None)
+        promo_only_no_discount = getattr(getattr(listing.source, "setting", None), "promo_only_no_discount", None)
+        buyout_surcharge_value = getattr(getattr(listing.source, "setting", None), "buyout_surcharge_value", None)
+        buyout_surcharge_currency = getattr(getattr(listing.source, "setting", None), "buyout_surcharge_currency", None)
+
+        try:
+            settings = self._pricing_settings()
+            computation = self.pricing.calculate_for_product(
+                source_price=normalized_price,
+                source_currency=normalized_currency,
+                weight_grams=weight_grams,
+                supplier_id=int(supplier_id) if supplier_id is not None else None,
+                promo_factor=float(promo_factor) if promo_factor is not None else None,
+                promo_only_no_discount=bool(promo_only_no_discount) if promo_only_no_discount is not None else None,
+                buyout_surcharge_value=float(buyout_surcharge_value) if buyout_surcharge_value is not None else None,
+                buyout_surcharge_currency=str(buyout_surcharge_currency or "").upper() or None,
+                variants=[
+                    {
+                        "price": normalized_price,
+                        "currency": normalized_currency,
+                        "compare_at_price": normalized_compare_at,
+                        "available": True,
+                    }
+                ],
+                settings=settings,
+            )
+            result = (
+                computation.final_price_rub,
+                {
+                    "manual_required": computation.manual_required,
+                    "reason": computation.reason,
+                    **(computation.components or {}),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            result = (None, {"manual_required": True, "reason": f"pricing_error:{exc.__class__.__name__}"})
+
+        self._variant_pricing_cache[cache_key] = result
+        return result
+
+    def _variant_payload(self, product: Product, listing: ProductListing, variant) -> dict[str, Any]:
+        is_business_source = self._is_business_source_listing(listing)
+        source_price = self._decimal_to_float(variant.price_amount)
+        compare_at_price = self._decimal_to_float(variant.compare_at_price_amount)
+        currency = str(variant.currency_code or "").upper() or None
+        pricing_mode = str(getattr(variant, "pricing_mode", "") or "source").strip().lower() or "source"
+        weight_grams = self._effective_weight_grams(product, listing)
+        final_price, pricing_details = self._compute_variant_pricing(
+            listing,
+            source_price=source_price,
+            source_currency=currency,
+            compare_at_price=compare_at_price,
+            weight_grams=weight_grams,
+            pricing_mode=pricing_mode,
+        )
+        if pricing_mode == "fixed_final_rub":
+            final_compare_at_price = compare_at_price
+        else:
+            final_compare_at_price, _ = self._compute_variant_pricing(
+                listing,
+                source_price=compare_at_price,
+                source_currency=currency,
+                compare_at_price=None,
+                weight_grams=weight_grams,
+                pricing_mode=pricing_mode,
+            ) if compare_at_price is not None else (None, None)
+        if (
+            final_price is not None
+            and final_compare_at_price is not None
+            and float(final_compare_at_price) <= float(final_price)
+        ):
+            final_compare_at_price = None
+
+        return {
+            "id": int(variant.id),
+            "position": int(variant.position),
+            "title": str(variant.title or ""),
+            "available": bool(variant.is_orderable),
+            "price": source_price,
+            "inventory_quantity": 1 if bool(variant.is_orderable) else 0,
+            "sku": variant.sku,
+            "currency": currency,
+            "compare_at_price": compare_at_price,
+            "pricing_mode": pricing_mode,
+            "final_price": final_price,
+            "final_currency": "RUB" if final_price is not None else None,
+            "final_compare_at_price": final_compare_at_price,
+            "final_compare_at_currency": "RUB" if final_compare_at_price is not None else None,
+            "pricing_manual_required": bool(pricing_details.get("manual_required")) if isinstance(pricing_details, dict) else False,
+            "pricing_reason": (
+                str(pricing_details.get("reason") or "").strip() or None
+                if isinstance(pricing_details, dict)
+                else None
+            ),
+            "pricing_components": dict(pricing_details) if isinstance(pricing_details, dict) else None,
+            "source_id": (int(listing.source_id) if is_business_source else None),
+            "source_name": (str(getattr(listing.source, "name", "") or "") or None if is_business_source else None),
+            "listing_id": int(listing.id),
+            "source_ref_id": str(variant.source_ref_id) if variant.source_ref_id else None,
+        }
+
+    def _listing_payload(self, product: Product, listing: ProductListing) -> dict:
+        gallery = self._gallery_state(product, listing)
+        is_business_source = self._is_business_source_listing(listing)
         return {
             "id": int(listing.id),
             "source_id": (int(listing.source_id) if is_business_source else None),
@@ -526,41 +822,14 @@ class ProductQueryService:
             "status_reason": str(listing.status_reason) if listing.status_reason else None,
             "image_urls": gallery["display_image_urls"],
             "gallery": gallery,
-            "variants": [
-                {
-                    "id": int(variant.id),
-                    "position": int(variant.position),
-                    "title": str(variant.title),
-                    "available": bool(variant.is_orderable),
-                    "price": ProductQueryService._decimal_to_float(variant.price_amount),
-                    "compare_at_price": ProductQueryService._decimal_to_float(variant.compare_at_price_amount),
-                    "currency": str(variant.currency_code or "").upper() or None,
-                    "sku": str(variant.sku) if variant.sku else None,
-                    "source_ref_id": str(variant.source_ref_id) if variant.source_ref_id else None,
-                }
-                for variant in sorted(listing.variants, key=lambda item: int(item.position))
-            ],
+            "variants": self._listing_variants(product, listing),
         }
 
-    def _listing_variants(self, listing: ProductListing | None) -> list[dict]:
+    def _listing_variants(self, product: Product, listing: ProductListing | None) -> list[dict]:
         if listing is None:
             return []
-        is_business_source = self._is_business_source_listing(listing)
         return [
-            {
-                "id": int(variant.id),
-                "title": str(variant.title or ""),
-                "available": bool(variant.is_orderable),
-                "price": self._decimal_to_float(variant.price_amount),
-                "inventory_quantity": 1 if bool(variant.is_orderable) else 0,
-                "sku": variant.sku,
-                "currency": str(variant.currency_code or "").upper() or None,
-                "compare_at_price": self._decimal_to_float(variant.compare_at_price_amount),
-                "source_id": (int(listing.source_id) if is_business_source else None),
-                "source_name": (str(getattr(listing.source, "name", "") or "") or None if is_business_source else None),
-                "listing_id": int(listing.id),
-                "source_ref_id": str(variant.source_ref_id) if variant.source_ref_id else None,
-            }
+            self._variant_payload(product, listing, variant)
             for variant in sorted(listing.variants, key=lambda item: int(item.position))
         ]
 
@@ -570,13 +839,23 @@ class ProductQueryService:
             listing = membership.listing
             if listing is None:
                 continue
-            variants.extend(self._listing_variants(listing))
+            variants.extend(self._listing_variants(product, listing))
         return variants
 
     def _compute_pricing(self, product: Product, listing: ProductListing | None, variants: list[dict], weight_grams: int | None) -> tuple[float | None, dict | None]:
         if listing is None:
             return None, None
         price_variant = next((variant for variant in variants if variant.get("price") is not None), None)
+        if price_variant and str(price_variant.get("pricing_mode") or "").strip().lower() == "fixed_final_rub":
+            final_price = float(price_variant["price"]) if price_variant.get("price") is not None else None
+            compare_at_price = float(price_variant["compare_at_price"]) if price_variant.get("compare_at_price") is not None else None
+            return final_price, {
+                "manual_required": False,
+                "reason": "fixed_final_rub",
+                "pricing_mode": "fixed_final_rub",
+                "fixed_final_price_rub": final_price,
+                "fixed_compare_at_price_rub": compare_at_price,
+            }
         source_price = float(price_variant["price"]) if price_variant and price_variant.get("price") is not None else None
         source_currency = str(price_variant.get("currency") or "").upper() or None if price_variant else None
         supplier_id = getattr(getattr(listing.source, "setting", None), "supplier_id", None)
@@ -584,18 +863,6 @@ class ProductQueryService:
         promo_only_no_discount = getattr(getattr(listing.source, "setting", None), "promo_only_no_discount", None)
         buyout_surcharge_value = getattr(getattr(listing.source, "setting", None), "buyout_surcharge_value", None)
         buyout_surcharge_currency = getattr(getattr(listing.source, "setting", None), "buyout_surcharge_currency", None)
-
-        if product.price_override is not None and product.price_override.manual_price_rub is not None:
-            final_price = float(product.price_override.manual_price_rub)
-            return final_price, {
-                "reason": None,
-                "manual_override": True,
-                "manual_compare_at_price_rub": (
-                    float(product.price_override.manual_compare_at_price_rub)
-                    if product.price_override.manual_compare_at_price_rub is not None
-                    else None
-                ),
-            }
 
         try:
             settings = self._pricing_settings()
@@ -623,8 +890,6 @@ class ProductQueryService:
     def _is_pricing_example_candidate(product: dict[str, Any]) -> bool:
         components = product.get("pricing_components") if isinstance(product.get("pricing_components"), dict) else {}
         if not components:
-            return False
-        if components.get("manual_override") is True:
             return False
         if components.get("manual_required") is True:
             return False
@@ -658,18 +923,22 @@ class ProductQueryService:
             return None
         if str(listing.orderability_status or "") != "orderable":
             return None
-        if product.price_override is not None and product.price_override.manual_price_rub is not None:
-            return None
-
-        listing_variants = self._listing_variants(listing)
+        listing_variants = self._listing_variants(product, listing)
+        price_summary = self._build_price_summary(listing_variants)
         effective_weight_grams = self._effective_weight_grams(product, listing)
         final_price, pricing_components = self._compute_pricing(product, listing, listing_variants, effective_weight_grams)
-        source_price = next((variant.get("price") for variant in listing_variants if variant.get("price") is not None), None)
-        source_currency = next((variant.get("currency") for variant in listing_variants if variant.get("currency")), None)
 
         candidate_payload = {
-            "source_price": source_price,
-            "final_price": final_price,
+            "source_price": (
+                float(price_summary.get("source_display_price"))
+                if isinstance(price_summary, dict) and price_summary.get("source_display_price") is not None
+                else None
+            ),
+            "final_price": (
+                float(price_summary.get("final_display_price"))
+                if isinstance(price_summary, dict) and price_summary.get("final_display_price") is not None
+                else final_price
+            ),
             "pricing_components": pricing_components or {},
         }
         if not self._is_pricing_example_candidate(candidate_payload):
@@ -686,9 +955,7 @@ class ProductQueryService:
                 else None
             ),
             "image_url": (gallery.get("display_image_urls") or [None])[0],
-            "source_price": source_price,
-            "source_currency": source_currency,
-            "final_price": final_price,
+            "price_summary": price_summary,
             "components": pricing_components or {},
             "is_sample": False,
         }
@@ -786,15 +1053,29 @@ class ProductQueryService:
         )
         if computation.manual_required or computation.final_price_rub is None:
             return None
+        price_summary = cls._build_price_summary(
+            [
+                {
+                    "price": sample_source_price,
+                    "currency": "EUR",
+                    "compare_at_price": None,
+                    "final_price": computation.final_price_rub,
+                    "final_currency": "RUB",
+                    "final_compare_at_price": None,
+                    "pricing_manual_required": bool(computation.manual_required),
+                    "pricing_reason": computation.reason,
+                    "pricing_components": computation.components or {},
+                    "available": True,
+                }
+            ]
+        )
         return {
             "product_id": None,
             "title": "Пример расчета",
             "url": None,
             "source_name": sample_source_name,
             "image_url": None,
-            "source_price": sample_source_price,
-            "source_currency": "EUR",
-            "final_price": computation.final_price_rub,
+            "price_summary": price_summary,
             "components": computation.components or {},
             "is_sample": True,
         }
@@ -811,12 +1092,11 @@ class ProductQueryService:
             for row in (
                 self.db.query(Product.id)
                 .join(ProductListing, ProductListing.id == Product.primary_listing_id)
-                .outerjoin(ProductPriceOverride, ProductPriceOverride.product_id == Product.id)
-                .filter(Product.lifecycle_status != "merged")
+                .filter(Product.lifecycle_status == "active")
+                .filter(Product.dedup_status == "independent")
                 .filter(Product.primary_listing_id.is_not(None))
                 .filter(Product.visibility_status == "visible")
                 .filter(ProductListing.orderability_status == "orderable")
-                .filter(ProductPriceOverride.product_id.is_(None))
                 .order_by(func.random())
                 .limit(self._PRICING_EXAMPLE_SCAN_LIMIT)
                 .all()
@@ -841,20 +1121,23 @@ class ProductQueryService:
 
     def _build_shared_payload(self, product: Product) -> tuple[dict, dict]:
         primary_listing = self._resolved_primary_listing(product)
+        effective_orderability_status, effective_status_reason = self._effective_orderability_state(product, primary_listing)
         primary_is_business_source = self._is_business_source_listing(primary_listing)
         title = self._effective_title(product, primary_listing)
         description = self._description_state(product, primary_listing)
         gallery = self._gallery_state(product, primary_listing)
         variants = self._build_variants(product)
-        primary_listing_variants = self._listing_variants(primary_listing)
+        primary_listing_variants = self._listing_variants(product, primary_listing)
         effective_weight_grams = self._effective_weight_grams(product, primary_listing)
         final_price, pricing_components = self._compute_pricing(product, primary_listing, primary_listing_variants, effective_weight_grams)
-        source_price = next((variant.get("price") for variant in primary_listing_variants if variant.get("price") is not None), None)
-        source_currency = next((variant.get("currency") for variant in primary_listing_variants if variant.get("currency")), None)
+        price_summary = self._build_price_summary(variants)
+        representative_pricing_components = self._representative_pricing_components(variants, price_summary)
         matched_filter_slugs = self._matched_filter_slugs(product)
         custom_catalog_slugs = self._custom_catalog_slugs(int(product.id))
-        internal_category_names = self._matched_filter_labels(product)
-        for title in self._taxonomy_titles(filter_slugs=[], custom_catalog_slugs=custom_catalog_slugs):
+        matched_filter_labels = self._matched_filter_labels(product)
+        custom_catalog_names = self._taxonomy_titles(filter_slugs=[], custom_catalog_slugs=custom_catalog_slugs)
+        internal_category_names = list(matched_filter_labels)
+        for title in custom_catalog_names:
             if title not in internal_category_names:
                 internal_category_names.append(title)
         showcase_category_codes = self._showcase_category_codes_for_product(
@@ -865,18 +1148,26 @@ class ProductQueryService:
             self._listing_payload(product, listing)
             for listing in self.products.list_product_listings(int(product.id))
         ]
+        has_sync_listing = any(str(listing.get("ingest_mode") or "").strip() == "sync" for listing in listings)
 
         base_payload = {
             "id": int(product.id),
             "designer_id": int(product.designer_id) if product.designer_id is not None else None,
             "designer_name": str(getattr(product.designer, "name", "") or "") or None,
-            "display_designer_name": str(getattr(product.designer, "name", "") or "") or (str(primary_listing.source_designer_raw) if primary_listing is not None and primary_listing.source_designer_raw else None),
+            "display_designer_name": str(getattr(product.designer, "name", "") or "") or self._effective_brand_name(product, primary_listing),
+            "brand_name": self._effective_brand_name(product, primary_listing),
+            "brand_name_is_manual": bool(
+                product.presentation is not None
+                and str(getattr(product.presentation, "brand_override_name", "") or "").strip()
+            ),
             "primary_listing_id": int(primary_listing.id) if primary_listing is not None else None,
             "gender": str(product.gender),
+            "gender_is_manual": bool(getattr(product, "gender_is_manual", False)),
             "availability_mode": str(product.availability_mode),
             "visibility_status": str(product.visibility_status),
             "lifecycle_status": str(product.lifecycle_status),
             "manual_weight_grams": int(product.manual_weight_grams) if product.manual_weight_grams is not None else None,
+            "auto_weight_grams": int(product.weight_rule.weight_grams) if product.weight_rule is not None and product.weight_rule.weight_grams is not None else None,
             "weight_rule_id": int(product.weight_rule_id) if product.weight_rule_id is not None else None,
             "effective_weight_grams": effective_weight_grams,
             "title": title,
@@ -900,24 +1191,33 @@ class ProductQueryService:
                 if primary_listing is not None and primary_is_business_source
                 else None
             ),
+            "source_mode": self._source_mode_for_listing(primary_listing),
+            "has_sync_listing": has_sync_listing,
             "source_category_name": str(primary_listing.source_category_raw) if primary_listing is not None and primary_listing.source_category_raw else None,
             "source_tags": self._normalized_text_list(getattr(primary_listing, "source_tags", None)) if primary_listing is not None else [],
             "source_designer_name": str(primary_listing.source_designer_raw) if primary_listing is not None and primary_listing.source_designer_raw else None,
-            "orderability_status": str(primary_listing.orderability_status) if primary_listing is not None else "unavailable",
-            "status_reason": str(primary_listing.status_reason) if primary_listing is not None and primary_listing.status_reason else None,
+            "orderability_status": effective_orderability_status,
+            "status_reason": effective_status_reason,
             "description_mode": description["description_mode"],
             "description": description["public_description"],
-            "price": final_price if final_price is not None else source_price,
-            "currency": "RUB" if final_price is not None else source_currency,
-            "source_price": source_price,
-            "source_currency": source_currency,
-            "final_price": final_price,
-            "final_currency": "RUB" if final_price is not None else None,
-            "pricing_components": pricing_components,
+            "price_summary": price_summary,
+            "pricing_reason": (
+                str(price_summary.get("pricing_reason") or "").strip() or None
+                if isinstance(price_summary, dict)
+                else None
+            ),
+            "pricing_manual_required": (
+                bool(price_summary.get("pricing_manual_required"))
+                if isinstance(price_summary, dict)
+                else False
+            ),
+            "pricing_components": representative_pricing_components or pricing_components,
             "image_urls": gallery["display_image_urls"],
             "variants": variants,
             "internal_category_names": internal_category_names,
             "internal_category_name": internal_category_names[0] if internal_category_names else None,
+            "filter_name": matched_filter_labels[0] if matched_filter_labels else None,
+            "custom_catalog_names": custom_catalog_names,
             "created_at": product.created_at.isoformat() if product.created_at else None,
             "updated_at": product.updated_at.isoformat() if product.updated_at else None,
         }
@@ -925,21 +1225,10 @@ class ProductQueryService:
             "description_text": description["effective_text"],
             "description_html": description["effective_html"],
             "description_public_visible": description["public_visible"],
-            "price_override": (
-                {
-                    "manual_price_rub": float(product.price_override.manual_price_rub),
-                    "manual_compare_at_price_rub": (
-                        float(product.price_override.manual_compare_at_price_rub)
-                        if product.price_override.manual_compare_at_price_rub is not None
-                        else None
-                    ),
-                }
-                if product.price_override is not None and product.price_override.manual_price_rub is not None
-                else None
-            ),
             "gallery": gallery,
             "presentation": {
                 "title_override": getattr(product.presentation, "title_override", None) if product.presentation is not None else None,
+                "brand_override_name": getattr(product.presentation, "brand_override_name", None) if product.presentation is not None else None,
                 "description_text": getattr(product.presentation, "description_text", None) if product.presentation is not None else None,
                 "description_html": getattr(product.presentation, "description_html", None) if product.presentation is not None else None,
                 "description_visibility": getattr(product.presentation, "description_visibility", None) if product.presentation is not None else None,
@@ -963,18 +1252,13 @@ class ProductQueryService:
 
     def build_dedup_candidate_payload(self, product: Product) -> dict:
         primary_listing = self._resolved_primary_listing(product)
+        effective_orderability_status, effective_status_reason = self._effective_orderability_state(product, primary_listing)
         image_urls = (
             [str(primary_listing.images[0].url)]
             if primary_listing is not None and self._show_images_enabled(primary_listing) and primary_listing.images
             else []
         )
-        primary_listing_variants = self._listing_variants(primary_listing)
-        first_priced_variant = next((variant for variant in primary_listing_variants if variant.get("price") is not None), None)
-        manual_price = (
-            float(product.price_override.manual_price_rub)
-            if product.price_override is not None and product.price_override.manual_price_rub is not None
-            else None
-        )
+        variants = self._build_variants(product)
         return {
             "id": int(product.id),
             "title": self._effective_title(product, primary_listing),
@@ -982,22 +1266,17 @@ class ProductQueryService:
             "source_designer_name": str(primary_listing.source_designer_raw) if primary_listing is not None and primary_listing.source_designer_raw else None,
             "display_designer_name": (
                 str(getattr(product.designer, "name", "") or "")
-                or (str(primary_listing.source_designer_raw) if primary_listing is not None and primary_listing.source_designer_raw else None)
+                or self._effective_brand_name(product, primary_listing)
             ),
             "url": (
                 str(primary_listing.url)
                 if primary_listing is not None and self._is_business_source_listing(primary_listing)
                 else None
             ),
-            "price": manual_price if manual_price is not None else (first_priced_variant.get("price") if first_priced_variant else None),
-            "currency": (
-                "RUB"
-                if manual_price is not None
-                else str(first_priced_variant.get("currency") or "RUB")
-                if first_priced_variant is not None
-                else "RUB"
-            ),
+            "price_summary": self._build_price_summary(variants),
             "visibility_status": str(product.visibility_status),
+            "orderability_status": effective_orderability_status,
+            "status_reason": effective_status_reason,
             "effective_weight_grams": self._effective_weight_grams(product, primary_listing),
             "image_urls": image_urls,
             "image_ids": [],
@@ -1040,6 +1319,7 @@ class ProductQueryService:
         visibility_status: str | None = None,
         availability_mode: str | None = None,
         orderability_status: str | None = None,
+        audience: str = "admin",
     ):
         normalized_source_mode = str(source_mode or "").strip().lower()
         normalized_designer_filter = str(designer_filter or "").strip()
@@ -1057,8 +1337,15 @@ class ProductQueryService:
                 bool(normalized_designer_filter and not normalized_designer_filter.isdigit()),
             )
         )
-        needs_presentation_join = bool(normalized_query)
-        base_query = self.db.query(Product.id.label("product_id")).filter(Product.lifecycle_status != "merged")
+        needs_presentation_join = bool(normalized_query or (normalized_designer_filter and not normalized_designer_filter.isdigit()))
+        normalized_audience = str(audience or "admin").strip().lower()
+        base_query = (
+            self.db.query(Product.id.label("product_id"))
+            .filter(Product.lifecycle_status == "active")
+            .filter(Product.primary_listing_id.is_not(None))
+        )
+        if normalized_audience == "public":
+            base_query = base_query.filter(Product.dedup_status == "independent")
         if needs_listing_join:
             base_query = (
                 base_query
@@ -1083,7 +1370,9 @@ class ProductQueryService:
                 designer_name = " ".join(raw_designer_name.strip().lower().split())
                 if designer_name:
                     base_query = base_query.filter(
-                        func.lower(func.coalesce(ProductListing.source_designer_raw, "")) == designer_name
+                        func.lower(
+                            func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw, "")
+                        ) == designer_name
                     )
                 else:
                     base_query = base_query.filter(False)
@@ -1094,7 +1383,12 @@ class ProductQueryService:
         if availability_mode:
             base_query = base_query.filter(Product.availability_mode == str(availability_mode).strip().lower())
         if orderability_status:
-            base_query = base_query.filter(ProductListing.orderability_status == str(orderability_status).strip().lower())
+            normalized_orderability_status = str(orderability_status).strip().lower()
+            effective_orderability_expr = case(
+                (Product.dedup_status != "independent", literal("unavailable")),
+                else_=func.coalesce(ProductListing.orderability_status, literal("unavailable")),
+            )
+            base_query = base_query.filter(effective_orderability_expr == normalized_orderability_status)
         if effective_filter_slug is not None:
             base_query = self._apply_filter_slug_query(base_query, effective_filter_slug)
         if effective_custom_catalog_slug is not None:
@@ -1111,7 +1405,7 @@ class ProductQueryService:
                     func.lower(func.coalesce(ProductListing.source_title, "")).like(pattern),
                     func.lower(func.coalesce(ProductListing.source_description_text, "")).like(pattern),
                     func.lower(func.coalesce(ProductListing.source_description_html, "")).like(pattern),
-                    func.lower(func.coalesce(ProductListing.source_designer_raw, "")).like(pattern),
+                    func.lower(func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw, "")).like(pattern),
                     func.lower(func.coalesce(ProductListing.source_category_raw, "")).like(pattern),
                     func.lower(func.coalesce(ProductListing.handle, "")).like(pattern),
                     func.lower(func.coalesce(ProductListing.url, "")).like(pattern),
@@ -1129,11 +1423,10 @@ class ProductQueryService:
         cached_ids = self._source_mode_ids_cache.get(normalized_mode)
         if cached_ids is not None:
             return list(cached_ids)
-        service_items = self._service_source_items()
         source_ids = [
             int(source_id)
-            for source_id, source_key, _source_name in self._source_rows()
-            if SourceRegistryService.derive_source_mode(source_key, service_items.get(source_key)) == normalized_mode
+            for source_id, source_key, _source_name, source_mode in self._source_rows()
+            if ("personal" if source_key == SourceRegistryService.MANUAL_SOURCE_KEY else source_mode) == normalized_mode
         ]
         self._source_mode_ids_cache[normalized_mode] = list(source_ids)
         return list(source_ids)
@@ -1166,6 +1459,7 @@ class ProductQueryService:
             visibility_status=visibility_status,
             availability_mode=availability_mode,
             orderability_status=orderability_status,
+            audience=audience,
             alias="public_product_ids",
         )
         total = int(self.db.query(func.count()).select_from(filtered_ids).scalar() or 0)
@@ -1198,7 +1492,20 @@ class ProductQueryService:
         product = self.products.get_product(product_id)
         if product is None:
             return None
-        return self.build_product_payload(product, audience=audience)
+        normalized_audience = str(audience).strip().lower()
+        if normalized_audience == "public" and self._dedup_status(product) != "independent":
+            return None
+        primary_listing = self._resolved_primary_listing(product)
+        effective_orderability_status, _ = self._effective_orderability_state(product, primary_listing)
+        if effective_orderability_status == "unavailable":
+            return None
+        return self.build_product_payload(product, audience=normalized_audience)
+
+    def get_admin_mutation_payload(self, product_id: int) -> dict | None:
+        product = self.products.get_product(product_id)
+        if product is None:
+            return None
+        return self.build_admin_product_payload(product)
 
     def get_dedup_payloads_by_ids(self, product_ids: list[int]) -> dict[int, dict]:
         products = self.products.list_products_for_dedup_by_ids(product_ids)
@@ -1229,11 +1536,9 @@ class ProductQueryService:
 
     def build_admin_table_product_payload(self, product: Product, *, custom_catalog_titles: list[str] | None = None) -> dict:
         primary_listing = self._resolved_primary_listing(product)
-        primary_listing_variants = self._listing_variants(primary_listing)
-        effective_weight_grams = self._effective_weight_grams(product, primary_listing)
-        final_price, pricing_components = self._compute_pricing(product, primary_listing, primary_listing_variants, effective_weight_grams)
-        source_price = next((variant.get("price") for variant in primary_listing_variants if variant.get("price") is not None), None)
-        source_currency = next((variant.get("currency") for variant in primary_listing_variants if variant.get("currency")), None)
+        effective_orderability_status, effective_status_reason = self._effective_orderability_state(product, primary_listing)
+        variants = self._build_variants(product)
+        price_summary = self._build_price_summary(variants)
         gallery = self._gallery_state(product, primary_listing)
         internal_category_names = self._matched_filter_labels(product)
         for title in custom_catalog_titles or []:
@@ -1270,24 +1575,21 @@ class ProductQueryService:
             "source_tags": self._normalized_text_list(getattr(primary_listing, "source_tags", None)) if primary_listing is not None else [],
             "visibility_status": str(product.visibility_status),
             "availability_mode": str(product.availability_mode),
-            "orderability_status": str(primary_listing.orderability_status) if primary_listing is not None else "unavailable",
-            "status_reason": str(primary_listing.status_reason) if primary_listing is not None and primary_listing.status_reason else None,
+            "orderability_status": effective_orderability_status,
+            "status_reason": effective_status_reason,
             "lifecycle_status": str(product.lifecycle_status),
             "image_count": len(gallery["display_image_urls"]),
             "image_urls": list(gallery["display_image_urls"][:1]),
             "image_ids": [],
-            "source_price": source_price,
-            "source_currency": source_currency,
-            "final_price": final_price,
-            "final_currency": "RUB" if final_price is not None else None,
+            "price_summary": price_summary,
             "pricing_reason": (
-                str(pricing_components.get("reason") or "").strip() or None
-                if isinstance(pricing_components, dict)
+                str(price_summary.get("pricing_reason") or "").strip() or None
+                if isinstance(price_summary, dict)
                 else None
             ),
             "pricing_manual_required": (
-                bool(pricing_components.get("manual_required"))
-                if isinstance(pricing_components, dict)
+                bool(price_summary.get("pricing_manual_required"))
+                if isinstance(price_summary, dict)
                 else False
             ),
             "internal_category_name": internal_category_names[0] if internal_category_names else None,
@@ -1487,12 +1789,11 @@ class ProductQueryService:
             )
             if str(value or "").strip()
         }
-        service_items = self._service_source_items()
         source_options = []
-        for source_id_value, source_key_value, source_name_value in self._source_rows():
+        for source_id_value, source_key_value, source_name_value, parser_mode_value in self._source_rows():
             source_key = int(source_id_value)
             count = int(source_counts.get(source_key, 0))
-            source_mode_value = SourceRegistryService.derive_source_mode(source_key_value, service_items.get(source_key_value))
+            source_mode_value = "personal" if source_key_value == SourceRegistryService.MANUAL_SOURCE_KEY else parser_mode_value
             source_options.append(
                 {
                     "value": str(source_key),
@@ -1514,7 +1815,7 @@ class ProductQueryService:
 
         all_active_product_ids = (
             self.db.query(Product.id.label("product_id"))
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
             .subquery("facet_all_active_products")
         )
         designer_count_map = {
@@ -1618,7 +1919,7 @@ class ProductQueryService:
 
         overall_total = int(
             self.db.query(func.count(Product.id))
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
             .scalar()
             or 0
         )

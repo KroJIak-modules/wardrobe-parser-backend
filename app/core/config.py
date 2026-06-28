@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     postgres_db: str = Field(default="wardrobe", validation_alias="POSTGRES_DB")
     cors_allowed_origins: str = Field(default="", validation_alias="CORS_ALLOWED_ORIGINS")
     service_base_url: str = Field(default="http://service:8000", validation_alias="SERVICE_BASE_URL")
+    internal_api_token: str = Field(validation_alias="INTERNAL_API_TOKEN")
     service_proxy_connect_timeout_sec: float = Field(default=10.0)
     service_proxy_read_timeout_sec: float = Field(default=120.0)
     redis_url: str = Field(default="redis://redis:6379/0", validation_alias="REDIS_URL")
@@ -141,6 +142,8 @@ class Settings(BaseSettings):
             object.__setattr__(self, "admin_superuser_password", secrets.token_urlsafe(24))
         if not self.admin_token_secret:
             object.__setattr__(self, "admin_token_secret", secrets.token_urlsafe(48))
+        if not str(self.internal_api_token).strip():
+            raise ValueError("INTERNAL_API_TOKEN is required")
         return self
 
     model_config = SettingsConfigDict(

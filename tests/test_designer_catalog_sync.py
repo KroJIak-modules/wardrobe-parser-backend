@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from fastapi.testclient import TestClient
+
+import app.api.v1.auth as auth_module
 from app.core.database import SessionLocal
+from app.main import app
 from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductListingMember, Source
 from app.services.catalog.admin_editor_service import AdminEditorService
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
+from app.services.catalog.product_write_service import ProductWriteService
 
 
 def _create_source(db, *, key: str) -> Source:
@@ -12,7 +17,6 @@ def _create_source(db, *, key: str) -> Source:
         name=key.replace("-", " ").title(),
         base_url=f"https://{key}.example.com",
         base_url_normalized=f"https://{key}.example.com",
-        host_normalized=f"{key}.example.com",
     )
     db.add(source)
     db.flush()
@@ -48,6 +52,25 @@ def _create_sync_product(db, *, source: Source, brand: str, suffix: str, status:
     product.primary_listing_id = int(listing.id)
     db.flush()
     return product, listing
+
+
+class DummyLimiter:
+    def __init__(self) -> None:
+        self.failed: dict[str, int] = {}
+
+    def is_limited(self, client_key: str) -> bool:
+        return self.failed.get(client_key, 0) >= 2
+
+    def register_failed_attempt(self, client_key: str) -> None:
+        self.failed[client_key] = self.failed.get(client_key, 0) + 1
+
+
+def _authorized_client(monkeypatch) -> TestClient:
+    monkeypatch.setattr(auth_module, "_login_rate_limiter", DummyLimiter())
+    client = TestClient(app)
+    login = client.post("/api/v1/auth/login", json={"login": "superadmin", "password": "Q7m2Lx9pRt"})
+    assert login.status_code == 200
+    return client
 
 
 def test_active_source_brand_creates_catalog_designer_automatically() -> None:
@@ -162,6 +185,35 @@ def test_source_brand_stays_after_admin_changes_description() -> None:
         db.close()
 
 
+def test_product_brand_override_survives_reconcile_and_creates_designer_if_missing() -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key="source-override")
+        raw_brand = "ZZ TEST Raw Brand"
+        override_brand = "ZZ TEST Manual Override"
+        product, listing = _create_sync_product(db, source=source, brand=raw_brand, suffix="override")
+
+        ProductWriteService(db).update_product(
+            product_id=int(product.id),
+            payload={"brand_override_name": override_brand},
+        )
+
+        db.refresh(product)
+        db.refresh(listing)
+        assert product.presentation is not None
+        assert product.presentation.brand_override_name == override_brand
+        assert db.query(Designer).filter(Designer.name == override_brand).count() == 1
+
+        DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
+        db.refresh(product)
+        assert product.presentation is not None
+        assert product.presentation.brand_override_name == override_brand
+        assert db.query(Designer).filter(Designer.name == override_brand).count() == 1
+    finally:
+        db.rollback()
+        db.close()
+
+
 def test_manual_designer_stays_without_source_brands() -> None:
     db = SessionLocal()
     try:
@@ -189,6 +241,17 @@ def test_manual_designer_stays_without_source_brands() -> None:
     finally:
         db.rollback()
         db.close()
+
+
+def test_admin_designer_editor_endpoint_returns_200(monkeypatch) -> None:
+    client = _authorized_client(monkeypatch)
+
+    response = client.get("/api/v1/admin/designers/editor")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert isinstance(payload.get("rows"), list)
+    assert isinstance(payload.get("designers"), list)
 
 
 def test_multiple_source_brands_can_share_one_designer_and_unused_auto_designer_is_removed() -> None:

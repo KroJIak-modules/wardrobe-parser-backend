@@ -22,6 +22,7 @@ class MergeRequest(BaseModel):
     product_ids: list[int] = Field(min_length=2)
     primary_product_id: int | None = Field(default=None, ge=1)
     primary_listing_id: int | None = Field(default=None, ge=1)
+    merge_mode: str | None = Field(default=None)
 
 
 class RejectRequest(BaseModel):
@@ -98,6 +99,7 @@ def merge_dedup_pair(payload: MergeRequest, db: Session = Depends(get_db)) -> di
         product_ids=[int(product_id) for product_id in payload.product_ids],
         primary_product_id=(int(payload.primary_product_id) if payload.primary_product_id is not None else None),
         primary_listing_id=(int(payload.primary_listing_id) if payload.primary_listing_id is not None else None),
+        merge_mode=payload.merge_mode,
     )
     db.commit()
     return {"ok": True, "created_product_id": product_id}
@@ -152,7 +154,7 @@ def list_dedup_decisions(
             {
                 "id": int(decision.id),
                 "pair_key": ":".join(str(member["id"]) for member in members),
-                "action": str(decision.decision_kind),
+                "action": service.describe_decision_action(decision),
                 "decided_at": decision.created_at.isoformat() if decision.created_at else None,
                 "members": members,
                 "created_product": created_product,

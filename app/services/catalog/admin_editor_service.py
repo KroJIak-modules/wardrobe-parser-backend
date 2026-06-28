@@ -14,6 +14,7 @@ from app.models import (
     Product,
     ProductListing,
     ProductListingMember,
+    ProductPresentation,
     ShowcaseCategory,
     Source,
 )
@@ -73,6 +74,8 @@ class AdminEditorService:
             "title": str(payload.get("title") or "").strip(),
             "image_url": str(image_urls[0]).strip() if image_urls else None,
             "visibility_status": "hidden" if str(payload.get("visibility_status") or "").strip().lower() == "hidden" else "visible",
+            "orderability_status": str(payload.get("orderability_status") or "").strip().lower() or "unavailable",
+            "status_reason": str(payload.get("status_reason") or "").strip() or None,
             "assigned_filter_titles": [str(item).strip() for item in payload.get("internal_category_names") or [] if str(item).strip()],
         }
 
@@ -104,7 +107,7 @@ class AdminEditorService:
                 joinedload(Product.primary_listing).joinedload(ProductListing.images),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing),
             )
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
         )
         if product_ids is not None:
             query = query.filter(Product.id.in_(product_ids))
@@ -114,6 +117,7 @@ class AdminEditorService:
         result: dict[int, dict] = {}
         for product in products:
             primary_listing = self.products._resolved_primary_listing(product)
+            effective_orderability_status, effective_status_reason = self.products._effective_orderability_state(product, primary_listing)
             image_url = None
             if primary_listing is not None and primary_listing.images:
                 first_image = sorted(primary_listing.images, key=lambda item: int(item.position or 0))[0]
@@ -136,12 +140,15 @@ class AdminEditorService:
                 ),
                 "designer_name": (
                     self._normalize_text(getattr(product.designer, "name", None))
+                    or self._normalize_text(getattr(product.presentation, "brand_override_name", None))
                     or self._normalize_text(getattr(primary_listing, "source_designer_raw", None))
                     or None
                 ),
                 "title": self.products._effective_title(product, primary_listing),
                 "image_urls": ([image_url] if image_url else []),
                 "visibility_status": str(product.visibility_status or "visible"),
+                "orderability_status": effective_orderability_status,
+                "status_reason": effective_status_reason,
                 "internal_category_names": assigned_titles,
             }
         return result
@@ -154,13 +161,14 @@ class AdminEditorService:
         rows = (
             self.db.query(Product.id)
             .outerjoin(Product.designer)
+            .outerjoin(Product.presentation)
             .outerjoin(Product.primary_listing)
             .outerjoin(Source, Source.id == ProductListing.source_id)
-            .filter(Product.lifecycle_status != "merged")
+            .filter(Product.lifecycle_status == "active")
             .filter(
                 or_(
                     func.lower(func.coalesce(Designer.name, "")).like(pattern),
-                    func.lower(func.coalesce(ProductListing.source_designer_raw, "")).like(pattern),
+                    func.lower(func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw, "")).like(pattern),
                     func.lower(func.coalesce(ProductListing.source_title, "")).like(pattern),
                     func.lower(func.coalesce(Source.name, "")).like(pattern),
                 )
@@ -400,6 +408,11 @@ class AdminEditorService:
                         "slug": slug,
                         "label": str(node.title),
                         "display_label": str(node.display_title or ""),
+                        "mobile_pair_root_id": (
+                            int(filter_by_slug[str(node.mobile_pair_slug)].id)
+                            if str(node.mobile_pair_slug or "").strip() and str(node.mobile_pair_slug) in filter_by_slug
+                            else None
+                        ),
                         "node_kind": str(node.node_kind),
                         "is_enabled": bool(node.is_enabled),
                         "rules": {
@@ -520,7 +533,7 @@ class AdminEditorService:
                 int(product_id)
                 for product_id, in (
                     self.db.query(Product.id)
-                    .filter(Product.lifecycle_status != "merged")
+                    .filter(Product.lifecycle_status == "active")
                     .filter(Product.visibility_status == "hidden")
                     .order_by(Product.id.asc())
                     .all()
@@ -578,6 +591,7 @@ class AdminEditorService:
             manual_products = rules.get("manual_products") if isinstance(rules.get("manual_products"), list) else []
             local_keywords = rules.get("local_category_keywords") if isinstance(rules.get("local_category_keywords"), list) else []
             title_keywords = rules.get("title_keywords") if isinstance(rules.get("title_keywords"), list) else []
+            mobile_pair_root_id = int(node.get("mobile_pair_root_id") or 0)
             node_id = int(node.get("id") or 0)
             persisted_filter = current_filters.get(node_id)
             ref_slug = (
@@ -591,6 +605,7 @@ class AdminEditorService:
                 "ref_slug": ref_slug,
                 "title": self._normalize_text(node.get("label")) or "Без названия",
                 "display_title": self._normalize_text(node.get("display_label")) or None,
+                "mobile_pair_slug": None,
                 "node_kind": (
                     "multifilter"
                     if children
@@ -605,9 +620,20 @@ class AdminEditorService:
                 "title_keywords": [self._normalize_text(item) for item in title_keywords if self._normalize_text(item)],
                 "manual_product_ids": [int(item.get("product_id")) for item in manual_products if int(item.get("product_id") or 0) > 0],
                 "children": [build_filter_node(child) for child in children if isinstance(child, dict)],
+                "_mobile_pair_root_id": mobile_pair_root_id if mobile_pair_root_id > 0 else None,
             }
 
-        filter_payload_nodes = [build_filter_node(node) for node in filters if isinstance(node, dict)]
+        def apply_mobile_pair_refs(nodes: list[dict]) -> list[dict]:
+            normalized: list[dict] = []
+            for node in nodes:
+                raw_pair_root_id = int(node.pop("_mobile_pair_root_id") or 0)
+                normalized_node = dict(node)
+                normalized_node["mobile_pair_slug"] = filter_ref_slug_by_id.get(raw_pair_root_id) if raw_pair_root_id > 0 else None
+                normalized_node["children"] = apply_mobile_pair_refs(list(node.get("children") or []))
+                normalized.append(normalized_node)
+            return normalized
+
+        filter_payload_nodes = apply_mobile_pair_refs([build_filter_node(node) for node in filters if isinstance(node, dict)])
 
         custom_catalog_payloads: list[dict] = []
         for catalog in custom_catalogs:
@@ -702,7 +728,7 @@ class AdminEditorService:
             int(product_id)
             for product_id, in (
                 self.db.query(Product.id)
-                .filter(Product.lifecycle_status != "merged")
+                .filter(Product.lifecycle_status == "active")
                 .filter(Product.visibility_status == "hidden")
                 .all()
             )

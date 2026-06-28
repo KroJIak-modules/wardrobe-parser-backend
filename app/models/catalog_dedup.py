@@ -16,13 +16,20 @@ class ProductDedupDecision(Base):
     undo_payload = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
-    created_product = relationship("Product")
+    created_product = relationship("Product", foreign_keys=[created_product_id])
     members = relationship("ProductDedupDecisionMember", back_populates="decision", cascade="all, delete-orphan")
 
     __table_args__ = (
-        CheckConstraint("decision_kind IN ('reject', 'merge')", name="ck_product_dedup_decisions_decision_kind"),
         CheckConstraint(
-            "(decision_kind = 'merge' AND created_product_id IS NOT NULL) OR (decision_kind <> 'merge' AND created_product_id IS NULL)",
+            "decision_kind IN ('reject', 'combine', 'keep_left', 'keep_right')",
+            name="ck_product_dedup_decisions_decision_kind",
+        ),
+        CheckConstraint(
+            """
+            (decision_kind = 'combine' AND created_product_id IS NOT NULL)
+            OR
+            (decision_kind IN ('reject', 'keep_left', 'keep_right') AND created_product_id IS NULL)
+            """,
             name="ck_product_dedup_decisions_created_product_merge_only",
         ),
     )

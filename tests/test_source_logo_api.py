@@ -38,7 +38,6 @@ def _create_source(db, *, key: str) -> Source:
         name=key.replace("-", " ").title(),
         base_url=f"https://{key}.example.com",
         base_url_normalized=f"https://{key}.example.com",
-        host_normalized=f"{key}.example.com",
     )
     db.add(source)
     db.flush()
@@ -90,14 +89,18 @@ def test_source_logo_patch_round_trips_in_sources_payload(monkeypatch, tmp_path)
     client = _authorized_client(monkeypatch)
     db = SessionLocal()
     monkeypatch.setattr(MediaAssetService, "_ROOT_DIR", tmp_path / "uploads")
+    source_id: int | None = None
+    asset_id: int | None = None
     try:
         source = _create_source(db, key=_unique_key("logo-source"))
+        source_id = int(source.id)
         svg_bytes = (
             f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'>"
             f"<text x='1' y='8'>{uuid4().hex[:6]}</text>"
             f"</svg>"
         ).encode("utf-8")
         asset = MediaAssetService(db).save_bytes(scope="sources", file_name="logo.svg", content=svg_bytes)
+        asset_id = int(asset.id)
         db.commit()
 
         patch_response = client.patch(
@@ -127,15 +130,21 @@ def test_source_logo_patch_round_trips_in_sources_payload(monkeypatch, tmp_path)
         persisted = db.query(Source).filter(Source.id == int(source.id)).one()
         assert persisted.logo_image_asset_id is None
     finally:
-        db.rollback()
+        if source_id is not None:
+            db.query(Source).filter(Source.id == source_id).delete(synchronize_session=False)
+        if asset_id is not None:
+            db.query(ImageAsset).filter(ImageAsset.id == asset_id).delete(synchronize_session=False)
+        db.commit()
         db.close()
 
 
 def test_source_logo_patch_rejects_unknown_asset(monkeypatch) -> None:
     client = _authorized_client(monkeypatch)
     db = SessionLocal()
+    source_id: int | None = None
     try:
         source = _create_source(db, key=_unique_key("logo-source-invalid"))
+        source_id = int(source.id)
         db.commit()
 
         response = client.patch(
@@ -146,5 +155,7 @@ def test_source_logo_patch_rejects_unknown_asset(monkeypatch) -> None:
         assert response.status_code == 400
         assert "Логотип не найден" in response.text
     finally:
-        db.rollback()
+        if source_id is not None:
+            db.query(Source).filter(Source.id == source_id).delete(synchronize_session=False)
+        db.commit()
         db.close()
