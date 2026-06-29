@@ -3,11 +3,11 @@ from __future__ import annotations
 from uuid import uuid4
 
 from app.core.database import SessionLocal
-from app.models import Source, SourceSetting, Supplier
+from app.models import Source, SourceSetting
 from app.services.catalog.catalog_defaults_service import CatalogDefaultsService
 
 
-def test_catalog_defaults_service_seeds_canonical_suppliers_and_assigns_default_source_supplier() -> None:
+def test_catalog_defaults_service_does_not_assign_supplier_to_existing_business_source_on_regular_ensure() -> None:
     db = SessionLocal()
     source_key = f"defaults-{uuid4().hex[:12]}.example"
     try:
@@ -25,14 +25,9 @@ def test_catalog_defaults_service_seeds_canonical_suppliers_and_assigns_default_
 
         CatalogDefaultsService(db).ensure()
         db.flush()
-
-        eu_supplier = db.query(Supplier).filter(Supplier.key == "eu").one()
-        uk_supplier = db.query(Supplier).filter(Supplier.key == "uk").one()
         db.refresh(setting)
 
-        assert int(setting.supplier_id or 0) == int(eu_supplier.id)
-        assert len(list(eu_supplier.shipping_rates or [])) > 0
-        assert len(list(uk_supplier.shipping_rates or [])) > 0
+        assert setting.supplier_id is None
     finally:
         db.rollback()
         db.close()
@@ -57,6 +52,7 @@ def test_catalog_defaults_service_does_not_assign_supplier_to_manual_source() ->
             db.add(setting)
             db.flush()
         setting.supplier_id = None
+        db.flush()
 
         CatalogDefaultsService(db).ensure()
         db.refresh(setting)

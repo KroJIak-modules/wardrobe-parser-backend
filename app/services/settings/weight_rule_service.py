@@ -19,6 +19,7 @@ from app.schemas.admin_settings import (
     WeightRuleResponse,
     WeightRuleUpdateRequest,
 )
+from app.services.settings.default_admin_settings import DefaultAdminSettingsLoader
 from app.services.settings.weight_rule_matcher import (
     WeightRuleMatcherField,
     WeightRuleMatcherEntry,
@@ -73,34 +74,11 @@ def _unique_normalized_keywords(keywords: list[str]) -> list[str]:
     return unique
 
 
-DEFAULT_WEIGHT_RULES: list[tuple[int, list[str]]] = [
-    (80, ["ring", "rings", "earring", "earrings", "brooch", "pin", "cufflink", "cufflinks", "ear cuff", "tie clip", "charm", "jewelry"]),
-    (130, ["necklace", "chain", "pendant", "bracelet", "anklet", "bangle", "body chain", "wallet chain", "key chain", "keychain"]),
-    (190, ["wallet", "wallets", "card holder", "cardholders", "card wallet", "passport holder", "coin purse", "coin pouch", "pouch", "glasses case", "sunglasses", "glasses", "eyewear", "gift card"]),
-    (240, ["cap", "beanie", "bucket hat", "scarf", "belt", "gloves", "mittens", "tie", "mask", "headband", "hair clip", "barrette", "perfume", "fragrance", "towel", "book", "magazine"]),
-    (300, ["tank top", "cami", "camisole", "bodysuit", "corset", "bralette", "bra", "bikini", "swimsuit", "tube top"]),
-    (360, ["t shirt", "tee", "graphic tee", "jersey tee", "thermal tee", "top", "tops", "long sleeve tee", "polo tee", "raglan tee", "rib tee"]),
-    (440, ["shirt", "shirts", "polo shirt", "blouse", "button up", "button down", "dress shirt", "denim shirt", "flannel shirt", "oxford shirt", "tunic"]),
-    (540, ["shorts", "short", "skirt", "mini skirt", "midi skirt", "maxi skirt", "skort", "bermuda", "cargo shorts", "denim shorts", "jorts"]),
-    (680, ["pants", "pant", "trousers", "trouser", "jeans", "joggers", "leggings", "sweatpants", "cargo pants", "track pants", "chinos", "slacks", "bottom", "bottoms", "culottes"]),
-    (700, ["dress", "dresses", "maxi dress", "midi dress", "mini dress", "slip dress", "gown", "jumpsuit", "romper", "playsuit", "leotard", "catsuit", "overall", "overalls"]),
-    (820, ["sweatshirt", "sweater", "cardigan", "jumper", "knit", "knitwear", "crewneck", "pullover", "zip sweater", "turtleneck"]),
-    (960, ["hoodie", "zip hoodie", "hooded sweatshirt", "vest", "down vest", "puffer vest", "waistcoat", "gilet", "quarter zip", "poncho"]),
-    (1120, ["jacket", "blazer", "outerwear", "denim jacket", "rain jacket", "shell jacket", "bomber", "windbreaker", "overshirt", "varsity jacket", "trucker jacket", "blouson", "fleece", "bolero"]),
-    (1380, ["coat", "parka", "puffer", "puffer jacket", "down jacket", "overcoat", "trench coat", "duffle coat", "pea coat", "wool coat", "fur coat", "mouton"]),
-    (1560, ["sneakers", "sneaker", "shoes", "shoe", "loafers", "loafer", "sandals", "sandal", "running shoes", "running shoe", "trainers", "derby", "derbies", "oxford shoes", "mule", "moccasin", "flats", "ballet flats", "heels", "heel", "pumps", "pump", "slippers", "slipper", "slides", "slide", "wedge", "platform shoes", "runners"]),
-    (1860, ["boots", "boot", "ankle boots", "chelsea boots", "combat boots", "cowboy boots", "hiking boots", "platform boots"]),
-    (2300, ["bag", "bags", "tote bag", "crossbody bag", "shoulder bag", "handbag", "messenger bag", "satchel", "sling bag", "waist bag", "belt bag", "fanny pack", "hobo bag", "clutch bag", "clutch", "pochette", "messenger"]),
-    (2850, ["backpack", "duffle bag", "duffel bag", "rucksack", "travel bag", "weekender bag", "gym bag", "garment bag"]),
-    (3800, ["suitcase", "carry on", "hard case luggage", "trolley case", "trunk case"]),
-]
-
-
 def _default_rules_unique() -> list[tuple[int, list[str]]]:
     by_weight: dict[int, list[str]] = {}
-    for weight_grams, keywords in DEFAULT_WEIGHT_RULES:
-        bucket = by_weight.setdefault(weight_grams, [])
-        bucket.extend(keywords)
+    for rule in DefaultAdminSettingsLoader.load().weight_rules:
+        bucket = by_weight.setdefault(int(rule.weight_grams), [])
+        bucket.extend(rule.keywords)
     return [(weight_grams, _unique_normalized_keywords(keywords)) for weight_grams, keywords in sorted(by_weight.items(), key=lambda row: row[0])]
 
 
@@ -133,7 +111,6 @@ class WeightRuleService:
 
     def ensure_default_rules(self) -> None:
         active = self.rule_repo.list_active()
-        changed = False
         if not active:
             for weight_grams, keywords in _default_rules_unique():
                 created = self.rule_repo.create_rule(weight_grams=weight_grams, is_enabled=True)
@@ -145,24 +122,9 @@ class WeightRuleService:
                 self.db.rollback()
             return
 
+        changed = False
         for rule in active:
             changed = self._normalize_rule_keywords(int(rule.id)) or changed
-
-        active = self.rule_repo.list_active()
-        by_weight = {int(rule.weight_grams): rule for rule in active}
-        for weight_grams, keywords in _default_rules_unique():
-            rule = by_weight.get(weight_grams)
-            if rule is None:
-                rule = self.rule_repo.create_rule(weight_grams=weight_grams, is_enabled=True)
-                by_weight[weight_grams] = rule
-                changed = True
-
-            existing = {item.keyword for item in self.rule_repo.list_keywords(int(rule.id))}
-            for normalized in keywords:
-                if normalized not in existing:
-                    self.rule_repo.create_keyword(rule_id=int(rule.id), keyword=normalized)
-                    existing.add(normalized)
-                    changed = True
 
         if changed:
             try:
@@ -245,6 +207,8 @@ class WeightRuleService:
         return {int(row[0]) for row in rows}
 
     def _recalculate_products_for_weight_rules(self, *, only_product_ids: set[int] | None = None) -> int:
+        from app.services.catalog.product_ingest_service import ProductIngestService
+
         rules = self.list_rules()
         products = self.rule_repo.list_products_for_weight_recalc(product_ids=only_product_ids if only_product_ids else None)
         changed = False
@@ -252,6 +216,16 @@ class WeightRuleService:
         for product in products:
             listing = product.primary_listing
             if listing is None:
+                continue
+
+            if ProductIngestService._weight_is_not_required_for_listing(listing=listing):
+                if product.weight_rule_id is not None:
+                    product.weight_rule_id = None
+                    changed = True
+                if str(listing.status_reason or "") == "missing_weight":
+                    listing.orderability_status = self._derive_listing_orderability(listing)
+                    listing.status_reason = None
+                    changed = True
                 continue
 
             manual_weight = getattr(product, "manual_weight_grams", None)
@@ -318,11 +292,9 @@ class WeightRuleService:
         self._recalculate_products_for_weight_rules(only_product_ids=normalized)
 
     def list_rules(self) -> list[WeightRuleResponse]:
-        self.ensure_default_rules()
         return self._build_responses()
 
     def create_rule(self, payload: WeightRuleCreateRequest) -> WeightRuleResponse:
-        self.ensure_default_rules()
         created = self.rule_repo.create_rule(weight_grams=payload.weight_grams, is_enabled=True)
         self.db.commit()
         return WeightRuleResponse(id=int(created.id), weight_grams=int(created.weight_grams), keywords=[])
@@ -386,6 +358,8 @@ class WeightRuleService:
             return self.list_rules()
 
     def list_missing_weight_products(self, limit: int = 500, offset: int = 0) -> list[WeightMissingProductResponse]:
+        from app.services.catalog.product_ingest_service import ProductIngestService
+
         safe_limit = max(1, min(limit, 5000))
         safe_offset = max(0, int(offset))
         rows = (
@@ -410,6 +384,7 @@ class WeightRuleService:
                 source_name=(str(source.name) if str(listing.ingest_mode or "") != "manual" else None),
             )
             for product, listing, source in rows
+            if not ProductIngestService._weight_is_not_required_for_listing(listing=product.primary_listing or listing)
         ]
 
     @staticmethod

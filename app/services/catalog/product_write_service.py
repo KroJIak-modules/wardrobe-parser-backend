@@ -42,6 +42,7 @@ class _CombineTreeNode:
 class ProductWriteService:
     MANUAL_VARIANT_PRICING_MODE_SOURCE = "source"
     MANUAL_VARIANT_PRICING_MODE_FIXED_FINAL_RUB = "fixed_final_rub"
+    MAX_VARIANT_MONEY_AMOUNT = Decimal("9999999999.99")
 
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -583,6 +584,13 @@ class ProductWriteService:
         return ProductWriteService.MANUAL_VARIANT_PRICING_MODE_SOURCE
 
     @staticmethod
+    def _validate_variant_money_amount(*, amount: Decimal | None, label: str) -> None:
+        if amount is None:
+            return
+        if amount.copy_abs() > ProductWriteService.MAX_VARIANT_MONEY_AMOUNT:
+            raise ValidationError(f"{label} слишком большая. Максимум: 9 999 999 999.99")
+
+    @staticmethod
     def _normalize_manual_variants(variants: object) -> list[dict]:
         if not isinstance(variants, list):
             raise ValidationError("variants must be a list")
@@ -600,6 +608,7 @@ class ProductWriteService:
                 raise ValidationError(f"variant #{index} has invalid price") from exc
             if price_amount is not None and price_amount <= 0:
                 raise ValidationError("variant price must be greater than zero")
+            ProductWriteService._validate_variant_money_amount(amount=price_amount, label="Цена варианта")
             raw_compare_at_price = item.get("compare_at_price")
             try:
                 compare_at_price_amount = None if raw_compare_at_price is None or str(raw_compare_at_price).strip() == "" else Decimal(str(raw_compare_at_price))
@@ -607,6 +616,7 @@ class ProductWriteService:
                 raise ValidationError(f"variant #{index} has invalid compare_at_price") from exc
             if compare_at_price_amount is not None and compare_at_price_amount <= 0:
                 raise ValidationError("variant compare_at_price must be greater than zero")
+            ProductWriteService._validate_variant_money_amount(amount=compare_at_price_amount, label="Старая цена варианта")
             if (
                 price_amount is not None
                 and compare_at_price_amount is not None
@@ -748,11 +758,16 @@ class ProductWriteService:
             )
         self.db.flush()
 
-    def _sync_weight_state(self, *, product, listing) -> None:
+    def _sync_weight_state(self, *, product, listing, variant_payloads: list[dict] | None = None) -> None:
         incoming_status = self._normalize_orderability_status(listing.orderability_status)
         incoming_reason = str(listing.status_reason or "").strip().lower() or None
         if incoming_reason == "missing_weight":
-            variant_states = [bool(variant.is_orderable) for variant in getattr(listing, "variants", [])]
+            raw_variants = (
+                variant_payloads
+                if variant_payloads is not None
+                else [{"is_orderable": bool(variant.is_orderable)} for variant in getattr(listing, "variants", [])]
+            )
+            variant_states = [bool(variant.get("is_orderable")) for variant in raw_variants]
             if variant_states:
                 incoming_status = "orderable" if any(variant_states) else "sold_out"
             incoming_reason = None
@@ -762,6 +777,7 @@ class ProductWriteService:
             incoming_status=incoming_status,
             incoming_reason=incoming_reason,
             incoming_reasons=([incoming_reason] if incoming_reason else []),
+            variant_payloads=variant_payloads,
         )
 
     def _gallery_asset_ids_from_urls(self, manual_image_urls: list[str]) -> list[int]:
@@ -1041,7 +1057,7 @@ class ProductWriteService:
         self.products.replace_variants(listing_id=int(listing.id), variants=normalized_variants)
         listing.orderability_status = "orderable" if any(bool(item.get("is_orderable")) for item in normalized_variants) else "sold_out"
         listing.status_reason = None
-        self._sync_weight_state(product=product, listing=listing)
+        self._sync_weight_state(product=product, listing=listing, variant_payloads=normalized_variants)
         self.db.flush()
 
     def bulk_update_products(self, *, product_ids: list[int], payload: dict) -> list[int]:
@@ -1119,7 +1135,7 @@ class ProductWriteService:
                 custom_catalog_slugs=payload.get("custom_catalog_slugs"),
             )
             DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
-            self._sync_weight_state(product=product, listing=listing)
+            self._sync_weight_state(product=product, listing=listing, variant_payloads=variants)
             self.db.flush()
             self.filter_assignments.enqueue_product_ids_after_commit([int(product.id)])
             return int(product.id)
@@ -1171,6 +1187,7 @@ class ProductWriteService:
             listing.status_reason = None
             designer_state_changed = True
 
+        variants: list[dict] | None = None
         if "variants" in payload:
             variants = self._normalize_manual_variants(payload.get("variants") or [])
             self.products.replace_variants(listing_id=int(listing.id), variants=variants)
@@ -1194,7 +1211,7 @@ class ProductWriteService:
             )
         if designer_state_changed:
             DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
-        self._sync_weight_state(product=product, listing=listing)
+        self._sync_weight_state(product=product, listing=listing, variant_payloads=variants)
         self.db.flush()
         if any(key in payload for key in ("title", "source_category_name", "filter_slugs")):
             self.filter_assignments.enqueue_product_ids_after_commit([int(product.id)])
@@ -1249,7 +1266,7 @@ class ProductWriteService:
         affected_product_ids: set[int] = set()
         if not self._rewrite_combine_component_after_delete(product_id=int(product_id), affected_product_ids=affected_product_ids):
             self._delete_product_storage(product_id=int(product_id), affected_product_ids=affected_product_ids)
-        DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
+        DesignerCatalogSyncService(self.db).reconcile(sync_product_links=False)
         self.filter_assignments.enqueue_product_ids_after_commit(sorted(affected_product_ids))
 
     def unbind_listing(self, *, product_id: int, listing_id: int) -> int:

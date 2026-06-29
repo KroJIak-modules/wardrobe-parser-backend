@@ -29,7 +29,7 @@ class CatalogProductRepository:
         query = (
             self.session.query(Product)
             .options(
-                joinedload(Product.primary_listing).joinedload(ProductListing.source),
+                joinedload(Product.primary_listing).joinedload(ProductListing.source).joinedload(Source.setting),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.source),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.variants),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.images),
@@ -55,7 +55,7 @@ class CatalogProductRepository:
         return (
             self.session.query(Product)
             .options(
-                joinedload(Product.primary_listing).joinedload(ProductListing.source),
+                joinedload(Product.primary_listing).joinedload(ProductListing.source).joinedload(Source.setting),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.source),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.variants),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.images),
@@ -76,7 +76,7 @@ class CatalogProductRepository:
         query = (
             self.session.query(Product)
             .options(
-                joinedload(Product.primary_listing).joinedload(ProductListing.source),
+                joinedload(Product.primary_listing).joinedload(ProductListing.source).joinedload(Source.setting),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.source),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.variants),
                 joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.images),

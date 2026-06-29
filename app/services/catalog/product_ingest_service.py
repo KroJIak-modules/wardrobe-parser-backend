@@ -51,6 +51,38 @@ class ProductIngestService:
         text = str(value or "").strip()
         return text or None
 
+    @staticmethod
+    def _normalized_variant_currency_code(variant: object) -> str | None:
+        if isinstance(variant, dict):
+            raw_currency = variant.get("currency_code")
+            if raw_currency is None or str(raw_currency).strip() == "":
+                raw_currency = variant.get("currency")
+        else:
+            raw_currency = getattr(variant, "currency_code", None)
+            if raw_currency is None or str(raw_currency).strip() == "":
+                raw_currency = getattr(variant, "currency", None)
+        return str(raw_currency or "").strip().upper() or None
+
+    @classmethod
+    def _all_variants_in_rub(cls, variants: list[object] | tuple[object, ...]) -> bool:
+        has_variants = False
+        for variant in variants:
+            has_variants = True
+            if cls._normalized_variant_currency_code(variant) != "RUB":
+                return False
+        return has_variants
+
+    @classmethod
+    def _weight_is_not_required_for_listing(
+        cls,
+        *,
+        listing: ProductListing,
+        variant_payloads: list[dict] | None = None,
+    ) -> bool:
+        if variant_payloads is not None:
+            return cls._all_variants_in_rub(variant_payloads)
+        return cls._all_variants_in_rub(list(getattr(listing, "variants", []) or []))
+
     @classmethod
     def _normalized_text_list(cls, value: object) -> list[str]:
         if not isinstance(value, list):
@@ -142,29 +174,34 @@ class ProductIngestService:
         incoming_status: str,
         incoming_reason: str | None,
         incoming_reasons: list[str],
+        variant_payloads: list[dict] | None = None,
     ) -> tuple[str, str | None]:
         reasons = [reason for reason in incoming_reasons if reason]
         if incoming_reason and incoming_reason not in reasons:
             reasons.append(incoming_reason)
 
         effective_listing = product.primary_listing or listing
-        source_weight = self._positive_int(effective_listing.source_weight_grams)
-        manual_weight = self._positive_int(product.manual_weight_grams)
-        if manual_weight is not None:
-            product.weight_rule_id = None
-            reasons = [reason for reason in reasons if reason != "missing_weight"]
-        elif source_weight is not None:
+        if self._weight_is_not_required_for_listing(listing=effective_listing, variant_payloads=variant_payloads):
             product.weight_rule_id = None
             reasons = [reason for reason in reasons if reason != "missing_weight"]
         else:
-            keyword_rule = self._resolve_keyword_weight_rule(effective_listing)
-            if keyword_rule is not None:
-                product.weight_rule_id = int(keyword_rule[0])
+            source_weight = self._positive_int(effective_listing.source_weight_grams)
+            manual_weight = self._positive_int(product.manual_weight_grams)
+            if manual_weight is not None:
+                product.weight_rule_id = None
+                reasons = [reason for reason in reasons if reason != "missing_weight"]
+            elif source_weight is not None:
+                product.weight_rule_id = None
                 reasons = [reason for reason in reasons if reason != "missing_weight"]
             else:
-                product.weight_rule_id = None
-                if "missing_weight" not in reasons:
-                    reasons.append("missing_weight")
+                keyword_rule = self._resolve_keyword_weight_rule(effective_listing)
+                if keyword_rule is not None:
+                    product.weight_rule_id = int(keyword_rule[0])
+                    reasons = [reason for reason in reasons if reason != "missing_weight"]
+                else:
+                    product.weight_rule_id = None
+                    if "missing_weight" not in reasons:
+                        reasons.append("missing_weight")
 
         if reasons:
             return "unavailable", reasons[0]
@@ -336,6 +373,7 @@ class ProductIngestService:
                 affected_product_ids.add(int(previous_owner.id))
             affected_product_ids.add(int(product.id))
 
+            variants = self._variant_payloads(item)
             incoming_status = self._normalize_orderability(str(item.get("orderability_status") or "unavailable"))
             incoming_reason = str(item.get("status_reason") or "").strip() or None
             incoming_reasons = self._normalize_status_reasons(item)
@@ -345,9 +383,8 @@ class ProductIngestService:
                 incoming_status=incoming_status,
                 incoming_reason=incoming_reason,
                 incoming_reasons=incoming_reasons,
+                variant_payloads=variants,
             )
-
-            variants = self._variant_payloads(item)
             self.products.replace_variants(listing_id=int(listing.id), variants=variants)
             listing_images, stale_listing_image_ids = self.products.replace_listing_images(
                 listing_id=int(listing.id),

@@ -130,6 +130,37 @@ def test_product_write_service_rejects_invalid_variant_compare_at_price() -> Non
         db.close()
 
 
+def test_product_write_service_rejects_too_large_variant_compare_at_price() -> None:
+    db = SessionLocal()
+    try:
+        try:
+            ProductWriteService(db).create_manual_product(
+                {
+                    "title": "Manual invalid compare-at overflow",
+                    "gender": "unisex",
+                    "availability_mode": "in_stock",
+                    "visibility_status": "visible",
+                    "orderability_status": "orderable",
+                    "variants": [
+                        {
+                            "title": "Default",
+                            "price": 324,
+                            "compare_at_price": 53425435342,
+                            "currency": "RUB",
+                            "available": True,
+                        }
+                    ],
+                    "manual_image_asset_ids": [],
+                }
+            )
+            raise AssertionError("Expected ValidationError")
+        except ValidationError as exc:
+            assert "Старая цена варианта слишком большая" in str(exc)
+    finally:
+        db.rollback()
+        db.close()
+
+
 def test_product_write_service_rejects_in_stock_for_sold_out_listing() -> None:
     db = SessionLocal()
     marker = uuid4().hex[:12]

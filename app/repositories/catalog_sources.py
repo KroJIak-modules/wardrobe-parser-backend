@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.source_identity import normalize_base_url
@@ -15,17 +16,27 @@ class CatalogSourceRepository:
     def list_all(self) -> list[Source]:
         return (
             self.session.query(Source)
+            .outerjoin(SourceSetting, SourceSetting.source_id == Source.id)
             .options(joinedload(Source.setting), joinedload(Source.sync_state))
-            .order_by(Source.name.asc(), Source.id.asc())
+            .order_by(
+                func.coalesce(SourceSetting.sort_priority, 2147483647).asc(),
+                Source.name.asc(),
+                Source.id.asc(),
+            )
             .all()
         )
 
     def list_registry_sources(self) -> list[Source]:
         return (
             self.session.query(Source)
+            .outerjoin(SourceSetting, SourceSetting.source_id == Source.id)
             .options(joinedload(Source.setting), joinedload(Source.sync_state))
             .filter(Source.adapter_key.is_not(None))
-            .order_by(Source.name.asc(), Source.id.asc())
+            .order_by(
+                func.coalesce(SourceSetting.sort_priority, 2147483647).asc(),
+                Source.name.asc(),
+                Source.id.asc(),
+            )
             .all()
         )
 
@@ -94,10 +105,19 @@ class CatalogSourceRepository:
             .count()
         )
 
+    def next_sort_priority(self) -> int:
+        value = self.session.query(func.max(SourceSetting.sort_priority)).scalar()
+        return int(value or 0) + 1
+
     def ensure_setting(self, source: Source) -> SourceSetting:
         if source.setting is not None:
+            if getattr(source.setting, "sort_priority", None) is None:
+                source.setting.sort_priority = self.next_sort_priority()
             return source.setting
-        setting = SourceSetting(source_id=int(source.id))
+        setting = SourceSetting(
+            source_id=int(source.id),
+            sort_priority=self.next_sort_priority(),
+        )
         self.session.add(setting)
         self.session.flush()
         source.setting = setting
@@ -111,3 +131,9 @@ class CatalogSourceRepository:
         self.session.flush()
         source.sync_state = sync_state
         return sync_state
+
+    def apply_sort_order(self, sources: list[Source]) -> None:
+        for index, source in enumerate(sources, start=1):
+            setting = self.ensure_setting(source)
+            setting.sort_priority = index
+        self.session.flush()

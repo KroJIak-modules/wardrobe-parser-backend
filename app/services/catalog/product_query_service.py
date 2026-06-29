@@ -19,6 +19,7 @@ from app.models import (
     ProductListingMember,
     ProductPresentation,
     Source,
+    SourceSetting,
     ShowcaseCategory,
     ShowcaseCategoryAttachment,
 )
@@ -43,7 +44,7 @@ class ProductQueryService:
         self._filter_rows_cache: list[tuple[str, str, bool]] | None = None
         self._custom_catalog_rows_cache: list[tuple[str, str]] | None = None
         self._showcase_cache: list[ShowcaseCategory] | None = None
-        self._source_rows_cache: list[tuple[int, str, str, str]] | None = None
+        self._source_rows_cache: list[tuple[int, str, str, str, int]] | None = None
         self._source_mode_ids_cache: dict[str, list[int]] = {}
         self._assigned_filter_slug_by_product_id_cache: dict[int, str] | None = None
         self._assigned_filter_label_by_product_id_cache: dict[int, str] | None = None
@@ -86,7 +87,7 @@ class ProductQueryService:
             ]
         return self._custom_catalog_rows_cache
 
-    def _source_rows(self) -> list[tuple[int, str, str, str]]:
+    def _source_rows(self) -> list[tuple[int, str, str, str, int]]:
         if self._source_rows_cache is None:
             rows = (
                 self.db.query(
@@ -94,8 +95,14 @@ class ProductQueryService:
                     Source.key.label("key"),
                     Source.name.label("name"),
                     Source.parser_config.label("parser_config"),
+                    SourceSetting.sort_priority.label("sort_priority"),
                 )
-                .order_by(Source.name.asc(), Source.id.asc())
+                .outerjoin(SourceSetting, SourceSetting.source_id == Source.id)
+                .order_by(
+                    func.coalesce(SourceSetting.sort_priority, 2147483647).asc(),
+                    Source.name.asc(),
+                    Source.id.asc(),
+                )
                 .all()
             )
             self._source_rows_cache = [
@@ -104,16 +111,70 @@ class ProductQueryService:
                     str(source_key or "").strip(),
                     str(source_name or "").strip() or str(source_key or "").strip(),
                     SourceRegistryService.normalize_parser_mode((parser_config or {}).get("mode") if isinstance(parser_config, dict) else None),
+                    int(sort_priority or 0),
                 )
-                for source_id, source_key, source_name, parser_config in rows
+                for source_id, source_key, source_name, parser_config, sort_priority in rows
                 if source_id is not None and str(source_key or "").strip()
             ]
         return self._source_rows_cache
+
+    @staticmethod
+    def _source_sort_priority_for_listing(listing: ProductListing | None) -> int | None:
+        source = getattr(listing, "source", None)
+        setting = getattr(source, "setting", None) if source is not None else None
+        value = getattr(setting, "sort_priority", None)
+        return int(value) if value is not None else None
 
     def _pricing_settings(self) -> PricingSettingsResponse:
         if self._pricing_settings_cache is None:
             self._pricing_settings_cache = self.pricing.get_settings(refresh_bybit=False)
         return self._pricing_settings_cache
+
+    @staticmethod
+    def _product_display_designer_expr():
+        return case(
+            (
+                and_(Product.designer_id.is_not(None), func.length(func.trim(func.coalesce(Designer.name, ""))) > 0),
+                func.trim(Designer.name),
+            ),
+            else_=func.trim(func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw, "")),
+        )
+
+    @staticmethod
+    def _product_orderability_expr():
+        return case(
+            (Product.dedup_status != "independent", literal("unavailable")),
+            else_=func.coalesce(ProductListing.orderability_status, literal("unavailable")),
+        )
+
+    @classmethod
+    def _product_orderability_rank_expr(cls):
+        orderability_expr = cls._product_orderability_expr()
+        return case(
+            (orderability_expr == "orderable", 0),
+            (orderability_expr == "unavailable", 1),
+            (orderability_expr == "sold_out", 2),
+            else_=3,
+        )
+
+    @staticmethod
+    def _product_visibility_rank_expr():
+        return case(
+            (Product.visibility_status == "visible", 0),
+            (Product.visibility_status == "hidden", 1),
+            else_=2,
+        )
+
+    @classmethod
+    def _apply_default_product_sorting(cls, query):
+        return query.order_by(
+            func.coalesce(SourceSetting.sort_priority, 2147483647).asc(),
+            func.lower(func.coalesce(Source.name, "")).asc(),
+            cls._product_orderability_rank_expr().asc(),
+            Product.created_at.desc(),
+            Product.id.desc(),
+            cls._product_visibility_rank_expr().asc(),
+        )
 
     def _filtered_product_ids_subquery(
         self,
@@ -1191,6 +1252,7 @@ class ProductQueryService:
                 if primary_listing is not None and primary_is_business_source
                 else None
             ),
+            "source_sort_priority": self._source_sort_priority_for_listing(primary_listing),
             "source_mode": self._source_mode_for_listing(primary_listing),
             "has_sync_listing": has_sync_listing,
             "source_category_name": str(primary_listing.source_category_raw) if primary_listing is not None and primary_listing.source_category_raw else None,
@@ -1425,7 +1487,7 @@ class ProductQueryService:
             return list(cached_ids)
         source_ids = [
             int(source_id)
-            for source_id, source_key, _source_name, source_mode in self._source_rows()
+            for source_id, source_key, _source_name, source_mode, _sort_priority in self._source_rows()
             if ("personal" if source_key == SourceRegistryService.MANUAL_SOURCE_KEY else source_mode) == normalized_mode
         ]
         self._source_mode_ids_cache[normalized_mode] = list(source_ids)
@@ -1466,9 +1528,15 @@ class ProductQueryService:
         product_ids = [
             int(row[0])
             for row in (
-                self.db.query(filtered_ids.c.product_id)
-                .join(Product, Product.id == filtered_ids.c.product_id)
-                .order_by(Product.updated_at.desc(), Product.id.desc())
+                self._apply_default_product_sorting(
+                    self.db.query(filtered_ids.c.product_id)
+                    .join(Product, Product.id == filtered_ids.c.product_id)
+                    .join(ProductListing, ProductListing.id == Product.primary_listing_id)
+                    .outerjoin(Source, Source.id == ProductListing.source_id)
+                    .outerjoin(SourceSetting, SourceSetting.source_id == ProductListing.source_id)
+                    .outerjoin(Designer, Designer.id == Product.designer_id)
+                    .outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
+                )
                 .offset(max(0, int(offset)))
                 .limit(max(1, int(limit)))
                 .all()
@@ -1558,13 +1626,14 @@ class ProductQueryService:
                 if primary_listing is not None and self._is_business_source_listing(primary_listing)
                 else None
             ),
+            "source_sort_priority": self._source_sort_priority_for_listing(primary_listing),
             "title": self._effective_title(product, primary_listing),
             "gender": str(product.gender),
             "designer_name": str(getattr(product.designer, "name", "") or "") or None,
             "source_designer_name": str(primary_listing.source_designer_raw) if primary_listing is not None and primary_listing.source_designer_raw else None,
             "display_designer_name": (
                 str(getattr(product.designer, "name", "") or "")
-                or (str(primary_listing.source_designer_raw) if primary_listing is not None and primary_listing.source_designer_raw else None)
+                or self._effective_brand_name(product, primary_listing)
             ),
             "url": (
                 str(primary_listing.url)
@@ -1594,6 +1663,7 @@ class ProductQueryService:
             ),
             "internal_category_name": internal_category_names[0] if internal_category_names else None,
             "internal_category_names": internal_category_names,
+            "created_at": product.created_at.isoformat() if product.created_at else None,
         }
 
     def search_products(self, *, query: str, limit: int, offset: int) -> dict:
@@ -1632,9 +1702,15 @@ class ProductQueryService:
         product_ids = [
             int(row[0])
             for row in (
-                self.db.query(filtered_ids.c.product_id)
-                .join(Product, Product.id == filtered_ids.c.product_id)
-                .order_by(Product.updated_at.desc(), Product.id.desc())
+                self._apply_default_product_sorting(
+                    self.db.query(filtered_ids.c.product_id)
+                    .join(Product, Product.id == filtered_ids.c.product_id)
+                    .join(ProductListing, ProductListing.id == Product.primary_listing_id)
+                    .outerjoin(Source, Source.id == ProductListing.source_id)
+                    .outerjoin(SourceSetting, SourceSetting.source_id == ProductListing.source_id)
+                    .outerjoin(Designer, Designer.id == Product.designer_id)
+                    .outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
+                )
                 .offset(max(0, int(offset)))
                 .limit(max(1, int(limit)))
                 .all()
@@ -1790,28 +1866,27 @@ class ProductQueryService:
             if str(value or "").strip()
         }
         source_options = []
-        for source_id_value, source_key_value, source_name_value, parser_mode_value in self._source_rows():
+        for source_id_value, source_key_value, source_name_value, _parser_mode_value, sort_priority_value in self._source_rows():
             source_key = int(source_id_value)
             count = int(source_counts.get(source_key, 0))
-            source_mode_value = "personal" if source_key_value == SourceRegistryService.MANUAL_SOURCE_KEY else parser_mode_value
             source_options.append(
                 {
                     "value": str(source_key),
                     "label": source_name_value or source_key_value or str(source_key),
                     "count": count,
                     "disabled": count == 0,
-                    "_mode": source_mode_value,
+                    "_sort_priority": int(sort_priority_value or 0),
                 }
             )
         source_options.sort(
             key=lambda item: (
-                0 if str(item.get("_mode")) == "personal" else 1 if str(item.get("_mode")) == "manual" else 2,
+                int(item.get("_sort_priority") or 0) if int(item.get("_sort_priority") or 0) > 0 else 2147483647,
                 str(item["label"]).lower(),
                 str(item["value"]),
             )
         )
         for item in source_options:
-            item.pop("_mode", None)
+            item.pop("_sort_priority", None)
 
         all_active_product_ids = (
             self.db.query(Product.id.label("product_id"))

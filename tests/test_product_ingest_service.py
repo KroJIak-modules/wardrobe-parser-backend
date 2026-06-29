@@ -131,6 +131,57 @@ def test_product_ingest_service_matches_weight_rule_from_handle() -> None:
         db.close()
 
 
+def test_product_ingest_service_keeps_rub_only_product_orderable_without_weight() -> None:
+    db = SessionLocal()
+    source_key = f"ingest-{uuid4().hex[:12]}.example"
+    product_url = f"https://{source_key}/products/rub-item"
+    try:
+        source = Source(
+            key=source_key,
+            name=source_key,
+            base_url=f"https://{source_key}",
+            base_url_normalized=source_key,
+        )
+        db.add(source)
+        db.flush()
+        db.add(SourceSetting(source_id=int(source.id)))
+        db.flush()
+
+        service = ProductIngestService(db)
+        service.apply_batch(
+            source_id=int(source.id),
+            items=[
+                {
+                    "url": product_url,
+                    "handle": "rub-item",
+                    "title": "RUB Only Product",
+                    "description": "",
+                    "designer": "Test Designer",
+                    "category": "",
+                    "gender": "unisex",
+                    "source_weight_grams": 0,
+                    "orderability_status": "orderable",
+                    "variants": [
+                        {"title": "S", "price": 12000.0, "currency": "RUB", "available": True},
+                        {"title": "M", "price": 13000.0, "currency": "RUB", "available": False},
+                    ],
+                    "images": [],
+                }
+            ],
+        )
+        db.flush()
+
+        listing = db.query(ProductListing).filter(ProductListing.source_id == int(source.id)).one()
+        product = db.query(Product).filter(Product.primary_listing_id == int(listing.id)).one()
+
+        assert listing.orderability_status == "orderable"
+        assert listing.status_reason is None
+        assert product.weight_rule_id is None
+    finally:
+        db.rollback()
+        db.close()
+
+
 def test_product_ingest_service_accepts_service_variant_shape() -> None:
     db = SessionLocal()
     source_key = f"ingest-{uuid4().hex[:12]}.example"

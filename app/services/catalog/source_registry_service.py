@@ -5,9 +5,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.source_identity import normalize_base_url
+from app.core.exceptions import ValidationError
 from app.models import Source
 from app.repositories.catalog_sources import CatalogSourceRepository
-from app.services.catalog.catalog_defaults_service import CatalogDefaultsService
 
 
 class SourceRegistryService:
@@ -56,7 +56,24 @@ class SourceRegistryService:
 
     def list_all(self) -> list[Source]:
         self.ensure_manual_source()
-        CatalogDefaultsService(self.db).ensure()
+        self.db.flush()
+        return self.repo.list_all()
+
+    def reorder_sources(self, source_keys: list[str]) -> list[Source]:
+        sources = self.list_all()
+        source_by_key = {
+            str(source.key or "").strip().lower(): source
+            for source in sources
+            if str(source.key or "").strip()
+        }
+        normalized_keys = [str(source_key or "").strip().lower() for source_key in source_keys if str(source_key or "").strip()]
+        if len(normalized_keys) != len(source_keys):
+            raise ValidationError("В списке порядка есть пустые ключи источников")
+        if len(set(normalized_keys)) != len(normalized_keys):
+            raise ValidationError("Один и тот же источник указан в порядке больше одного раза")
+        if set(normalized_keys) != set(source_by_key.keys()):
+            raise ValidationError("Нужно передать полный список всех источников без пропусков")
+        self.repo.apply_sort_order([source_by_key[source_key] for source_key in normalized_keys])
         self.db.flush()
         return self.repo.list_all()
 

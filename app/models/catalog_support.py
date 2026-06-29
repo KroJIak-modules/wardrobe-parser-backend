@@ -6,6 +6,7 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     DateTime,
+    event,
     Float,
     ForeignKey,
     Index,
@@ -81,6 +82,7 @@ class SourceSetting(Base):
 
     source_id = Column(BigInteger, ForeignKey("sources.id", ondelete="CASCADE"), primary_key=True)
     supplier_id = Column(BigInteger, ForeignKey("suppliers.id", ondelete="SET NULL"), nullable=True, index=True)
+    sort_priority = Column(Integer, nullable=False, default=1, server_default="1")
     is_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     is_sync_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     dedup_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
@@ -99,6 +101,16 @@ class SourceSetting(Base):
     __table_args__ = (
         CheckConstraint("description_mode IN ('hidden', 'text', 'html')", name="ck_source_settings_description_mode"),
     )
+
+
+@event.listens_for(SourceSetting, "before_insert")
+def _assign_source_setting_sort_priority(_mapper, connection, target: SourceSetting) -> None:
+    if getattr(target, "sort_priority", None) is not None:
+        return
+    max_priority = connection.execute(
+        sa_text("SELECT COALESCE(MAX(sort_priority), 0) FROM source_settings")
+    ).scalar()
+    target.sort_priority = int(max_priority or 0) + 1
 
 
 class SourceSyncState(Base):

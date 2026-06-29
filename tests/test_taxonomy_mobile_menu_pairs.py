@@ -247,3 +247,31 @@ def test_admin_editor_preserves_display_label_for_multifilter() -> None:
     finally:
         taxonomy.replace_state(original_state)
         db.close()
+
+
+def test_taxonomy_service_keeps_showcase_category_title_from_payload() -> None:
+    db = SessionLocal()
+    service = TaxonomyService(db)
+    original_state = _clone_state(service.get_state())
+    suffix = uuid4().hex[:8]
+    custom_title = f"Кастомный заголовок {suffix}"
+    try:
+        payload = TaxonomyState(
+            filters=[],
+            custom_catalogs=[],
+            showcase_categories=[
+                TaxonomyShowcaseCategory(
+                    code=item.code,
+                    title=(custom_title if item.code == "new" else item.title),
+                    attachments=[],
+                )
+                for item in original_state.showcase_categories
+            ],
+        )
+
+        saved = service.replace_state(payload)
+        updated_category = next(item for item in saved.showcase_categories if item.code == "new")
+        assert updated_category.title == custom_title
+    finally:
+        service.replace_state(original_state)
+        db.close()

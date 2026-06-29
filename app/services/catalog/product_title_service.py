@@ -20,6 +20,8 @@ class ProductTitleService:
         if not designer:
             return title
         category = cls._collapse_spaces(source_category_name)
+        if category and cls._normalize_compare(title) == cls._normalize_compare(designer):
+            return category
 
         prefix_pattern = cls._designer_prefix_pattern(designer)
         if prefix_pattern is None:
@@ -31,8 +33,6 @@ class ProductTitleService:
 
         remainder = cls._collapse_spaces(re.sub(r"^[\s\-\|:/\\,.;_]+", "", title[match.end() :]))
         if not remainder:
-            if category and cls._normalize_compare(title) == cls._normalize_compare(designer):
-                return category
             return title
         if not re.search(r"\w", remainder, flags=re.UNICODE):
             return title
@@ -46,9 +46,20 @@ class ProductTitleService:
 
     @staticmethod
     def _normalize_compare(value: str | None) -> str:
-        text = unicodedata.normalize("NFKC", str(value or "")).casefold()
-        text = re.sub(r"[\W_]+", " ", text, flags=re.UNICODE)
-        return " ".join(text.split())
+        raw = str(value or "")
+        parts: list[str] = []
+        for raw_character in raw.casefold():
+            if not raw_character.isalnum():
+                continue
+            parts.append(
+                "".join(
+                    character
+                    for character in unicodedata.normalize("NFKD", raw_character)
+                    if character.isalnum()
+                )
+            )
+        text = "".join(parts)
+        return re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
 
     @classmethod
     def _designer_prefix_pattern(cls, designer_name: str) -> re.Pattern[str] | None:

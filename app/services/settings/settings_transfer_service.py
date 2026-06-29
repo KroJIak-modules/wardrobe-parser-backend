@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 import re
 
 from fastapi import HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import (
     AdminUiSettings,
     Designer,
     DesignerSourceName,
+    ImageAsset,
     PricingSetting,
+    Product,
+    ProductListing,
     Source,
+    SourceSetting,
+    ShowcaseCarouselImage,
+    ShowcaseSetting,
     Supplier,
     SupplierShippingRate,
     WeightRule,
@@ -26,21 +36,43 @@ from app.repositories import (
     CatalogWeightRuleRepository,
 )
 from app.services.catalog.designer_support import slugify_designer_name
+from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
+from app.services.catalog.catalog_defaults_service import CatalogDefaultsService
+from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.source_registry_service import SourceRegistryService
+from app.services.catalog.taxonomy_service import TaxonomyService
 from app.core.source_identity import normalize_base_url
+from app.schemas.taxonomy import (
+    TaxonomyCustomCatalog,
+    TaxonomyFilterNode,
+    TaxonomyShowcaseAttachment,
+    TaxonomyShowcaseCategory,
+    TaxonomyState,
+)
 from app.services.settings.pricing_service import PricingSettingsService
+from app.services.settings.default_admin_settings import DefaultAdminSettingsLoader
+from app.services.settings.weight_rule_service import WeightRuleService
 from app.schemas.admin_settings import (
     SettingsTransferAdminUiSettings,
+    SettingsTransferDesignerEntry,
     SettingsTransferDesignerSourceNameEntry,
+    SettingsTransferImageAssetEntry,
     SettingsTransferPayload,
     SettingsTransferPricingSettings,
     SettingsTransferResponse,
     SettingsTransferSourceEntry,
     SettingsTransferSupplierEntry,
+    SettingsTransferTaxonomyCustomCatalog,
+    SettingsTransferTaxonomyFilterNode,
+    SettingsTransferTaxonomyShowcaseAttachment,
+    SettingsTransferTaxonomyShowcaseCategory,
+    SettingsTransferTaxonomyState,
+    SettingsTransferShowcaseCarouselEntry,
+    SettingsTransferShowcaseMedia,
     SettingsTransferWeightRuleEntry,
 )
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _PROJECT_NAME = "wardrobe-parser-platform"
 
 _PRICING_EXPORT_FIELDS = [
@@ -83,6 +115,13 @@ def _slugify_name(raw: str) -> str:
     return slugify_designer_name(raw)
 
 
+def _numeric_values_equal(left: object, right: object) -> bool:
+    try:
+        return Decimal(str(left)) == Decimal(str(right))
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
 class SettingsTransferService:
     """Application service for settings export/import."""
 
@@ -92,14 +131,154 @@ class SettingsTransferService:
         self.supplier_repo = CatalogSupplierRepository(db)
         self.source_repo = CatalogSourceRepository(db)
         self.weight_rule_repo = CatalogWeightRuleRepository(db)
+        self.media_assets = MediaAssetService(db)
+        self.taxonomy = TaxonomyService(db)
+
+    @staticmethod
+    def _normalize_designer_key(raw: str | None) -> str:
+        return " ".join(str(raw or "").strip().split()).lower()
+
+    @staticmethod
+    def _asset_scope_for_storage_key(storage_key: str | None, *, fallback: str) -> str:
+        raw = str(storage_key or "").strip()
+        if not raw or "/" not in raw:
+            return fallback
+        prefix = raw.split("/", 1)[0].strip()
+        return prefix or fallback
+
+    @staticmethod
+    def _asset_file_name(storage_key: str | None, *, fallback: str) -> str:
+        raw = str(storage_key or "").strip()
+        if not raw or "/" not in raw:
+            return fallback
+        file_name = raw.rsplit("/", 1)[-1].strip()
+        return file_name or fallback
+
+    def _export_image_assets(self, assets: list[tuple[ImageAsset, str]]) -> list[SettingsTransferImageAssetEntry]:
+        seen_checksums: set[str] = set()
+        entries: list[SettingsTransferImageAssetEntry] = []
+        for asset, default_scope in assets:
+            checksum = str(getattr(asset, "checksum_sha256", "") or "").strip()
+            if not checksum or checksum in seen_checksums:
+                continue
+            file_path = self.media_assets.resolve_file_path(asset)
+            if not file_path.exists():
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Файл изображения не найден: {asset.storage_key}",
+                )
+            content = file_path.read_bytes()
+            seen_checksums.add(checksum)
+            entries.append(
+                SettingsTransferImageAssetEntry(
+                    checksum_sha256=checksum,
+                    scope=self._asset_scope_for_storage_key(getattr(asset, "storage_key", None), fallback=default_scope),
+                    file_name=self._asset_file_name(getattr(asset, "storage_key", None), fallback=f"{checksum}.bin"),
+                    mime_type=str(getattr(asset, "mime_type", "") or "application/octet-stream"),
+                    byte_size=int(getattr(asset, "byte_size", 0) or 0),
+                    width_px=(int(asset.width_px) if getattr(asset, "width_px", None) is not None else None),
+                    height_px=(int(asset.height_px) if getattr(asset, "height_px", None) is not None else None),
+                    content_base64=base64.b64encode(content).decode("ascii"),
+                )
+            )
+        return entries
+
+    @classmethod
+    def _serialize_taxonomy_filters(cls, nodes: list[TaxonomyFilterNode]) -> list[SettingsTransferTaxonomyFilterNode]:
+        return [
+            SettingsTransferTaxonomyFilterNode(
+                slug=str(node.slug or "").strip(),
+                title=str(node.title),
+                display_title=(str(node.display_title) if node.display_title else None),
+                mobile_pair_slug=(str(node.mobile_pair_slug) if node.mobile_pair_slug else None),
+                node_kind=str(node.node_kind),
+                is_enabled=bool(node.is_enabled),
+                local_category_keywords=[str(item) for item in node.local_category_keywords],
+                title_keywords=[str(item) for item in node.title_keywords],
+                children=cls._serialize_taxonomy_filters(node.children),
+            )
+            for node in nodes
+            if str(node.slug or "").strip()
+        ]
+
+    def _export_taxonomy(self) -> SettingsTransferTaxonomyState:
+        state = self.taxonomy.get_state()
+        return SettingsTransferTaxonomyState(
+            filters=self._serialize_taxonomy_filters(state.filters),
+            custom_catalogs=[
+                SettingsTransferTaxonomyCustomCatalog(
+                    slug=str(catalog.slug or "").strip(),
+                    title=str(catalog.title),
+                    description=(str(catalog.description) if catalog.description else None),
+                    is_enabled=bool(catalog.is_enabled),
+                )
+                for catalog in state.custom_catalogs
+                if str(catalog.slug or "").strip()
+            ],
+            showcase_categories=[
+                SettingsTransferTaxonomyShowcaseCategory(
+                    code=str(category.code),
+                    title=str(category.title),
+                    attachments=[
+                        SettingsTransferTaxonomyShowcaseAttachment(
+                            kind=str(attachment.kind),
+                            filter_slug=(str(attachment.filter_slug) if attachment.filter_slug else None),
+                            custom_catalog_slug=(str(attachment.custom_catalog_slug) if attachment.custom_catalog_slug else None),
+                            hidden_filter_slugs=[str(item) for item in attachment.hidden_filter_slugs],
+                        )
+                        for attachment in category.attachments
+                    ],
+                )
+                for category in state.showcase_categories
+            ],
+        )
+
+    @staticmethod
+    def _import_taxonomy_filters(nodes: list[SettingsTransferTaxonomyFilterNode]) -> list[TaxonomyFilterNode]:
+        return [
+            TaxonomyFilterNode(
+                slug=str(node.slug).strip(),
+                title=node.title,
+                display_title=node.display_title,
+                mobile_pair_slug=node.mobile_pair_slug,
+                node_kind=node.node_kind,
+                is_enabled=node.is_enabled,
+                local_category_keywords=[str(item) for item in node.local_category_keywords],
+                title_keywords=[str(item) for item in node.title_keywords],
+                manual_product_ids=[],
+                children=SettingsTransferService._import_taxonomy_filters(node.children),
+            )
+            for node in nodes
+        ]
 
     def export_payload(self) -> SettingsTransferPayload:
-        pricing_row, _ = self.pricing_repo.get_or_create_default()
+        pricing_row = self.pricing_repo.get_singleton()
+        ui_row = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
+        if pricing_row is None or ui_row is None:
+            pricing_service = PricingSettingsService(self.db)
+            pricing_service.reset_to_seed()
+            self.db.flush()
+            pricing_row = self.pricing_repo.get_singleton()
+            ui_row = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
+        if pricing_row is None or ui_row is None:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Не удалось подготовить настройки к экспорту")
         suppliers = self.supplier_repo.list_all_with_rates()
         sources = SourceRegistryService(self.db).list_all()
         weight_rules = self.weight_rule_repo.list_active()
+        showcase_media_settings = self.db.query(ShowcaseCarouselImage).order_by(ShowcaseCarouselImage.position.asc(), ShowcaseCarouselImage.id.asc()).all()
+        showcase_setting = self.db.query(ShowcaseSetting).order_by(ShowcaseSetting.id.asc()).first()
 
         supplier_by_id = {int(supplier.id): supplier for supplier in suppliers}
+        designer_rows = (
+            self.db.query(Designer)
+            .order_by(Designer.name.asc(), Designer.id.asc())
+            .all()
+        )
+        mapping_rows = (
+            self.db.query(DesignerSourceName)
+            .order_by(DesignerSourceName.source_name.asc(), DesignerSourceName.id.asc())
+            .all()
+        )
 
         pricing = SettingsTransferPricingSettings(
             **{
@@ -107,9 +286,8 @@ class SettingsTransferService:
                 for field in _PRICING_EXPORT_FIELDS
             }
         )
-        ui_row = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
         admin_ui = SettingsTransferAdminUiSettings(
-            auto_sync_period_minutes=max(60, int(getattr(ui_row, "auto_sync_period_minutes", 60) or 60)),
+            auto_sync_period_minutes=int(ui_row.auto_sync_period_minutes),
         )
 
         supplier_entries = [
@@ -144,19 +322,19 @@ class SettingsTransferService:
         ]
 
         source_entries: list[SettingsTransferSourceEntry] = []
+        export_assets: list[tuple[ImageAsset, str]] = []
         for source in sources:
-            if str(source.key) == SourceRegistryService.MANUAL_SOURCE_KEY:
-                continue
-            if not str(getattr(source, "adapter_key", "") or "").strip():
-                continue
             setting = self.source_repo.ensure_setting(source)
+            if getattr(source, "logo_image_asset", None) is not None:
+                export_assets.append((source.logo_image_asset, "sources"))
             source_entries.append(
                 SettingsTransferSourceEntry(
                     key=str(source.key),
                     name=str(source.name),
                     url=str(source.base_url),
-                    adapter_key=str(getattr(source, "adapter_key", "") or "").strip(),
+                    adapter_key=(str(getattr(source, "adapter_key", "") or "").strip() or None),
                     parser_config=dict(getattr(source, "parser_config", None) or {}),
+                    sort_priority=int(getattr(setting, "sort_priority", 0) or 0) or 1,
                     enabled=bool(getattr(setting, "is_enabled", True)),
                     sync_enabled=bool(getattr(setting, "is_sync_enabled", True)),
                     dedup_enabled=bool(getattr(setting, "dedup_enabled", True)),
@@ -180,6 +358,11 @@ class SettingsTransferService:
                         if getattr(setting, "buyout_surcharge_currency", None)
                         else None
                     ),
+                    logo_asset_checksum=(
+                        str(source.logo_image_asset.checksum_sha256)
+                        if getattr(source, "logo_image_asset", None) is not None
+                        else None
+                    ),
                 )
             )
 
@@ -193,6 +376,11 @@ class SettingsTransferService:
             )
             for rule in weight_rules
         ]
+        if getattr(showcase_setting, "hero_image_asset", None) is not None:
+            export_assets.append((showcase_setting.hero_image_asset, "showcase"))
+        for row in showcase_media_settings:
+            if getattr(row, "image_asset", None) is not None:
+                export_assets.append((row.image_asset, "showcase"))
 
         return SettingsTransferPayload(
             schema_version=_SCHEMA_VERSION,
@@ -203,17 +391,44 @@ class SettingsTransferService:
             suppliers=supplier_entries,
             sources=source_entries,
             weight_rules=weight_entries,
+            designers=[
+                SettingsTransferDesignerEntry(
+                    name=str(row.name),
+                    slug=str(row.slug),
+                    description=(str(row.description) if row.description else None),
+                    origin_kind=str(getattr(row, "origin_kind", "manual") or "manual"),
+                    is_admin_touched=bool(getattr(row, "is_admin_touched", False)),
+                    is_enabled=bool(getattr(row, "is_enabled", True)),
+                )
+                for row in designer_rows
+                if str(row.name or "").strip() and str(row.slug or "").strip()
+            ],
             designer_source_names=[
                 SettingsTransferDesignerSourceNameEntry(
                     source_name=str(row.source_name),
                     designer_name=(str(row.designer_name) if row.designer_name is not None else None),
+                    is_enabled=bool(getattr(row, "is_enabled", True)),
+                    is_admin_touched=bool(getattr(row, "is_admin_touched", False)),
                 )
-                for row in (
-                    self.db.query(DesignerSourceName)
-                    .order_by(DesignerSourceName.source_name.asc(), DesignerSourceName.id.asc())
-                    .all()
-                )
+                for row in mapping_rows
             ],
+            taxonomy=self._export_taxonomy(),
+            showcase_media=SettingsTransferShowcaseMedia(
+                hero_asset_checksum=(
+                    str(showcase_setting.hero_image_asset.checksum_sha256)
+                    if getattr(showcase_setting, "hero_image_asset", None) is not None
+                    else None
+                ),
+                carousel=[
+                    SettingsTransferShowcaseCarouselEntry(
+                        asset_checksum=str(row.image_asset.checksum_sha256),
+                        position=int(row.position),
+                    )
+                    for row in showcase_media_settings
+                    if getattr(row, "image_asset", None) is not None
+                ],
+            ),
+            image_assets=self._export_image_assets(export_assets),
         )
 
     def import_payload(self, payload: SettingsTransferPayload) -> SettingsTransferResponse:
@@ -223,31 +438,61 @@ class SettingsTransferService:
                 detail=f"Unsupported schema_version: {payload.schema_version}",
             )
 
-        supplier_map = self._import_suppliers(payload.suppliers)
-        pricing_updated = self._import_pricing(payload.pricing_settings)
-        admin_ui_updated = self._import_admin_ui(payload.admin_ui_settings)
-        source_count = self._import_sources(payload.sources, supplier_map=supplier_map)
-        weight_count = self._import_weight_rules(payload.weight_rules)
-        designer_source_names_updated = self._import_designer_source_names(payload.designer_source_names)
+        asset_map: dict[str, ImageAsset] = {}
+        created_assets: list[ImageAsset] = []
+        try:
+            asset_map, created_assets = self._import_image_assets(payload.image_assets)
+            supplier_map = self._import_suppliers(payload.suppliers)
+            pricing_updated = self._import_pricing(payload.pricing_settings)
+            admin_ui_updated = self._import_admin_ui(payload.admin_ui_settings)
+            designer_count = self._import_designers(payload.designers)
+            designer_source_names_updated = self._import_designer_source_names(payload.designer_source_names)
+            source_count = self._import_sources(payload.sources, supplier_map=supplier_map, asset_map=asset_map)
+            weight_count = self._import_weight_rules(payload.weight_rules)
+            taxonomy_state = self._import_taxonomy(payload.taxonomy)
+            showcase_media_updated = self._import_showcase_media(payload.showcase_media, asset_map=asset_map)
+            DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
+            pruned_source_count = self._prune_sources(payload.sources)
+            pruned_supplier_count = self._prune_suppliers(payload.suppliers)
+            pruned_designer_count = self._prune_designers(payload.designers)
 
-        self.db.commit()
-        return SettingsTransferResponse(
-            ok=True,
-            message="Настройки импортированы",
-            schema_version=_SCHEMA_VERSION,
-            imported_at=datetime.now(timezone.utc).isoformat(),
-            imported_counts={
-                "pricing_settings_updated": pricing_updated,
-                "admin_ui_settings_updated": admin_ui_updated,
-                "suppliers_upserted": len(supplier_map),
-                "sources_upserted": source_count,
-                "weight_rules_replaced": weight_count,
-                "designer_source_names_replaced": designer_source_names_updated,
-            },
-        )
+            self.db.commit()
+            return SettingsTransferResponse(
+                ok=True,
+                message="Настройки импортированы",
+                schema_version=_SCHEMA_VERSION,
+                imported_at=datetime.now(timezone.utc).isoformat(),
+                imported_counts={
+                    "pricing_settings_updated": pricing_updated,
+                    "admin_ui_settings_updated": admin_ui_updated,
+                    "suppliers_upserted": len(supplier_map),
+                    "image_assets_upserted": len(asset_map),
+                    "sources_upserted": source_count,
+                    "sources_deleted": pruned_source_count,
+                    "weight_rules_replaced": weight_count,
+                    "designers_upserted": designer_count,
+                    "designers_deleted": pruned_designer_count,
+                    "designer_source_names_replaced": designer_source_names_updated,
+                    "suppliers_deleted": pruned_supplier_count,
+                    "taxonomy_filters_replaced": len(taxonomy_state.filters),
+                    "taxonomy_custom_catalogs_replaced": len(taxonomy_state.custom_catalogs),
+                    "showcase_categories_replaced": len(taxonomy_state.showcase_categories),
+                    "showcase_media_assets_linked": showcase_media_updated,
+                },
+            )
+        except HTTPException:
+            self.db.rollback()
+            self._cleanup_created_assets(created_assets)
+            raise
+        except Exception:
+            self.db.rollback()
+            self._cleanup_created_assets(created_assets)
+            raise
 
     def reset_all(self) -> SettingsTransferResponse:
-        # 1) Reset pricing settings/suppliers to service defaults.
+        seed = DefaultAdminSettingsLoader.load()
+
+        # 1) Reset pricing settings/suppliers to packaged defaults.
         self.db.query(SupplierShippingRate).delete(synchronize_session=False)
         self.db.query(Supplier).delete(synchronize_session=False)
         self.db.query(PricingSetting).delete(synchronize_session=False)
@@ -255,26 +500,29 @@ class SettingsTransferService:
         self.db.flush()
 
         pricing_service = PricingSettingsService(self.db)
-        pricing_service.get_settings(refresh_bybit=False)
+        pricing_service.reset_to_seed()
+        CatalogDefaultsService(self.db).ensure()
+        self.db.flush()
         suppliers = self.supplier_repo.list_all_with_rates()
-        fallback_supplier = next((s for s in suppliers if str(getattr(s, "provider_kind", "")) == "main"), suppliers[0] if suppliers else None)
+        fallback_supplier = next((s for s in suppliers if str(getattr(s, "key", "") or "") == seed.default_source_supplier_key), None)
+        source_defaults = seed.source_setting_defaults
 
-        # 2) Reset sources to neutral defaults.
+        # 2) Reset sources to packaged defaults.
         sources_reset = 0
         for source in self.source_repo.list_all():
             if str(source.key) == SourceRegistryService.MANUAL_SOURCE_KEY:
                 continue
             setting = self.source_repo.ensure_setting(source)
-            setting.is_enabled = True
-            setting.is_sync_enabled = True
-            setting.dedup_enabled = True
-            setting.hide_auto_added_products = False
-            setting.description_mode = "text"
-            setting.show_images = True
-            setting.promo_factor = 1.0
-            setting.promo_only_no_discount = False
-            setting.buyout_surcharge_value = None
-            setting.buyout_surcharge_currency = None
+            setting.is_enabled = bool(source_defaults.enabled)
+            setting.is_sync_enabled = bool(source_defaults.sync_enabled)
+            setting.dedup_enabled = bool(source_defaults.dedup_enabled)
+            setting.hide_auto_added_products = bool(source_defaults.hide_auto_added_products)
+            setting.description_mode = str(source_defaults.description_mode)
+            setting.show_images = bool(source_defaults.show_images)
+            setting.promo_factor = float(source_defaults.promo_factor)
+            setting.promo_only_no_discount = bool(source_defaults.promo_only_no_discount)
+            setting.buyout_surcharge_value = source_defaults.buyout_surcharge_value
+            setting.buyout_surcharge_currency = source_defaults.buyout_surcharge_currency
             if fallback_supplier is not None:
                 setting.supplier_id = int(fallback_supplier.id)
             sources_reset += 1
@@ -282,6 +530,9 @@ class SettingsTransferService:
         # 3) Reset weight rules.
         self.db.query(WeightRuleKeyword).delete(synchronize_session=False)
         self.db.query(WeightRule).delete(synchronize_session=False)
+        self.db.flush()
+        WeightRuleService(self.db).ensure_default_rules()
+        weight_rule_count = len(self.weight_rule_repo.list_active())
 
         # 4) Reset designer source names.
         self.db.query(DesignerSourceName).delete(synchronize_session=False)
@@ -297,14 +548,300 @@ class SettingsTransferService:
                 "admin_ui_settings_updated": 1,
                 "suppliers_upserted": len(suppliers),
                 "sources_upserted": sources_reset,
-                "weight_rules_replaced": 0,
+                "weight_rules_replaced": weight_rule_count,
             },
         )
+
+    def _import_image_assets(self, assets: list[SettingsTransferImageAssetEntry]) -> tuple[dict[str, ImageAsset], list[ImageAsset]]:
+        result: dict[str, ImageAsset] = {}
+        created_assets: list[ImageAsset] = []
+        seen_checksums: set[str] = set()
+        for item in assets:
+            checksum = str(item.checksum_sha256 or "").strip()
+            if not checksum or checksum in seen_checksums:
+                continue
+            seen_checksums.add(checksum)
+            existing = self.db.query(ImageAsset).filter(ImageAsset.checksum_sha256 == checksum).one_or_none()
+            if existing is not None:
+                result[checksum] = existing
+                continue
+            try:
+                content = base64.b64decode(item.content_base64.encode("ascii"), validate=True)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Не удалось прочитать изображение {checksum}: {exc}",
+                ) from exc
+            actual_checksum = sha256(content).hexdigest()
+            if actual_checksum != checksum:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Контрольная сумма изображения не совпадает для {checksum}.",
+                )
+            asset = self.media_assets.save_bytes(
+                scope=str(item.scope or "assets").strip() or "assets",
+                file_name=str(item.file_name or "").strip() or f"{checksum}.bin",
+                content=content,
+            )
+            result[checksum] = asset
+            created_assets.append(asset)
+        return result, created_assets
+
+    def _cleanup_created_assets(self, assets: list[ImageAsset]) -> None:
+        for asset in assets:
+            file_path = self.media_assets.resolve_file_path(asset)
+            if file_path.exists():
+                file_path.unlink()
+
+    @staticmethod
+    def _require_asset_checksum(
+        *,
+        asset_map: dict[str, ImageAsset],
+        checksum: str,
+        field_label: str,
+    ) -> ImageAsset:
+        normalized = str(checksum or "").strip()
+        asset = asset_map.get(normalized)
+        if asset is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"В файле отсутствует изображение для поля '{field_label}'.",
+            )
+        return asset
+
+    def _import_designers(self, rows: list[SettingsTransferDesignerEntry]) -> int:
+        existing_by_slug = {
+            str(row.slug).strip(): row
+            for row in self.db.query(Designer).order_by(Designer.id.asc()).all()
+            if str(row.slug or "").strip()
+        }
+        existing_by_name = {
+            self._normalize_designer_key(getattr(row, "name", None)): row
+            for row in existing_by_slug.values()
+            if self._normalize_designer_key(getattr(row, "name", None))
+        }
+        kept_ids: set[int] = set()
+        for item in rows:
+            slug = str(item.slug or "").strip()
+            name = " ".join(str(item.name or "").strip().split())
+            if not slug or not name:
+                continue
+            entity = existing_by_slug.get(slug)
+            if entity is None:
+                entity = existing_by_name.get(self._normalize_designer_key(name))
+            if entity is None:
+                entity = Designer(
+                    name=name,
+                    slug=slug,
+                    description=item.description,
+                    origin_kind=item.origin_kind,
+                    is_admin_touched=bool(item.is_admin_touched),
+                    is_enabled=bool(item.is_enabled),
+                )
+                self.db.add(entity)
+                self.db.flush()
+            else:
+                entity.name = name
+                entity.slug = slug
+                entity.description = item.description
+                entity.origin_kind = str(item.origin_kind or "manual")
+                entity.is_admin_touched = bool(item.is_admin_touched)
+                entity.is_enabled = bool(item.is_enabled)
+            existing_by_slug[slug] = entity
+            existing_by_name[self._normalize_designer_key(name)] = entity
+            kept_ids.add(int(entity.id))
+        return len(kept_ids)
+
+    def _import_taxonomy(self, payload: SettingsTransferTaxonomyState) -> TaxonomyState:
+        state = TaxonomyState(
+            filters=self._import_taxonomy_filters(payload.filters),
+            custom_catalogs=[
+                TaxonomyCustomCatalog(
+                    slug=str(item.slug).strip(),
+                    title=item.title,
+                    description=item.description,
+                    is_enabled=item.is_enabled,
+                    product_ids=[],
+                )
+                for item in payload.custom_catalogs
+            ],
+            showcase_categories=[
+                TaxonomyShowcaseCategory(
+                    code=str(category.code),
+                    title=category.title,
+                    attachments=[
+                        TaxonomyShowcaseAttachment(
+                            kind=attachment.kind,
+                            filter_slug=attachment.filter_slug,
+                            custom_catalog_slug=attachment.custom_catalog_slug,
+                            hidden_filter_slugs=[str(value) for value in attachment.hidden_filter_slugs],
+                        )
+                        for attachment in category.attachments
+                    ],
+                )
+                for category in payload.showcase_categories
+            ],
+        )
+        return self.taxonomy.replace_state(state)
+
+    def _import_showcase_media(
+        self,
+        payload: SettingsTransferShowcaseMedia,
+        *,
+        asset_map: dict[str, ImageAsset],
+    ) -> int:
+        settings = self.db.query(ShowcaseSetting).order_by(ShowcaseSetting.id.asc()).first()
+        if settings is None:
+            settings = ShowcaseSetting(id=1)
+            self.db.add(settings)
+            self.db.flush()
+        hero_checksum = str(payload.hero_asset_checksum or "").strip()
+        settings.hero_image_asset_id = (
+            int(self._require_asset_checksum(asset_map=asset_map, checksum=hero_checksum, field_label="Главное изображение витрины").id)
+            if hero_checksum
+            else None
+        )
+        self.db.query(ShowcaseCarouselImage).delete(synchronize_session=False)
+        self.db.flush()
+        linked = 1 if settings.hero_image_asset_id is not None else 0
+        seen_checksums: set[str] = set()
+        for position, item in enumerate(sorted(payload.carousel, key=lambda row: int(row.position)), start=1):
+            checksum = str(item.asset_checksum or "").strip()
+            if not checksum or checksum in seen_checksums:
+                continue
+            seen_checksums.add(checksum)
+            asset = self._require_asset_checksum(
+                asset_map=asset_map,
+                checksum=checksum,
+                field_label=f"Изображение карусели #{position}",
+            )
+            self.db.add(
+                ShowcaseCarouselImage(
+                    image_asset_id=int(asset.id),
+                    position=position,
+                )
+            )
+            linked += 1
+        self.db.flush()
+        return linked
+
+    def _prune_sources(self, rows: list[SettingsTransferSourceEntry]) -> int:
+        desired_keys = {
+            SourceRegistryService.normalize_source_key(item.key)
+            for item in rows
+            if SourceRegistryService.normalize_source_key(item.key)
+        }
+        stale_sources = [
+            source
+            for source in self.db.query(Source).order_by(Source.id.asc()).all()
+            if str(source.key or "") != SourceRegistryService.MANUAL_SOURCE_KEY and str(source.key or "") not in desired_keys
+        ]
+        if not stale_sources:
+            return 0
+
+        listing_counts = {
+            int(source_id): int(count)
+            for source_id, count in (
+                self.db.query(ProductListing.source_id, func.count(ProductListing.id))
+                .filter(ProductListing.source_id.in_([int(source.id) for source in stale_sources]))
+                .group_by(ProductListing.source_id)
+                .all()
+            )
+        }
+
+        deleted = 0
+        for source in stale_sources:
+            linked_listings = listing_counts.get(int(source.id), 0)
+            if linked_listings > 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"В файле отсутствует источник '{source.name}', но к нему все еще привязано {linked_listings} листингов.",
+                )
+            self.db.delete(source)
+            deleted += 1
+        self.db.flush()
+        return deleted
+
+    def _prune_suppliers(self, rows: list[SettingsTransferSupplierEntry]) -> int:
+        desired_keys = {
+            _normalize_supplier_key(item.key, item.name, index=index)
+            for index, item in enumerate(rows, start=1)
+        }
+        stale_suppliers = [
+            supplier
+            for supplier in self.db.query(Supplier).order_by(Supplier.id.asc()).all()
+            if str(supplier.key or "") not in desired_keys
+        ]
+        if not stale_suppliers:
+            return 0
+
+        assignment_counts = {
+            int(supplier_id): int(count)
+            for supplier_id, count in (
+                self.db.query(SourceSetting.supplier_id, func.count(SourceSetting.source_id))
+                .filter(SourceSetting.supplier_id.in_([int(supplier.id) for supplier in stale_suppliers]))
+                .group_by(SourceSetting.supplier_id)
+                .all()
+            )
+            if supplier_id is not None
+        }
+
+        deleted = 0
+        for supplier in sorted(stale_suppliers, key=lambda item: (0 if item.parent_supplier_id is not None else 1, int(item.id))):
+            assigned_sources = assignment_counts.get(int(supplier.id), 0)
+            if assigned_sources > 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"В файле отсутствует тариф '{supplier.name}', но он все еще назначен на {assigned_sources} источников.",
+                )
+            self.db.delete(supplier)
+            deleted += 1
+        self.db.flush()
+        return deleted
+
+    def _prune_designers(self, rows: list[SettingsTransferDesignerEntry]) -> int:
+        desired_slugs = {str(item.slug or "").strip() for item in rows if str(item.slug or "").strip()}
+        desired_names = {self._normalize_designer_key(item.name) for item in rows if self._normalize_designer_key(item.name)}
+        referenced_designer_ids = {
+            int(designer_id)
+            for designer_id, in self.db.query(Product.designer_id).filter(Product.designer_id.is_not(None)).all()
+        }
+        referenced_designer_ids.update(
+            int(designer_id)
+            for designer_id, in self.db.query(DesignerSourceName.designer_id).filter(DesignerSourceName.designer_id.is_not(None)).all()
+        )
+
+        deleted = 0
+        for designer in self.db.query(Designer).order_by(Designer.id.asc()).all():
+            if int(designer.id) in referenced_designer_ids:
+                continue
+            if str(designer.slug or "").strip() in desired_slugs:
+                continue
+            if self._normalize_designer_key(designer.name) in desired_names:
+                continue
+            self.db.delete(designer)
+            deleted += 1
+        self.db.flush()
+        return deleted
 
     def _import_pricing(self, payload: SettingsTransferPricingSettings) -> int:
         row, _ = self.pricing_repo.get_or_create_default()
         values = payload.model_dump()
         updated_fields = 0
+        numeric_fields = {
+            "markup_multiplier",
+            "weight_tolerance",
+            "customs_threshold_eur",
+            "customs_duty_rate",
+            "eur_to_rub_rate",
+            "usd_to_rub_rate",
+            "usdt_to_rub_rate",
+            "usdt_extra_rub",
+            "payment_fee_rate",
+            "customs_processing_rate",
+            "customs_fixed_rub",
+            "tax_rate",
+        }
         mapped_values = {
             "markup_multiplier": float(values["markup_multiplier"]),
             "weight_tolerance": float(values["weight_tolerance"]),
@@ -321,7 +858,13 @@ class SettingsTransferService:
             "tax_rate": float(values["tax_rate"]),
         }
         for key, raw_value in mapped_values.items():
-            if getattr(row, key) != raw_value:
+            current_value = getattr(row, key)
+            value_changed = (
+                not _numeric_values_equal(current_value, raw_value)
+                if key in numeric_fields
+                else current_value != raw_value
+            )
+            if value_changed:
                 setattr(row, key, raw_value)
                 updated_fields += 1
         return updated_fields
@@ -335,7 +878,7 @@ class SettingsTransferService:
         updated_fields = 0
         values = payload.model_dump()
         normalized = {
-            "auto_sync_period_minutes": max(60, int(values.get("auto_sync_period_minutes") or 60)),
+            "auto_sync_period_minutes": int(values["auto_sync_period_minutes"]),
         }
         for key, raw_value in normalized.items():
             if getattr(row, key) != raw_value:
@@ -399,17 +942,21 @@ class SettingsTransferService:
         sources: list[SettingsTransferSourceEntry],
         *,
         supplier_map: dict[str, Supplier],
+        asset_map: dict[str, ImageAsset],
     ) -> int:
         if not supplier_map:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет тарифов для назначения источникам")
         updated = 0
         for item in sources:
             source_key = SourceRegistryService.normalize_source_key(item.key)
-            if not source_key or source_key == SourceRegistryService.MANUAL_SOURCE_KEY:
+            if not source_key:
                 continue
-            existing = self.source_repo.get_by_key(source_key)
-            if existing is None:
-                existing = self.db.query(Source).filter(Source.key == source_key).one_or_none()
+            if source_key == SourceRegistryService.MANUAL_SOURCE_KEY:
+                existing = SourceRegistryService(self.db).ensure_manual_source()
+            else:
+                existing = self.source_repo.get_by_key(source_key)
+                if existing is None:
+                    existing = self.db.query(Source).filter(Source.key == source_key).one_or_none()
             supplier = supplier_map.get(item.supplier_key) if item.supplier_key else None
             if item.supplier_key and supplier is None:
                 raise HTTPException(
@@ -429,15 +976,17 @@ class SettingsTransferService:
                 existing.name = item.name
                 existing.base_url = item.url
                 existing.base_url_normalized = normalize_base_url(item.url)
-                existing.adapter_key = str(item.adapter_key).strip()
+                existing.adapter_key = (str(item.adapter_key).strip() or None) if item.adapter_key is not None else None
                 existing.parser_config = dict(item.parser_config or {})
             setting = self.source_repo.ensure_setting(existing)
+            self.source_repo.ensure_sync_state(existing)
             setting.is_enabled = bool(item.enabled)
             setting.is_sync_enabled = bool(item.sync_enabled)
             setting.dedup_enabled = bool(item.dedup_enabled)
             setting.hide_auto_added_products = bool(item.hide_auto_added_products)
             setting.description_mode = str(item.description_mode)
             setting.show_images = bool(item.show_images)
+            setting.sort_priority = int(item.sort_priority)
             setting.supplier_id = supplier_id
             setting.promo_factor = float(item.promo_factor)
             setting.promo_only_no_discount = bool(item.promo_only_no_discount)
@@ -449,6 +998,12 @@ class SettingsTransferService:
             setting.buyout_surcharge_currency = (
                 _normalize_currency(item.buyout_surcharge_currency, default="RUB")
                 if item.buyout_surcharge_currency is not None
+                else None
+            )
+            logo_checksum = str(item.logo_asset_checksum or "").strip()
+            existing.logo_image_asset_id = (
+                int(self._require_asset_checksum(asset_map=asset_map, checksum=logo_checksum, field_label=f"Логотип источника '{item.name}'").id)
+                if logo_checksum
                 else None
             )
             updated += 1
@@ -483,28 +1038,11 @@ class SettingsTransferService:
         self.db.flush()
         inserted = 0
         designers_by_name = {
-            str(designer.name).strip(): designer
+            self._normalize_designer_key(getattr(designer, "name", None)): designer
             for designer in self.db.query(Designer).order_by(Designer.id.asc()).all()
-            if str(designer.name or "").strip()
-        }
-        used_slugs = {
-            str(designer.slug).strip()
-            for designer in designers_by_name.values()
-            if str(designer.slug or "").strip()
+            if self._normalize_designer_key(getattr(designer, "name", None))
         }
         seen_source_names: set[str] = set()
-
-        def next_slug(name: str) -> str:
-            base = _slugify_name(name)
-            if base not in used_slugs:
-                used_slugs.add(base)
-                return base
-            index = 2
-            while f"{base}-{index}" in used_slugs:
-                index += 1
-            slug = f"{base}-{index}"
-            used_slugs.add(slug)
-            return slug
 
         for item in rows:
             source_name = str(item.source_name or "").strip()
@@ -515,20 +1053,20 @@ class SettingsTransferService:
             seen_source_names.add(source_name)
 
             designer_id = None
-            designer_name = str(item.designer_name or "").strip()
+            designer_name = " ".join(str(item.designer_name or "").strip().split())
             if designer_name:
-                designer = designers_by_name.get(designer_name)
+                designer = designers_by_name.get(self._normalize_designer_key(designer_name))
                 if designer is None:
                     designer = Designer(
                         name=designer_name,
-                        slug=next_slug(designer_name),
+                        slug=_slugify_name(designer_name),
                         origin_kind="manual",
                         is_admin_touched=True,
                         is_enabled=True,
                     )
                     self.db.add(designer)
                     self.db.flush()
-                    designers_by_name[designer_name] = designer
+                    designers_by_name[self._normalize_designer_key(designer_name)] = designer
                 designer_id = int(designer.id)
 
             self.db.add(
@@ -536,8 +1074,8 @@ class SettingsTransferService:
                     source_name=source_name,
                     designer_name=(designer_name or source_name),
                     designer_id=designer_id,
-                    is_enabled=True,
-                    is_admin_touched=True,
+                    is_enabled=bool(item.is_enabled),
+                    is_admin_touched=bool(item.is_admin_touched),
                 )
             )
             inserted += 1

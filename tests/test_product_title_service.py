@@ -21,3 +21,11 @@ def test_display_title_uses_category_when_source_title_is_only_designer_name() -
         source_designer_name="Rick Owens",
         source_category_name="Wool Hoodie",
     ) == "Wool Hoodie"
+
+
+def test_display_title_uses_category_when_title_matches_designer_after_normalization() -> None:
+    assert ProductTitleService.display_title(
+        source_title="Rick-Owens™",
+        source_designer_name="Rick Owens",
+        source_category_name="Shield Wader Kiss Boots",
+    ) == "Shield Wader Kiss Boots"

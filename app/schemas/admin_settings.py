@@ -7,6 +7,17 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class SettingsTransferImageAssetEntry(BaseModel):
+    checksum_sha256: str = Field(min_length=64, max_length=64)
+    scope: str = Field(min_length=1, max_length=255)
+    file_name: str = Field(min_length=1, max_length=255)
+    mime_type: str = Field(min_length=1, max_length=255)
+    byte_size: int = Field(ge=0)
+    width_px: int | None = Field(default=None, ge=1, le=20000)
+    height_px: int | None = Field(default=None, ge=1, le=20000)
+    content_base64: str = Field(min_length=1)
+
+
 class WeightRuleKeywordRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=255)
 
@@ -186,8 +197,9 @@ class SettingsTransferSourceEntry(BaseModel):
     key: str = Field(min_length=1, max_length=255)
     name: str = Field(min_length=1, max_length=255)
     url: str = Field(min_length=1, max_length=2048)
-    adapter_key: str = Field(min_length=1, max_length=255)
+    adapter_key: str | None = Field(default=None, min_length=1, max_length=255)
     parser_config: dict = Field(default_factory=dict)
+    sort_priority: int = Field(ge=1, le=1000000)
     enabled: bool = True
     sync_enabled: bool = True
     dedup_enabled: bool = True
@@ -199,6 +211,7 @@ class SettingsTransferSourceEntry(BaseModel):
     promo_only_no_discount: bool = False
     buyout_surcharge_value: float | None = Field(default=None, ge=0.0, le=100000000.0)
     buyout_surcharge_currency: str | None = Field(default=None, min_length=3, max_length=3)
+    logo_asset_checksum: str | None = Field(default=None, min_length=64, max_length=64)
 
 
 class SettingsTransferWeightRuleEntry(BaseModel):
@@ -209,10 +222,69 @@ class SettingsTransferWeightRuleEntry(BaseModel):
 class SettingsTransferDesignerSourceNameEntry(BaseModel):
     source_name: str = Field(min_length=1, max_length=255)
     designer_name: str | None = Field(default=None, min_length=1, max_length=255)
+    is_enabled: bool = True
+    is_admin_touched: bool = False
+
+
+class SettingsTransferDesignerEntry(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    slug: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+    origin_kind: Literal["auto", "manual"] = "manual"
+    is_admin_touched: bool = False
+    is_enabled: bool = True
+
+
+class SettingsTransferTaxonomyFilterNode(BaseModel):
+    slug: str = Field(min_length=1, max_length=255)
+    title: str = Field(min_length=1)
+    display_title: str | None = None
+    mobile_pair_slug: str | None = Field(default=None, min_length=1, max_length=255)
+    node_kind: Literal["filter", "multifilter"] = "filter"
+    is_enabled: bool = True
+    local_category_keywords: list[str] = Field(default_factory=list)
+    title_keywords: list[str] = Field(default_factory=list)
+    children: list["SettingsTransferTaxonomyFilterNode"] = Field(default_factory=list)
+
+
+class SettingsTransferTaxonomyCustomCatalog(BaseModel):
+    slug: str = Field(min_length=1, max_length=255)
+    title: str = Field(min_length=1)
+    description: str | None = None
+    is_enabled: bool = True
+
+
+class SettingsTransferTaxonomyShowcaseAttachment(BaseModel):
+    kind: Literal["filter", "custom_catalog"]
+    filter_slug: str | None = Field(default=None, min_length=1, max_length=255)
+    custom_catalog_slug: str | None = Field(default=None, min_length=1, max_length=255)
+    hidden_filter_slugs: list[str] = Field(default_factory=list)
+
+
+class SettingsTransferTaxonomyShowcaseCategory(BaseModel):
+    code: str = Field(min_length=1, max_length=32)
+    title: str = Field(min_length=1)
+    attachments: list[SettingsTransferTaxonomyShowcaseAttachment] = Field(default_factory=list)
+
+
+class SettingsTransferTaxonomyState(BaseModel):
+    filters: list[SettingsTransferTaxonomyFilterNode] = Field(default_factory=list)
+    custom_catalogs: list[SettingsTransferTaxonomyCustomCatalog] = Field(default_factory=list)
+    showcase_categories: list[SettingsTransferTaxonomyShowcaseCategory] = Field(default_factory=list)
+
+
+class SettingsTransferShowcaseCarouselEntry(BaseModel):
+    asset_checksum: str = Field(min_length=64, max_length=64)
+    position: int = Field(ge=1, le=1000)
+
+
+class SettingsTransferShowcaseMedia(BaseModel):
+    hero_asset_checksum: str | None = Field(default=None, min_length=64, max_length=64)
+    carousel: list[SettingsTransferShowcaseCarouselEntry] = Field(default_factory=list)
 
 
 class SettingsTransferPayload(BaseModel):
-    schema_version: int = Field(default=3, ge=1, le=1000)
+    schema_version: int = Field(default=4, ge=1, le=1000)
     exported_at: str | None = None
     project: str | None = None
     pricing_settings: SettingsTransferPricingSettings
@@ -220,7 +292,11 @@ class SettingsTransferPayload(BaseModel):
     suppliers: list[SettingsTransferSupplierEntry] = Field(default_factory=list)
     sources: list[SettingsTransferSourceEntry] = Field(default_factory=list)
     weight_rules: list[SettingsTransferWeightRuleEntry] = Field(default_factory=list)
+    designers: list[SettingsTransferDesignerEntry] = Field(default_factory=list)
     designer_source_names: list[SettingsTransferDesignerSourceNameEntry] = Field(default_factory=list)
+    taxonomy: SettingsTransferTaxonomyState = Field(default_factory=SettingsTransferTaxonomyState)
+    showcase_media: SettingsTransferShowcaseMedia = Field(default_factory=SettingsTransferShowcaseMedia)
+    image_assets: list[SettingsTransferImageAssetEntry] = Field(default_factory=list)
 
 
 class SettingsTransferResponse(BaseModel):
@@ -229,3 +305,6 @@ class SettingsTransferResponse(BaseModel):
     schema_version: int
     imported_at: str
     imported_counts: dict[str, int] = Field(default_factory=dict)
+
+
+SettingsTransferTaxonomyFilterNode.model_rebuild()

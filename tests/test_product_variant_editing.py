@@ -8,6 +8,7 @@ from app.models import Designer, DesignerSourceName, ImageAsset, Product, Produc
 from app.services.catalog.product_ingest_service import ProductIngestService
 from app.services.catalog.product_query_service import ProductQueryService
 from app.services.catalog.product_write_service import ProductWriteService
+from app.services.settings.weight_rule_service import WeightRuleService
 
 
 def _create_manual_product(db) -> int:
@@ -160,6 +161,56 @@ def test_product_write_service_allows_variant_editing_for_personal_manual_produc
         assert [row.title for row in rows] == ["S", "M"]
         assert [int(row.price_amount) for row in rows] == [1200, 1300]
         assert [bool(row.is_orderable) for row in rows] == [True, False]
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_manual_rub_only_variants_make_weight_optional_and_remove_missing_weight_from_settings() -> None:
+    db = SessionLocal()
+    try:
+        product_id = ProductWriteService(db).create_manual_product(
+            {
+                "title": "Manual no weight RUB product",
+                "description_text": "Description",
+                "designer_name": "Designer",
+                "source_category_name": "Category",
+                "gender": "unisex",
+                "availability_mode": "by_order",
+                "visibility_status": "visible",
+                "orderability_status": "orderable",
+                "variants": [{"title": "Default", "price": 100, "currency": "USD", "available": True}],
+                "manual_image_asset_ids": [],
+            }
+        )
+        db.flush()
+
+        product = db.query(Product).filter(Product.id == product_id).one()
+        primary_listing = product.primary_listing
+        assert primary_listing is not None
+        assert primary_listing.orderability_status == "unavailable"
+        assert primary_listing.status_reason == "missing_weight"
+
+        ProductWriteService(db).update_manual_variants(
+            product_id=product_id,
+            variants=[
+                {"title": "S", "price": 1200, "currency": "RUB", "available": True},
+                {"title": "M", "price": 1300, "currency": "RUB", "available": False},
+            ],
+        )
+        db.flush()
+        db.refresh(product)
+        db.refresh(primary_listing)
+
+        assert primary_listing.orderability_status == "orderable"
+        assert primary_listing.status_reason is None
+        assert product.weight_rule_id is None
+
+        missing_ids = {
+            int(item.id)
+            for item in WeightRuleService(db).list_missing_weight_products(limit=500, offset=0)
+        }
+        assert product_id not in missing_ids
     finally:
         db.rollback()
         db.close()

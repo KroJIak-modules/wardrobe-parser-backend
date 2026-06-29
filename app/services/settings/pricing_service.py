@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings as app_settings
-from app.models import AdminUiSettings, Supplier
+from app.models import AdminUiSettings, PricingSetting, Supplier
 from app.repositories import CatalogPricingSettingsRepository, CatalogSourceRepository, CatalogSupplierRepository
 from app.schemas.admin_settings import (
     AdminUiSettingsResponse,
@@ -26,6 +26,7 @@ from app.schemas.admin_settings import (
     PricingSupplierResponse,
     PricingSupplierUpdateRequest,
 )
+from app.services.settings.default_admin_settings import DefaultAdminSettingsLoader
 from app.services.settings.bybit_rate_provider import BybitP2PRateProvider
 
 _FORMULA_LINES = [
@@ -98,6 +99,73 @@ class PricingSettingsService:
         self.repo = CatalogPricingSettingsRepository(db)
         self.supplier_repo = CatalogSupplierRepository(db)
         self.source_repo = CatalogSourceRepository(db)
+
+    def _get_or_create_pricing_entity(self) -> tuple[PricingSetting, bool]:
+        current = self.repo.get_singleton()
+        if current is not None:
+            return current, False
+        seed = DefaultAdminSettingsLoader.load().pricing_settings
+        entity = PricingSetting(
+            id=1,
+            markup_multiplier=float(seed.markup_multiplier),
+            weight_tolerance=float(seed.weight_tolerance),
+            customs_threshold_eur=float(seed.customs_threshold_eur),
+            customs_duty_rate=float(seed.customs_duty_rate),
+            eur_to_rub_rate=float(seed.eur_to_rub_rate),
+            usd_to_rub_rate=float(seed.usd_to_rub_rate),
+            usdt_to_rub_rate=float(seed.usdt_to_rub_rate),
+            usdt_extra_rub=float(seed.usdt_extra_rub),
+            payment_fee_rate=float(seed.payment_fee_rate),
+            customs_processing_rate=float(seed.customs_processing_rate),
+            customs_fixed_rub=float(seed.customs_fixed_rub),
+            tax_rate=float(seed.tax_rate),
+            final_rounding_mode=str(seed.final_rounding_mode),
+            bybit_bucket_rates=[],
+        )
+        self.db.add(entity)
+        self.db.flush()
+        return entity, True
+
+    def _get_or_create_admin_ui_entity(self) -> tuple[AdminUiSettings, bool]:
+        entity = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
+        if entity is not None:
+            return entity, False
+        seed = DefaultAdminSettingsLoader.load().admin_ui_settings
+        entity = AdminUiSettings(
+            id=1,
+            auto_sync_period_minutes=int(seed.auto_sync_period_minutes),
+        )
+        self.db.add(entity)
+        self.db.flush()
+        return entity, True
+
+    def reset_to_seed(self) -> None:
+        seed = DefaultAdminSettingsLoader.load()
+        pricing, _ = self._get_or_create_pricing_entity()
+        pricing.markup_multiplier = float(seed.pricing_settings.markup_multiplier)
+        pricing.weight_tolerance = float(seed.pricing_settings.weight_tolerance)
+        pricing.customs_threshold_eur = float(seed.pricing_settings.customs_threshold_eur)
+        pricing.customs_duty_rate = float(seed.pricing_settings.customs_duty_rate)
+        pricing.eur_to_rub_rate = float(seed.pricing_settings.eur_to_rub_rate)
+        pricing.usd_to_rub_rate = float(seed.pricing_settings.usd_to_rub_rate)
+        pricing.usdt_to_rub_rate = float(seed.pricing_settings.usdt_to_rub_rate)
+        pricing.usdt_extra_rub = float(seed.pricing_settings.usdt_extra_rub)
+        pricing.payment_fee_rate = float(seed.pricing_settings.payment_fee_rate)
+        pricing.customs_processing_rate = float(seed.pricing_settings.customs_processing_rate)
+        pricing.customs_fixed_rub = float(seed.pricing_settings.customs_fixed_rub)
+        pricing.tax_rate = float(seed.pricing_settings.tax_rate)
+        pricing.final_rounding_mode = str(seed.pricing_settings.final_rounding_mode)
+        pricing.bybit_bucket_rates = []
+        pricing.bybit_last_updated_at = None
+        pricing.bybit_last_error = None
+
+        admin_ui, _ = self._get_or_create_admin_ui_entity()
+        admin_ui.auto_sync_period_minutes = int(seed.admin_ui_settings.auto_sync_period_minutes)
+        admin_ui.auto_sync_next_run_at = None
+        admin_ui.auto_sync_last_started_at = None
+        admin_ui.auto_sync_last_finished_at = None
+        admin_ui.auto_sync_last_status = None
+        admin_ui.auto_sync_last_error = None
 
     @staticmethod
     def _normalize_currency(raw: str | None, *, default: str = "RUB", allowed: set[str] | None = None) -> str:
@@ -211,8 +279,8 @@ class PricingSettingsService:
     @classmethod
     def _effective_rates_from_entity(cls, entity) -> tuple[float, float]:
         return cls._effective_fx_rates(
-            usd_to_rub_rate=float(getattr(entity, "usd_to_rub_rate", 95.0) or 95.0),
-            eur_to_rub_rate=float(getattr(entity, "eur_to_rub_rate", 105.0) or 105.0),
+            usd_to_rub_rate=float(entity.usd_to_rub_rate),
+            eur_to_rub_rate=float(entity.eur_to_rub_rate),
         )
 
     @classmethod
@@ -277,46 +345,6 @@ class PricingSettingsService:
                 break
         return result
 
-    @classmethod
-    def _coerce_settings_defaults(cls, entity) -> bool:
-        changed = False
-
-        if getattr(entity, "usdt_to_rub_rate", None) is None:
-            entity.usdt_to_rub_rate = 95.0
-            changed = True
-        if getattr(entity, "usdt_extra_rub", None) is None:
-            entity.usdt_extra_rub = 1.0
-            changed = True
-        if getattr(entity, "usd_to_rub_rate", None) is None:
-            entity.usd_to_rub_rate = float(getattr(entity, "usdt_to_rub_rate", 95.0) or 95.0)
-            changed = True
-        if getattr(entity, "eur_to_rub_rate", None) is None:
-            entity.eur_to_rub_rate = float(getattr(entity, "usd_to_rub_rate", 95.0) or 95.0) * 1.18
-            changed = True
-        normalized_rounding_mode = cls._normalize_final_rounding_mode(
-            getattr(entity, "final_rounding_mode", None),
-            default="unit",
-        )
-        if normalized_rounding_mode != getattr(entity, "final_rounding_mode", None):
-            entity.final_rounding_mode = normalized_rounding_mode
-            changed = True
-        if getattr(entity, "payment_fee_rate", None) is None:
-            entity.payment_fee_rate = 0.02
-            changed = True
-        if getattr(entity, "customs_processing_rate", None) is None:
-            entity.customs_processing_rate = 0.08
-            changed = True
-        if getattr(entity, "customs_fixed_rub", None) is None:
-            entity.customs_fixed_rub = 540.0
-            changed = True
-        if getattr(entity, "tax_rate", None) is None:
-            entity.tax_rate = 0.06
-            changed = True
-        if not isinstance(getattr(entity, "bybit_bucket_rates", None), list):
-            entity.bybit_bucket_rates = []
-
-        return changed
-
     @staticmethod
     def _refresh_bybit_rate(entity) -> tuple[bool, str, Any | None, str | None]:
         if not app_settings.pricing_bybit_rate_auto_enabled:
@@ -380,8 +408,7 @@ class PricingSettingsService:
         return True, "live_updated", snapshot, None
 
     def get_settings(self, *, refresh_bybit: bool = True) -> PricingSettingsResponse:
-        entity, created = self.repo.get_or_create_default()
-        defaults_changed = self._coerce_settings_defaults(entity)
+        entity, created = self._get_or_create_pricing_entity()
         bybit_status = "skipped"
         bybit_warning = None
         bybit_snapshot = None
@@ -398,7 +425,7 @@ class PricingSettingsService:
             bybit_error = str(getattr(entity, "bybit_last_error", "") or "") or None
             if bybit_error:
                 bybit_warning = f"WARN: Bybit временно недоступен, используется сохраненный курс. Причина: {bybit_error}"
-        if created or defaults_changed or bybit_changed:
+        if created or bybit_changed:
             self.db.commit()
             self.db.refresh(entity)
         suppliers = self.supplier_repo.list_all_with_rates()
@@ -412,7 +439,7 @@ class PricingSettingsService:
         )
 
     def update_settings(self, payload: PricingSettingsUpdateRequest) -> PricingSettingsResponse:
-        entity, created = self.repo.get_or_create_default()
+        entity, created = self._get_or_create_pricing_entity()
         patch = payload.model_dump(exclude_none=True)
         if "final_rounding_mode" in patch:
             patch["final_rounding_mode"] = self._normalize_final_rounding_mode(
@@ -421,9 +448,8 @@ class PricingSettingsService:
             )
         for key, value in patch.items():
             setattr(entity, key, value)
-        defaults_changed = self._coerce_settings_defaults(entity)
         self.db.commit()
-        if created or patch or defaults_changed:
+        if created or patch:
             self.db.refresh(entity)
         suppliers = self.supplier_repo.list_all_with_rates()
         return self._to_response(entity, suppliers=suppliers)
@@ -464,18 +490,18 @@ class PricingSettingsService:
             weight_tolerance=float(entity.weight_tolerance),
             customs_threshold_eur=float(entity.customs_threshold_eur),
             customs_duty_rate=float(entity.customs_duty_rate),
-            eur_to_rub_rate=float(getattr(entity, "eur_to_rub_rate", 105.0) or 105.0),
-            usd_to_rub_rate=float(getattr(entity, "usd_to_rub_rate", 95.0) or 95.0),
-            usdt_to_rub_rate=float(getattr(entity, "usdt_to_rub_rate", 95.0) or 95.0),
-            usdt_extra_rub=float(getattr(entity, "usdt_extra_rub", 1.0) or 1.0),
+            eur_to_rub_rate=float(entity.eur_to_rub_rate),
+            usd_to_rub_rate=float(entity.usd_to_rub_rate),
+            usdt_to_rub_rate=float(entity.usdt_to_rub_rate),
+            usdt_extra_rub=float(entity.usdt_extra_rub),
             final_rounding_mode=PricingSettingsService._normalize_final_rounding_mode(
-                getattr(entity, "final_rounding_mode", None),
+                str(entity.final_rounding_mode),
                 default="unit",
             ),
-            payment_fee_rate=float(getattr(entity, "payment_fee_rate", 0.02)),
-            customs_processing_rate=float(getattr(entity, "customs_processing_rate", 0.08)),
-            customs_fixed_rub=float(getattr(entity, "customs_fixed_rub", 540.0)),
-            tax_rate=float(getattr(entity, "tax_rate", 0.06)),
+            payment_fee_rate=float(entity.payment_fee_rate),
+            customs_processing_rate=float(entity.customs_processing_rate),
+            customs_fixed_rub=float(entity.customs_fixed_rub),
+            tax_rate=float(entity.tax_rate),
             bybit_rate_status=bybit_rate_status,
             bybit_rate_warning=bybit_rate_warning,
             bybit_bucket_step_usdt=int(app_settings.pricing_bybit_bucket_step_usdt),
@@ -499,14 +525,12 @@ class PricingSettingsService:
         )
 
     def get_admin_ui_settings(self) -> AdminUiSettingsResponse:
-        entity = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
-        if entity is None:
-            entity = AdminUiSettings(id=1)
-            self.db.add(entity)
+        entity, created = self._get_or_create_admin_ui_entity()
+        if created:
             self.db.commit()
             self.db.refresh(entity)
         return AdminUiSettingsResponse(
-            auto_sync_period_minutes=max(60, int(getattr(entity, "auto_sync_period_minutes", 60) or 60)),
+            auto_sync_period_minutes=int(entity.auto_sync_period_minutes),
             auto_sync_next_run_at=(
                 getattr(entity, "auto_sync_next_run_at", None).isoformat()
                 if getattr(entity, "auto_sync_next_run_at", None) is not None
@@ -530,14 +554,12 @@ class PricingSettingsService:
         patch = payload.model_dump(exclude_unset=True)
         reset_sync_timer = "auto_sync_period_minutes" in patch
         if "auto_sync_period_minutes" in patch:
-            patch["auto_sync_period_minutes"] = max(60, int(patch.get("auto_sync_period_minutes") or 60))
-        entity = self.db.query(AdminUiSettings).filter(AdminUiSettings.id == 1).one_or_none()
-        if entity is None:
-            entity = AdminUiSettings(id=1)
+            patch["auto_sync_period_minutes"] = int(patch.get("auto_sync_period_minutes"))
+        entity, _ = self._get_or_create_admin_ui_entity()
         for key, value in patch.items():
             setattr(entity, key, value)
         if reset_sync_timer:
-            period_minutes = max(60, int(getattr(entity, "auto_sync_period_minutes", 60) or 60))
+            period_minutes = int(entity.auto_sync_period_minutes)
             now_utc = datetime.now(timezone.utc)
             entity.auto_sync_next_run_at = now_utc + timedelta(minutes=period_minutes)
             entity.auto_sync_last_status = "scheduled"
@@ -596,7 +618,7 @@ class PricingSettingsService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Тариф не найден")
 
         patch = payload.model_dump(exclude_none=True)
-        settings_entity, _ = self.repo.get_or_create_default()
+        settings_entity, _ = self._get_or_create_pricing_entity()
         usd_to_rub_effective, eur_to_rub_effective = self._effective_rates_from_entity(settings_entity)
         for key in ("name",):
             if key in patch:
@@ -645,7 +667,7 @@ class PricingSettingsService:
             is_enabled=bool(payload.is_enabled),
         )
         supplier.key = self._build_supplier_key(int(supplier.id))
-        settings_entity, _ = self.repo.get_or_create_default()
+        settings_entity, _ = self._get_or_create_pricing_entity()
         usd_to_rub_effective, eur_to_rub_effective = self._effective_rates_from_entity(settings_entity)
         incoming_rates = self._normalize_shipping_rows(payload.rates or [])
         self.supplier_repo.replace_ranges(supplier_id=int(supplier.id), ranges=incoming_rates)

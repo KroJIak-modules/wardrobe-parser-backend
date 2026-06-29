@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, File, Header, UploadFile
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from fastapi.responses import FileResponse
@@ -53,6 +53,10 @@ class SupplierPatch(BaseModel):
 
 class SourceLogoPatch(BaseModel):
     logo_image_asset_id: int | None = None
+
+
+class SourceOrderPatch(BaseModel):
+    source_keys: list[str] = Field(default_factory=list)
 
 
 class InternalSourceEntryResponse(BaseModel):
@@ -121,6 +125,7 @@ def _source_payload(source: Source, counts_by_source_id: dict[int, dict[str, int
         "name": source.name,
         "base_url": source.base_url,
         "logo_image_asset_id": int(source.logo_image_asset_id) if source.logo_image_asset_id is not None else None,
+        "sort_priority": int(getattr(setting, "sort_priority", 0) or 0),
         "enabled": bool(getattr(setting, "is_enabled", True)),
         "sync_enabled": bool(getattr(setting, "is_sync_enabled", True)),
         "dedup_enabled": bool(getattr(setting, "dedup_enabled", True)),
@@ -165,6 +170,15 @@ def list_sources(db: Session = Depends(get_db)) -> list[dict]:
         _source_payload(source, counts_by_source_id)
         for source in sources
     ]
+
+
+@router.patch("/sources/order", dependencies=[Depends(require_permission("control.sources.edit"))])
+def patch_sources_order(payload: SourceOrderPatch, db: Session = Depends(get_db)) -> list[dict]:
+    registry = SourceRegistryService(db)
+    sources = registry.reorder_sources(payload.source_keys)
+    db.commit()
+    counts_by_source_id = _source_counts_by_id(db)
+    return [_source_payload(source, counts_by_source_id) for source in sources]
 
 
 @router.post("/sources/logo/upload", dependencies=[Depends(require_permission("control.sources.edit"))])

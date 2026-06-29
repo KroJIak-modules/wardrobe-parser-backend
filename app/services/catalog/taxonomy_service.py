@@ -37,14 +37,6 @@ from app.services.catalog.filter_assignment_service import ProductFilterAssignme
 
 
 class TaxonomyService:
-    _SHOWCASE_CATEGORY_SEED = {
-        "new": "Новинки",
-        "designers": "Дизайнеры",
-        "men": "Мужское",
-        "women": "Женское",
-        "sale": "Sale",
-    }
-
     def __init__(self, db: Session) -> None:
         self.db = db
         self.repo = CatalogTaxonomyRepository(db)
@@ -211,8 +203,9 @@ class TaxonomyService:
         def rewrite_nodes(nodes: list[TaxonomyFilterNode]) -> list[TaxonomyFilterNode]:
             out: list[TaxonomyFilterNode] = []
             for node in nodes:
-                old_slug = str(node.slug).strip()
-                new_slug = next_unique_slug(self._slugify(node.title), used_filter_slugs)
+                old_slug = self._clean_optional_slug(node.slug)
+                slug_seed = old_slug or self._slugify(node.title)
+                new_slug = next_unique_slug(slug_seed, used_filter_slugs)
                 if old_slug:
                     filter_slug_aliases[old_slug] = new_slug
                 filter_slug_aliases[new_slug] = new_slug
@@ -259,8 +252,9 @@ class TaxonomyService:
         prepared_filters = rewrite_mobile_pairs(rewrite_nodes(payload.filters))
         prepared_catalogs: list[TaxonomyCustomCatalog] = []
         for catalog in payload.custom_catalogs:
-            old_slug = str(catalog.slug).strip()
-            new_slug = next_unique_slug(self._slugify(catalog.title), used_catalog_slugs)
+            old_slug = self._clean_optional_slug(catalog.slug)
+            slug_seed = old_slug or self._slugify(catalog.title)
+            new_slug = next_unique_slug(slug_seed, used_catalog_slugs)
             if old_slug:
                 catalog_slug_aliases[old_slug] = new_slug
             catalog_slug_aliases[new_slug] = new_slug
@@ -434,12 +428,17 @@ class TaxonomyService:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Duplicate custom catalog slug: {slug}")
             catalogs_by_slug[slug] = catalog
 
+        allowed_showcase_codes = {
+            str(category.code).strip()
+            for category in self.repo.list_showcase_categories()
+            if str(category.code or "").strip()
+        }
         category_codes: set[str] = set()
         for showcase_category in payload.showcase_categories:
             code = str(showcase_category.code).strip()
             if code in category_codes:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Duplicate showcase category code: {code}")
-            if code not in self._SHOWCASE_CATEGORY_SEED:
+            if code not in allowed_showcase_codes:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Unknown showcase category code: {code}")
             category_codes.add(code)
             for attachment in showcase_category.attachments:
@@ -547,7 +546,7 @@ class TaxonomyService:
                 category_entity = seeded_categories.get(str(showcase_category.code).strip())
                 if category_entity is None:
                     raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Unknown showcase category code: {showcase_category.code}")
-                category_entity.title = self._SHOWCASE_CATEGORY_SEED.get(str(showcase_category.code).strip(), str(showcase_category.title).strip())
+                category_entity.title = str(showcase_category.title).strip()
                 for position, attachment in enumerate(showcase_category.attachments, start=1):
                     attachment_entity = ShowcaseCategoryAttachment(
                         showcase_category_id=int(category_entity.id),
