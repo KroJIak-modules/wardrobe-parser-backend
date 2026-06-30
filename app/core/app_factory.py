@@ -32,18 +32,14 @@ _PUBLIC_OPENAPI_PATHS = {
     "/api/v1/products/{product_id}",
     "/api/v1/products/images/{image_id}",
     "/api/v1/showcase/state",
-    "/api/v1/showcase/hero/image",
-    "/api/v1/showcase/carousel",
-    "/api/v1/showcase/carousel/{image_id}/image",
+    "/api/v1/showcase/media/{asset_id}/file",
 }
 _PUBLIC_OPENAPI_OPERATIONS = {
     "/health": {"get"},
     "/api/v1/products/{product_id}": {"get"},
     "/api/v1/products/images/{image_id}": {"get"},
     "/api/v1/showcase/state": {"get"},
-    "/api/v1/showcase/hero/image": {"get"},
-    "/api/v1/showcase/carousel": {"get"},
-    "/api/v1/showcase/carousel/{image_id}/image": {"get"},
+    "/api/v1/showcase/media/{asset_id}/file": {"get"},
 }
 
 

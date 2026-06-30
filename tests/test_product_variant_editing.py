@@ -92,6 +92,7 @@ def test_manual_product_creation_keeps_only_uploaded_gallery_rows() -> None:
     marker = uuid4().hex
     try:
         asset = ImageAsset(
+            scope="products",
             storage_key=f"products/tests/{marker}.jpg",
             mime_type="image/jpeg",
             byte_size=128,
@@ -347,6 +348,7 @@ def test_sync_bound_creation_does_not_duplicate_source_images_with_uploaded_asse
     marker = uuid4().hex
     try:
         asset = ImageAsset(
+            scope="products",
             storage_key=f"products/tests/{marker}.jpg",
             mime_type="image/jpeg",
             byte_size=128,

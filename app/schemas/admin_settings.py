@@ -62,25 +62,6 @@ class PricingSettingsUpdateRequest(BaseModel):
     tax_rate: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
-class ShowcaseMediaSettingsUpdateRequest(BaseModel):
-    hero_image_asset_id: int | None = None
-    carousel_image_asset_ids: list[int] | None = None
-
-
-class ShowcaseMediaSettingsResponse(BaseModel):
-    hero_image_asset_id: int | None = None
-    carousel_image_asset_ids: list[int] = Field(default_factory=list)
-    carousel_limit: int = 20
-
-
-class ShowcaseHeroSetRequest(BaseModel):
-    image_asset_id: int = Field(ge=1)
-
-
-class ShowcaseCarouselOrderRequest(BaseModel):
-    items: list[int] = Field(default_factory=list)
-
-
 class AdminUiSettingsResponse(BaseModel):
     auto_sync_period_minutes: int = Field(ge=60, le=1_000_000, default=60)
     auto_sync_next_run_at: str | None = None
@@ -275,16 +256,19 @@ class SettingsTransferTaxonomyState(BaseModel):
 
 class SettingsTransferShowcaseCarouselEntry(BaseModel):
     asset_checksum: str = Field(min_length=64, max_length=64)
+    viewport: Literal["desktop", "mobile"]
     position: int = Field(ge=1, le=1000)
 
 
 class SettingsTransferShowcaseMedia(BaseModel):
-    hero_asset_checksum: str | None = Field(default=None, min_length=64, max_length=64)
-    carousel: list[SettingsTransferShowcaseCarouselEntry] = Field(default_factory=list)
+    desktop_hero_asset_checksum: str | None = Field(default=None, min_length=64, max_length=64)
+    mobile_hero_asset_checksum: str | None = Field(default=None, min_length=64, max_length=64)
+    desktop_carousel: list[SettingsTransferShowcaseCarouselEntry] = Field(default_factory=list)
+    mobile_carousel: list[SettingsTransferShowcaseCarouselEntry] = Field(default_factory=list)
 
 
 class SettingsTransferPayload(BaseModel):
-    schema_version: int = Field(default=4, ge=1, le=1000)
+    schema_version: int = Field(default=5, ge=1, le=1000)
     exported_at: str | None = None
     project: str | None = None
     pricing_settings: SettingsTransferPricingSettings

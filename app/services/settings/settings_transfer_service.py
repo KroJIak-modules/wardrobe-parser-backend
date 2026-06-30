@@ -39,6 +39,7 @@ from app.services.catalog.designer_support import slugify_designer_name
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.catalog_defaults_service import CatalogDefaultsService
 from app.services.catalog.media_asset_service import MediaAssetService
+from app.services.catalog.showcase_service import ShowcaseService
 from app.services.catalog.source_registry_service import SourceRegistryService
 from app.services.catalog.taxonomy_service import TaxonomyService
 from app.core.source_identity import normalize_base_url
@@ -71,8 +72,9 @@ from app.schemas.admin_settings import (
     SettingsTransferShowcaseMedia,
     SettingsTransferWeightRuleEntry,
 )
+from app.schemas.showcase_media import ShowcaseStateUpdateRequest
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _PROJECT_NAME = "wardrobe-parser-platform"
 
 _PRICING_EXPORT_FIELDS = [
@@ -139,8 +141,11 @@ class SettingsTransferService:
         return " ".join(str(raw or "").strip().split()).lower()
 
     @staticmethod
-    def _asset_scope_for_storage_key(storage_key: str | None, *, fallback: str) -> str:
-        raw = str(storage_key or "").strip()
+    def _asset_scope_for_export(asset: ImageAsset, *, fallback: str) -> str:
+        explicit_scope = str(getattr(asset, "scope", "") or "").strip()
+        if explicit_scope:
+            return explicit_scope
+        raw = str(getattr(asset, "storage_key", "") or "").strip()
         if not raw or "/" not in raw:
             return fallback
         prefix = raw.split("/", 1)[0].strip()
@@ -155,24 +160,26 @@ class SettingsTransferService:
         return file_name or fallback
 
     def _export_image_assets(self, assets: list[tuple[ImageAsset, str]]) -> list[SettingsTransferImageAssetEntry]:
-        seen_checksums: set[str] = set()
+        seen_asset_keys: set[tuple[str, str]] = set()
         entries: list[SettingsTransferImageAssetEntry] = []
         for asset, default_scope in assets:
             checksum = str(getattr(asset, "checksum_sha256", "") or "").strip()
-            if not checksum or checksum in seen_checksums:
+            scope = self._asset_scope_for_export(asset, fallback=default_scope)
+            asset_key = (scope, checksum)
+            if not checksum or asset_key in seen_asset_keys:
                 continue
             file_path = self.media_assets.resolve_file_path(asset)
             if not file_path.exists():
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Файл изображения не найден: {asset.storage_key}",
+                    detail=f"Медиафайл не найден: {asset.storage_key}",
                 )
             content = file_path.read_bytes()
-            seen_checksums.add(checksum)
+            seen_asset_keys.add(asset_key)
             entries.append(
                 SettingsTransferImageAssetEntry(
                     checksum_sha256=checksum,
-                    scope=self._asset_scope_for_storage_key(getattr(asset, "storage_key", None), fallback=default_scope),
+                    scope=scope,
                     file_name=self._asset_file_name(getattr(asset, "storage_key", None), fallback=f"{checksum}.bin"),
                     mime_type=str(getattr(asset, "mime_type", "") or "application/octet-stream"),
                     byte_size=int(getattr(asset, "byte_size", 0) or 0),
@@ -265,7 +272,11 @@ class SettingsTransferService:
         suppliers = self.supplier_repo.list_all_with_rates()
         sources = SourceRegistryService(self.db).list_all()
         weight_rules = self.weight_rule_repo.list_active()
-        showcase_media_settings = self.db.query(ShowcaseCarouselImage).order_by(ShowcaseCarouselImage.position.asc(), ShowcaseCarouselImage.id.asc()).all()
+        showcase_media_settings = (
+            self.db.query(ShowcaseCarouselImage)
+            .order_by(ShowcaseCarouselImage.viewport.asc(), ShowcaseCarouselImage.position.asc(), ShowcaseCarouselImage.id.asc())
+            .all()
+        )
         showcase_setting = self.db.query(ShowcaseSetting).order_by(ShowcaseSetting.id.asc()).first()
 
         supplier_by_id = {int(supplier.id): supplier for supplier in suppliers}
@@ -376,8 +387,10 @@ class SettingsTransferService:
             )
             for rule in weight_rules
         ]
-        if getattr(showcase_setting, "hero_image_asset", None) is not None:
-            export_assets.append((showcase_setting.hero_image_asset, "showcase"))
+        if getattr(showcase_setting, "desktop_hero_image_asset", None) is not None:
+            export_assets.append((showcase_setting.desktop_hero_image_asset, "showcase"))
+        if getattr(showcase_setting, "mobile_hero_image_asset", None) is not None:
+            export_assets.append((showcase_setting.mobile_hero_image_asset, "showcase"))
         for row in showcase_media_settings:
             if getattr(row, "image_asset", None) is not None:
                 export_assets.append((row.image_asset, "showcase"))
@@ -414,18 +427,33 @@ class SettingsTransferService:
             ],
             taxonomy=self._export_taxonomy(),
             showcase_media=SettingsTransferShowcaseMedia(
-                hero_asset_checksum=(
-                    str(showcase_setting.hero_image_asset.checksum_sha256)
-                    if getattr(showcase_setting, "hero_image_asset", None) is not None
+                desktop_hero_asset_checksum=(
+                    str(showcase_setting.desktop_hero_image_asset.checksum_sha256)
+                    if getattr(showcase_setting, "desktop_hero_image_asset", None) is not None
                     else None
                 ),
-                carousel=[
+                mobile_hero_asset_checksum=(
+                    str(showcase_setting.mobile_hero_image_asset.checksum_sha256)
+                    if getattr(showcase_setting, "mobile_hero_image_asset", None) is not None
+                    else None
+                ),
+                desktop_carousel=[
                     SettingsTransferShowcaseCarouselEntry(
                         asset_checksum=str(row.image_asset.checksum_sha256),
+                        viewport="desktop",
                         position=int(row.position),
                     )
                     for row in showcase_media_settings
-                    if getattr(row, "image_asset", None) is not None
+                    if getattr(row, "image_asset", None) is not None and str(getattr(row, "viewport", "") or "") == "desktop"
+                ],
+                mobile_carousel=[
+                    SettingsTransferShowcaseCarouselEntry(
+                        asset_checksum=str(row.image_asset.checksum_sha256),
+                        viewport="mobile",
+                        position=int(row.position),
+                    )
+                    for row in showcase_media_settings
+                    if getattr(row, "image_asset", None) is not None and str(getattr(row, "viewport", "") or "") == "mobile"
                 ],
             ),
             image_assets=self._export_image_assets(export_assets),
@@ -552,38 +580,47 @@ class SettingsTransferService:
             },
         )
 
-    def _import_image_assets(self, assets: list[SettingsTransferImageAssetEntry]) -> tuple[dict[str, ImageAsset], list[ImageAsset]]:
-        result: dict[str, ImageAsset] = {}
+    def _import_image_assets(self, assets: list[SettingsTransferImageAssetEntry]) -> tuple[dict[tuple[str, str], ImageAsset], list[ImageAsset]]:
+        result: dict[tuple[str, str], ImageAsset] = {}
         created_assets: list[ImageAsset] = []
-        seen_checksums: set[str] = set()
+        seen_asset_keys: set[tuple[str, str]] = set()
         for item in assets:
+            scope = self.media_assets.normalize_scope(item.scope)
             checksum = str(item.checksum_sha256 or "").strip()
-            if not checksum or checksum in seen_checksums:
+            asset_key = (scope, checksum)
+            if not checksum or asset_key in seen_asset_keys:
                 continue
-            seen_checksums.add(checksum)
-            existing = self.db.query(ImageAsset).filter(ImageAsset.checksum_sha256 == checksum).one_or_none()
+            seen_asset_keys.add(asset_key)
+            existing = (
+                self.db.query(ImageAsset)
+                .filter(
+                    ImageAsset.scope == scope,
+                    ImageAsset.checksum_sha256 == checksum,
+                )
+                .one_or_none()
+            )
             if existing is not None:
-                result[checksum] = existing
+                result[asset_key] = existing
                 continue
             try:
                 content = base64.b64decode(item.content_base64.encode("ascii"), validate=True)
             except Exception as exc:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Не удалось прочитать изображение {checksum}: {exc}",
+                    detail=f"Не удалось прочитать медиафайл {checksum}: {exc}",
                 ) from exc
             actual_checksum = sha256(content).hexdigest()
             if actual_checksum != checksum:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Контрольная сумма изображения не совпадает для {checksum}.",
+                    detail=f"Контрольная сумма медиафайла не совпадает для {checksum}.",
                 )
             asset = self.media_assets.save_bytes(
-                scope=str(item.scope or "assets").strip() or "assets",
+                scope=scope,
                 file_name=str(item.file_name or "").strip() or f"{checksum}.bin",
                 content=content,
             )
-            result[checksum] = asset
+            result[asset_key] = asset
             created_assets.append(asset)
         return result, created_assets
 
@@ -596,12 +633,14 @@ class SettingsTransferService:
     @staticmethod
     def _require_asset_checksum(
         *,
-        asset_map: dict[str, ImageAsset],
+        asset_map: dict[tuple[str, str], ImageAsset],
         checksum: str,
+        expected_scope: str,
         field_label: str,
     ) -> ImageAsset:
+        scope = MediaAssetService.normalize_scope(expected_scope)
         normalized = str(checksum or "").strip()
-        asset = asset_map.get(normalized)
+        asset = asset_map.get((scope, normalized))
         if asset is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -688,42 +727,83 @@ class SettingsTransferService:
         self,
         payload: SettingsTransferShowcaseMedia,
         *,
-        asset_map: dict[str, ImageAsset],
+        asset_map: dict[tuple[str, str], ImageAsset],
     ) -> int:
         settings = self.db.query(ShowcaseSetting).order_by(ShowcaseSetting.id.asc()).first()
         if settings is None:
             settings = ShowcaseSetting(id=1)
             self.db.add(settings)
             self.db.flush()
-        hero_checksum = str(payload.hero_asset_checksum or "").strip()
-        settings.hero_image_asset_id = (
-            int(self._require_asset_checksum(asset_map=asset_map, checksum=hero_checksum, field_label="Главное изображение витрины").id)
-            if hero_checksum
-            else None
-        )
-        self.db.query(ShowcaseCarouselImage).delete(synchronize_session=False)
-        self.db.flush()
-        linked = 1 if settings.hero_image_asset_id is not None else 0
-        seen_checksums: set[str] = set()
-        for position, item in enumerate(sorted(payload.carousel, key=lambda row: int(row.position)), start=1):
-            checksum = str(item.asset_checksum or "").strip()
-            if not checksum or checksum in seen_checksums:
-                continue
-            seen_checksums.add(checksum)
-            asset = self._require_asset_checksum(
-                asset_map=asset_map,
-                checksum=checksum,
-                field_label=f"Изображение карусели #{position}",
-            )
-            self.db.add(
-                ShowcaseCarouselImage(
-                    image_asset_id=int(asset.id),
-                    position=position,
-                )
-            )
+        desktop_hero_checksum = str(payload.desktop_hero_asset_checksum or "").strip()
+        mobile_hero_checksum = str(payload.mobile_hero_asset_checksum or "").strip()
+        desktop_carousel = sorted(payload.desktop_carousel, key=lambda row: int(row.position))
+        mobile_carousel = sorted(payload.mobile_carousel, key=lambda row: int(row.position))
+
+        linked = 0
+        if desktop_hero_checksum:
             linked += 1
+        if mobile_hero_checksum:
+            linked += 1
+        linked += len({str(item.asset_checksum or "").strip() for item in desktop_carousel if str(item.asset_checksum or "").strip()})
+        linked += len({str(item.asset_checksum or "").strip() for item in mobile_carousel if str(item.asset_checksum or "").strip()})
+
+        state = ShowcaseService(self.db).replace_state(
+            ShowcaseStateUpdateRequest(
+                desktop={
+                    "hero_asset_id": (
+                        int(self._require_asset_checksum(
+                            asset_map=asset_map,
+                            checksum=desktop_hero_checksum,
+                            expected_scope="showcase",
+                            field_label="Компьютерная заставка",
+                        ).id)
+                        if desktop_hero_checksum else None
+                    ),
+                    "carousel_asset_ids": [
+                        int(
+                            self._require_asset_checksum(
+                                asset_map=asset_map,
+                                checksum=str(item.asset_checksum or "").strip(),
+                                expected_scope="showcase",
+                                field_label=f"Компьютерная карусель #{index}",
+                            ).id
+                        )
+                        for index, item in enumerate(desktop_carousel, start=1)
+                        if str(item.asset_checksum or "").strip()
+                    ],
+                },
+                mobile={
+                    "hero_asset_id": (
+                        int(self._require_asset_checksum(
+                            asset_map=asset_map,
+                            checksum=mobile_hero_checksum,
+                            expected_scope="showcase",
+                            field_label="Мобильная заставка",
+                        ).id)
+                        if mobile_hero_checksum else None
+                    ),
+                    "carousel_asset_ids": [
+                        int(
+                            self._require_asset_checksum(
+                                asset_map=asset_map,
+                                checksum=str(item.asset_checksum or "").strip(),
+                                expected_scope="showcase",
+                                field_label=f"Мобильная карусель #{index}",
+                            ).id
+                        )
+                        for index, item in enumerate(mobile_carousel, start=1)
+                        if str(item.asset_checksum or "").strip()
+                    ],
+                },
+            )
+        )
         self.db.flush()
-        return linked
+        return (
+            (1 if state.desktop.hero_asset is not None else 0)
+            + (1 if state.mobile.hero_asset is not None else 0)
+            + len(state.desktop.carousel_assets)
+            + len(state.mobile.carousel_assets)
+        )
 
     def _prune_sources(self, rows: list[SettingsTransferSourceEntry]) -> int:
         desired_keys = {
@@ -1002,7 +1082,7 @@ class SettingsTransferService:
             )
             logo_checksum = str(item.logo_asset_checksum or "").strip()
             existing.logo_image_asset_id = (
-                int(self._require_asset_checksum(asset_map=asset_map, checksum=logo_checksum, field_label=f"Логотип источника '{item.name}'").id)
+                int(self._require_asset_checksum(asset_map=asset_map, checksum=logo_checksum, expected_scope="sources", field_label=f"Логотип источника '{item.name}'").id)
                 if logo_checksum
                 else None
             )

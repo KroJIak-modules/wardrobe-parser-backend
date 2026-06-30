@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from app.core.database import SessionLocal
 from app.core.source_identity import normalize_base_url
-from app.models import Designer, DesignerSourceName, ImageAsset, ProductListing, Source, SourceSetting, Supplier
+from app.models import Designer, DesignerSourceName, ImageAsset, ProductListing, ShowcaseCarouselImage, ShowcaseSetting, Source, SourceSetting, Supplier
 from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.source_registry_service import SourceRegistryService
 from app.services.settings.settings_transfer_service import SettingsTransferService
@@ -28,8 +28,19 @@ def _image_entry(scope: str, file_name: str, content: bytes) -> dict[str, object
     }
 
 
+def _reset_showcase_media_state(db) -> None:
+    db.query(ShowcaseCarouselImage).delete(synchronize_session=False)
+    settings = db.query(ShowcaseSetting).order_by(ShowcaseSetting.id.asc()).first()
+    if settings is not None:
+        settings.desktop_hero_image_asset_id = None
+        settings.mobile_hero_image_asset_id = None
+    db.query(ImageAsset).filter(ImageAsset.storage_key.like("showcase/%")).delete(synchronize_session=False)
+    db.flush()
+
+
 def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and_showcase_media() -> None:
     db = SessionLocal()
+    _reset_showcase_media_state(db)
     service = SettingsTransferService(db)
     marker = uuid4().hex[:10]
     source_brand = f"Transfer Brand {marker}"
@@ -39,8 +50,9 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
     catalog_slug = f"transfer-catalog-{marker}"
     title_override = f"Витрина {marker}"
 
-    manual_logo_bytes = f"<svg xmlns='http://www.w3.org/2000/svg'><text>{marker}-logo</text></svg>".encode("utf-8")
-    hero_bytes = f"<svg xmlns='http://www.w3.org/2000/svg'><text>{marker}-hero</text></svg>".encode("utf-8")
+    shared_logo_hero_bytes = f"<svg xmlns='http://www.w3.org/2000/svg'><text>{marker}-shared</text></svg>".encode("utf-8")
+    manual_logo_bytes = shared_logo_hero_bytes
+    hero_bytes = shared_logo_hero_bytes
     carousel_bytes = f"<svg xmlns='http://www.w3.org/2000/svg'><text>{marker}-carousel</text></svg>".encode("utf-8")
     manual_logo_entry = _image_entry("sources", f"{marker}-logo.svg", manual_logo_bytes)
     hero_entry = _image_entry("showcase", f"{marker}-hero.svg", hero_bytes)
@@ -138,13 +150,16 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
         ]
 
         payload_data["showcase_media"] = {
-            "hero_asset_checksum": str(hero_entry["checksum_sha256"]),
-            "carousel": [
+            "desktop_hero_asset_checksum": str(hero_entry["checksum_sha256"]),
+            "mobile_hero_asset_checksum": None,
+            "desktop_carousel": [
                 {
                     "asset_checksum": str(carousel_entry["checksum_sha256"]),
+                    "viewport": "desktop",
                     "position": 1,
                 }
             ],
+            "mobile_carousel": [],
         }
 
         payload = original_payload.__class__.model_validate(payload_data)
@@ -171,12 +186,15 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
         assert any(item.filter_slug == filter_slug for item in exported_showcase_new.attachments if item.kind == "filter")
         assert any(item.custom_catalog_slug == catalog_slug for item in exported_showcase_new.attachments if item.kind == "custom_catalog")
 
-        assert exported.showcase_media.hero_asset_checksum == hero_entry["checksum_sha256"]
-        assert [item.asset_checksum for item in exported.showcase_media.carousel] == [carousel_entry["checksum_sha256"]]
-        exported_checksums = {item.checksum_sha256 for item in exported.image_assets}
-        assert str(manual_logo_entry["checksum_sha256"]) in exported_checksums
-        assert str(hero_entry["checksum_sha256"]) in exported_checksums
-        assert str(carousel_entry["checksum_sha256"]) in exported_checksums
+        assert exported.showcase_media.desktop_hero_asset_checksum == hero_entry["checksum_sha256"]
+        assert exported.showcase_media.mobile_hero_asset_checksum is None
+        assert [item.asset_checksum for item in exported.showcase_media.desktop_carousel] == [carousel_entry["checksum_sha256"]]
+        assert [item.viewport for item in exported.showcase_media.desktop_carousel] == ["desktop"]
+        assert exported.showcase_media.mobile_carousel == []
+        exported_asset_keys = {(item.scope, item.checksum_sha256) for item in exported.image_assets}
+        assert ("sources", str(manual_logo_entry["checksum_sha256"])) in exported_asset_keys
+        assert ("showcase", str(hero_entry["checksum_sha256"])) in exported_asset_keys
+        assert ("showcase", str(carousel_entry["checksum_sha256"])) in exported_asset_keys
     finally:
         SettingsTransferService(db).import_payload(restore_payload)
 
@@ -203,6 +221,7 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
 
 def test_settings_transfer_roundtrip_restores_pricing_ui_supplier_source_and_weight_rules() -> None:
     db = SessionLocal()
+    _reset_showcase_media_state(db)
     service = SettingsTransferService(db)
     original_payload = service.export_payload()
     restore_payload = original_payload.model_copy(deep=True)
@@ -323,6 +342,7 @@ def test_settings_transfer_roundtrip_restores_pricing_ui_supplier_source_and_wei
 
 def test_settings_transfer_import_of_exported_payload_is_idempotent_for_pricing_counts() -> None:
     db = SessionLocal()
+    _reset_showcase_media_state(db)
     service = SettingsTransferService(db)
     payload = service.export_payload()
 
@@ -343,6 +363,7 @@ def test_settings_transfer_import_of_exported_payload_is_idempotent_for_pricing_
 
 def test_settings_transfer_import_rejects_missing_logo_asset_checksum_reference() -> None:
     db = SessionLocal()
+    _reset_showcase_media_state(db)
     service = SettingsTransferService(db)
     payload = service.export_payload()
     payload_data = payload.model_dump()
@@ -362,6 +383,7 @@ def test_settings_transfer_import_rejects_missing_logo_asset_checksum_reference(
 
 def test_settings_transfer_failed_import_cleans_up_new_image_files() -> None:
     db = SessionLocal()
+    _reset_showcase_media_state(db)
     service = SettingsTransferService(db)
     payload = service.export_payload()
     payload_data = payload.model_dump()
@@ -369,7 +391,7 @@ def test_settings_transfer_failed_import_cleans_up_new_image_files() -> None:
     content = b"<svg xmlns='http://www.w3.org/2000/svg'><text>cleanup-check</text></svg>"
     checksum = sha256(content).hexdigest()
     payload_data["image_assets"].append(_image_entry("showcase", "cleanup-check.svg", content))
-    payload_data["showcase_media"]["hero_asset_checksum"] = checksum
+    payload_data["showcase_media"]["desktop_hero_asset_checksum"] = checksum
 
     broken_source = next(item for item in payload_data["sources"] if item["key"] != SourceRegistryService.MANUAL_SOURCE_KEY)
     broken_source["supplier_key"] = "missing-supplier-key"
@@ -392,6 +414,7 @@ def test_settings_transfer_failed_import_cleans_up_new_image_files() -> None:
 
 def test_settings_transfer_import_rejects_checksum_mismatch_image_asset() -> None:
     db = SessionLocal()
+    _reset_showcase_media_state(db)
     service = SettingsTransferService(db)
     payload = service.export_payload()
     payload_data = payload.model_dump()
@@ -403,14 +426,14 @@ def test_settings_transfer_import_rejects_checksum_mismatch_image_asset() -> Non
             "checksum_sha256": "a" * 64,
         }
     )
-    payload_data["showcase_media"]["hero_asset_checksum"] = "a" * 64
+    payload_data["showcase_media"]["desktop_hero_asset_checksum"] = "a" * 64
 
     try:
         SettingsTransferService(db).import_payload(payload.__class__.model_validate(payload_data))
         raise AssertionError("Expected import to fail on checksum mismatch")
     except HTTPException as exc:
         assert exc.status_code == 400
-        assert "Контрольная сумма изображения не совпадает" in str(exc.detail)
+        assert "Контрольная сумма медиафайла не совпадает" in str(exc.detail)
     finally:
         db.rollback()
         db.close()
@@ -418,6 +441,7 @@ def test_settings_transfer_import_rejects_checksum_mismatch_image_asset() -> Non
 
 def test_settings_transfer_import_prunes_unreferenced_source_supplier_and_designer_missing_from_file() -> None:
     db = SessionLocal()
+    _reset_showcase_media_state(db)
     marker = uuid4().hex[:10]
     extra_supplier_key = f"extra-supplier-{marker}"
     extra_source_key = f"extra-source-{marker}.example"
@@ -484,6 +508,7 @@ def test_settings_transfer_import_prunes_unreferenced_source_supplier_and_design
 
 def test_settings_transfer_import_rejects_missing_in_use_source() -> None:
     db = SessionLocal()
+    _reset_showcase_media_state(db)
     marker = uuid4().hex[:10]
     source_key = f"in-use-source-{marker}.example"
     source_url = f"https://{source_key}/"

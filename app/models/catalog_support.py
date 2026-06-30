@@ -24,6 +24,14 @@ from sqlalchemy.orm import relationship
 from app.core.database import Base
 
 
+def _image_asset_scope_from_storage_key(storage_key: str | None) -> str:
+    raw = str(storage_key or "").strip()
+    if not raw or "/" not in raw:
+        return "assets"
+    prefix = raw.split("/", 1)[0].strip()
+    return prefix or "assets"
+
+
 class Designer(Base):
     __tablename__ = "designers"
 
@@ -222,6 +230,7 @@ class ImageAsset(Base):
     __tablename__ = "image_assets"
 
     id = Column(BigInteger, primary_key=True)
+    scope = Column(String(255), nullable=False, default="assets", server_default="assets")
     storage_key = Column(String(2048), nullable=False)
     mime_type = Column(String(255), nullable=False)
     byte_size = Column(BigInteger, nullable=False)
@@ -231,19 +240,27 @@ class ImageAsset(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint("checksum_sha256", name="uq_image_assets_checksum_sha256"),
+        UniqueConstraint("scope", "checksum_sha256", name="uq_image_assets_scope_checksum_sha256"),
     )
+
+
+@event.listens_for(ImageAsset, "before_insert")
+@event.listens_for(ImageAsset, "before_update")
+def _sync_image_asset_scope(_mapper, _connection, target: ImageAsset) -> None:
+    target.scope = _image_asset_scope_from_storage_key(getattr(target, "storage_key", None))
 
 
 class ShowcaseSetting(Base):
     __tablename__ = "showcase_settings"
 
     id = Column(BigInteger, primary_key=True)
-    hero_image_asset_id = Column(BigInteger, ForeignKey("image_assets.id", ondelete="SET NULL"), nullable=True)
+    desktop_hero_image_asset_id = Column(BigInteger, ForeignKey("image_assets.id", ondelete="SET NULL"), nullable=True)
+    mobile_hero_image_asset_id = Column(BigInteger, ForeignKey("image_assets.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
-    hero_image_asset = relationship("ImageAsset")
+    desktop_hero_image_asset = relationship("ImageAsset", foreign_keys=[desktop_hero_image_asset_id])
+    mobile_hero_image_asset = relationship("ImageAsset", foreign_keys=[mobile_hero_image_asset_id])
 
 
 class ShowcaseCarouselImage(Base):
@@ -251,6 +268,7 @@ class ShowcaseCarouselImage(Base):
 
     id = Column(BigInteger, primary_key=True)
     image_asset_id = Column(BigInteger, ForeignKey("image_assets.id", ondelete="CASCADE"), nullable=False)
+    viewport = Column(String(16), nullable=False, default="desktop", server_default="desktop")
     position = Column(Integer, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -258,7 +276,8 @@ class ShowcaseCarouselImage(Base):
     image_asset = relationship("ImageAsset")
 
     __table_args__ = (
-        UniqueConstraint("position", name="uq_showcase_carousel_images_position"),
+        UniqueConstraint("viewport", "position", name="uq_showcase_carousel_images_viewport_position"),
+        CheckConstraint("viewport IN ('desktop', 'mobile')", name="ck_showcase_carousel_images_viewport"),
     )
 
 
