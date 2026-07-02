@@ -10,16 +10,18 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Product, ProductListing, Source
+from app.models import Filter, Product, ProductFilterAssignment, ProductListing, Source
+from app.repositories.catalog_filter_assignments import CatalogFilterAssignmentRepository
 from app.repositories import CatalogWeightRuleRepository
 from app.schemas.admin_settings import (
     WeightMissingProductResponse,
+    WeightRecalcStatusResponse,
     WeightRuleCreateRequest,
     WeightRuleKeywordRequest,
     WeightRuleResponse,
     WeightRuleUpdateRequest,
 )
-from app.services.settings.default_admin_settings import DefaultAdminSettingsLoader
+from app.services.settings.weight_recalc_runtime_service import WeightRecalcRuntimeService
 from app.services.settings.weight_rule_matcher import (
     WeightRuleMatcherField,
     WeightRuleMatcherEntry,
@@ -30,6 +32,7 @@ from app.services.settings.weight_rule_matcher import (
     resolve_match_for_fields,
 )
 from app.services.settings.weight_recalc_queue import WeightRuleRecalcQueue
+from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
 
 
 LOGGER = logging.getLogger(__name__)
@@ -74,14 +77,6 @@ def _unique_normalized_keywords(keywords: list[str]) -> list[str]:
     return unique
 
 
-def _default_rules_unique() -> list[tuple[int, list[str]]]:
-    by_weight: dict[int, list[str]] = {}
-    for rule in DefaultAdminSettingsLoader.load().weight_rules:
-        bucket = by_weight.setdefault(int(rule.weight_grams), [])
-        bucket.extend(rule.keywords)
-    return [(weight_grams, _unique_normalized_keywords(keywords)) for weight_grams, keywords in sorted(by_weight.items(), key=lambda row: row[0])]
-
-
 class WeightRuleService:
     def __init__(self, db: Session):
         self.db = db
@@ -112,16 +107,7 @@ class WeightRuleService:
     def ensure_default_rules(self) -> None:
         active = self.rule_repo.list_active()
         if not active:
-            for weight_grams, keywords in _default_rules_unique():
-                created = self.rule_repo.create_rule(weight_grams=weight_grams, is_enabled=True)
-                for normalized in keywords:
-                    self.rule_repo.create_keyword(rule_id=int(created.id), keyword=normalized)
-            try:
-                self.db.commit()
-            except IntegrityError:
-                self.db.rollback()
             return
-
         changed = False
         for rule in active:
             changed = self._normalize_rule_keywords(int(rule.id)) or changed
@@ -174,6 +160,47 @@ class WeightRuleService:
         )
         return WeightMatchResult(rule_id=match.rule_id, weight_grams=match.weight_grams, matched_keyword=match.matched_keyword)
 
+    def _default_weight_rule_id_by_filter_slug(self) -> dict[str, int]:
+        active_rule_ids = {
+            int(rule.id)
+            for rule in self.rule_repo.list_active()
+            if rule.id is not None
+        }
+        return {
+            str(slug): int(rule_id)
+            for slug, rule_id in (
+                self.db.query(Filter.slug, Filter.default_weight_rule_id)
+                .filter(Filter.default_weight_rule_id.is_not(None))
+                .all()
+            )
+            if str(slug or "").strip() and rule_id is not None and int(rule_id) in active_rule_ids
+        }
+
+    def _assigned_filter_slug_by_product_id(self, product_ids: list[int]) -> dict[int, str]:
+        normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
+        if not normalized_ids:
+            return {}
+        assignments = CatalogFilterAssignmentRepository(self.db)
+        state = assignments.get_runtime_state(for_update=False)
+        revision = int(getattr(state, "applied_revision", 0) or 0)
+        if revision <= 0:
+            return {}
+        return {
+            int(product_id): str(filter_slug)
+            for product_id, filter_slug in (
+                self.db.query(
+                    ProductFilterAssignment.product_id,
+                    ProductFilterAssignment.filter_slug,
+                )
+                .filter(ProductFilterAssignment.revision == revision)
+                .filter(ProductFilterAssignment.product_id.in_(normalized_ids))
+                .filter(ProductFilterAssignment.filter_slug.is_not(None))
+                .order_by(ProductFilterAssignment.product_id.asc())
+                .all()
+            )
+            if str(filter_slug or "").strip()
+        }
+
     def _find_candidate_product_ids(self, keywords: list[str]) -> set[int]:
         normalized = [str(keyword).strip().lower() for keyword in keywords if str(keyword).strip()]
         if not normalized:
@@ -211,6 +238,8 @@ class WeightRuleService:
 
         rules = self.list_rules()
         products = self.rule_repo.list_products_for_weight_recalc(product_ids=only_product_ids if only_product_ids else None)
+        assigned_filter_slug_by_product_id = self._assigned_filter_slug_by_product_id([int(product.id) for product in products if product.id is not None])
+        default_weight_rule_id_by_filter_slug = self._default_weight_rule_id_by_filter_slug()
         changed = False
 
         for product in products:
@@ -251,6 +280,11 @@ class WeightRuleService:
                 continue
 
             match = self._resolve_rule_match(listing, rules)
+            if match.rule_id is None:
+                assigned_filter_slug = assigned_filter_slug_by_product_id.get(int(product.id))
+                filter_rule_id = default_weight_rule_id_by_filter_slug.get(str(assigned_filter_slug or "").strip())
+                if filter_rule_id is not None:
+                    match = WeightMatchResult(rule_id=int(filter_rule_id), weight_grams=None, matched_keyword=None)
             if match.rule_id is not None:
                 if product.weight_rule_id != int(match.rule_id):
                     product.weight_rule_id = int(match.rule_id)
@@ -277,7 +311,9 @@ class WeightRuleService:
         normalized = {int(product_id) for product_id in product_ids if int(product_id) > 0}
         if not normalized:
             return 0
-        return self._recalculate_products_for_weight_rules(only_product_ids=normalized)
+        processed = self._recalculate_products_for_weight_rules(only_product_ids=normalized)
+        SiteCatalogSortPriceService(self.db).enqueue_product_ids(normalized)
+        return processed
 
     def _enqueue_recalculation(self, product_ids: set[int]) -> None:
         normalized = {int(product_id) for product_id in product_ids if int(product_id) > 0}
@@ -290,6 +326,61 @@ class WeightRuleService:
         except Exception:
             LOGGER.exception("Failed to enqueue weight recalculation, falling back to synchronous recalculation")
         self._recalculate_products_for_weight_rules(only_product_ids=normalized)
+
+    def enqueue_product_ids(self, product_ids: set[int] | list[int] | tuple[int, ...]) -> None:
+        self._enqueue_recalculation({int(product_id) for product_id in product_ids if int(product_id) > 0})
+
+    def enqueue_all_active_products(self) -> int:
+        return self._enqueue_all_active_products()
+
+    def _count_active_products(self) -> int:
+        return int(
+            self.db.query(func.count(Product.id))
+            .filter(Product.lifecycle_status == "active")
+            .scalar()
+            or 0
+        )
+
+    def _enqueue_all_active_products(self) -> int:
+        page_size = 5000
+        offset = 0
+        enqueued = 0
+        queue = WeightRuleRecalcQueue()
+        while True:
+            batch = (
+                self.db.query(Product.id)
+                .filter(Product.lifecycle_status == "active")
+                .order_by(Product.id.asc())
+                .offset(offset)
+                .limit(page_size)
+                .all()
+            )
+            normalized = [int(product_id) for product_id, in batch if int(product_id or 0) > 0]
+            if not normalized:
+                break
+            enqueued += queue.enqueue_product_ids(normalized)
+            if len(normalized) < page_size:
+                break
+            offset += page_size
+        return enqueued
+
+    def get_recalculation_status(self) -> WeightRecalcStatusResponse:
+        return WeightRecalcRuntimeService(self.db).serialize()
+
+    def start_full_recalculation(self) -> tuple[int, WeightRecalcStatusResponse, bool]:
+        runtime = WeightRecalcRuntimeService(self.db)
+        total_products = self._count_active_products()
+        status_payload, started = runtime.try_mark_queued(total_products=total_products)
+        if not started:
+            return 0, status_payload, False
+        if total_products <= 0:
+            return 0, runtime.advance_after_batch(processed_count=0, has_more_work=False), True
+        try:
+            queued = self._enqueue_all_active_products()
+        except Exception as exc:
+            runtime.mark_failed(message=f"{exc.__class__.__name__}: {exc}")
+            raise
+        return queued, self.get_recalculation_status(), True
 
     def list_rules(self) -> list[WeightRuleResponse]:
         return self._build_responses()
@@ -305,22 +396,22 @@ class WeightRuleService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Правило веса не найдено")
         rule.weight_grams = int(payload.weight_grams)
         keywords = [item.keyword for item in self.rule_repo.list_keywords(rule_id)]
-        affected_ids = self._find_candidate_product_ids(keywords) | self._find_current_rule_product_ids(rule_id)
         self.db.commit()
-        self._enqueue_recalculation(affected_ids)
         return WeightRuleResponse(id=int(rule.id), weight_grams=int(rule.weight_grams), keywords=keywords)
 
     def delete_rule(self, rule_id: int) -> dict:
         rule = self.rule_repo.get_by_id(rule_id)
         if rule is None or not bool(rule.is_enabled):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Правило веса не найдено")
-        keywords = [item.keyword for item in self.rule_repo.list_keywords(rule_id)]
-        affected_ids = self._find_candidate_product_ids(keywords) | self._find_current_rule_product_ids(rule_id)
+        (
+            self.db.query(Filter)
+            .filter(Filter.default_weight_rule_id == int(rule_id))
+            .update({Filter.default_weight_rule_id: None}, synchronize_session=False)
+        )
         for keyword in self.rule_repo.list_keywords(rule_id):
             self.db.delete(keyword)
         rule.is_enabled = False
         self.db.commit()
-        self._enqueue_recalculation(affected_ids)
         return {"ok": True}
 
     def add_keyword(self, rule_id: int, payload: WeightRuleKeywordRequest) -> dict:
@@ -332,8 +423,6 @@ class WeightRuleService:
             return {"ok": True, "keyword": keyword, "duplicated": True}
         self.rule_repo.create_keyword(rule_id=rule_id, keyword=keyword)
         self.db.commit()
-        affected_ids = self._find_candidate_product_ids([keyword]) | self._find_current_rule_product_ids(rule_id)
-        self._enqueue_recalculation(affected_ids)
         return {"ok": True, "keyword": keyword}
 
     def remove_keyword(self, rule_id: int, keyword: str) -> dict:
@@ -344,10 +433,8 @@ class WeightRuleService:
         entity = self.rule_repo.get_keyword(rule_id=rule_id, keyword=normalized)
         if entity is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ключевое слово не найдено")
-        affected_ids = self._find_candidate_product_ids([normalized]) | self._find_current_rule_product_ids(rule_id)
         self.db.delete(entity)
         self.db.commit()
-        self._enqueue_recalculation(affected_ids)
         return {"ok": True}
 
     def get_matching_rules(self) -> list[WeightRuleResponse]:

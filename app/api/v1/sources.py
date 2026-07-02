@@ -17,6 +17,7 @@ from app.services.auth.admin_auth_service import require_permission
 from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.sync_error_humanizer import humanize_sync_error
 from app.services.catalog.source_registry_service import SourceRegistryService
+from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
 
 
 router = APIRouter(tags=["sources"])
@@ -285,6 +286,7 @@ def patch_source_supplier(source_key: str, payload: SupplierPatch, db: Session =
         value = str(payload.buyout_surcharge_currency or "").strip().upper() or None
         setting.buyout_surcharge_currency = value
     db.commit()
+    SiteCatalogSortPriceService(db).enqueue_source_product_ids([int(entity.id)])
     refreshed = repo.get_by_key(source_key)
     return _source_payload(refreshed, _source_counts_by_id(db))
 

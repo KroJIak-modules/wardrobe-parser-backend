@@ -11,13 +11,16 @@ from app.models import (
     CustomCatalogProduct,
     Designer,
     DesignerSourceName,
+    FilterAssignmentRuntimeState,
     Product,
+    ProductFilterAssignment,
     ProductListing,
     ProductListingMember,
     ProductPresentation,
     ShowcaseCategory,
     Source,
 )
+from app.repositories.catalog_taxonomy import SHOWCASE_CATEGORY_ORDER
 from app.schemas.taxonomy import TaxonomyWriteState
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.designer_support import normalize_designer_text, slugify_designer_name
@@ -60,6 +63,50 @@ class AdminEditorService:
         if normalized in {"men", "women"}:
             return "gender", normalized
         return "sale", None
+
+    @staticmethod
+    def _is_showcase_attachment_allowed(category_code: object, attachment_kind: object) -> bool:
+        normalized_code = str(category_code or "").strip()
+        normalized_kind = str(attachment_kind or "").strip()
+        if normalized_code == "new":
+            return normalized_kind == "custom_catalog"
+        if normalized_code in {"men", "women"}:
+            return normalized_kind == "filter"
+        return False
+
+    @staticmethod
+    def _sort_category_payloads(categories: list[dict]) -> list[dict]:
+        order_index = {code: index for index, code in enumerate(SHOWCASE_CATEGORY_ORDER)}
+        return sorted(
+            categories,
+            key=lambda category: (
+                order_index.get(str(category.get("slug") or "").strip(), len(order_index)),
+                str(category.get("slug") or "").strip(),
+            ),
+        )
+
+    def _filter_product_counts_by_slug(self) -> dict[str, int]:
+        state = (
+            self.db.query(FilterAssignmentRuntimeState)
+            .filter(FilterAssignmentRuntimeState.id == 1)
+            .one_or_none()
+        )
+        revision = int(getattr(state, "applied_revision", 0) or 0)
+        if revision <= 0:
+            return {}
+        return {
+            str(slug): int(count)
+            for slug, count in (
+                self.db.query(
+                    ProductFilterAssignment.filter_slug,
+                    func.count(func.distinct(ProductFilterAssignment.product_id)).label("product_count"),
+                )
+                .filter(ProductFilterAssignment.revision == revision)
+                .group_by(ProductFilterAssignment.filter_slug)
+                .all()
+            )
+            if str(slug or "").strip()
+        }
 
     @staticmethod
     def _serialize_manual_product_payload(payload: dict) -> dict | None:
@@ -378,6 +425,7 @@ class AdminEditorService:
         filters_state = self.taxonomy.get_state()
         filter_rows = self.taxonomy.repo.list_filters()
         filter_by_slug = {str(row.slug): row for row in filter_rows}
+        product_counts_by_slug = self._filter_product_counts_by_slug()
         custom_catalog_rows = self.taxonomy.repo.list_custom_catalogs()
         custom_catalog_by_slug = {str(row.slug): row for row in custom_catalog_rows}
         showcase_rows = {
@@ -415,6 +463,7 @@ class AdminEditorService:
                         ),
                         "node_kind": str(node.node_kind),
                         "is_enabled": bool(node.is_enabled),
+                        "product_count": int(product_counts_by_slug.get(slug, 0)),
                         "rules": {
                             "local_category_keywords": [str(item) for item in node.local_category_keywords],
                             "title_keywords": [str(item) for item in node.title_keywords],
@@ -453,6 +502,9 @@ class AdminEditorService:
             attachments_payload = []
             if entity is not None:
                 for attachment in sorted(entity.attachments, key=lambda value: (int(value.position), int(value.id))):
+                    attachment_kind = str(attachment.attachment_kind)
+                    if not self._is_showcase_attachment_allowed(item.code, attachment_kind):
+                        continue
                     hidden_filter_ids = [
                         int(hidden.filter_node.filter_id)
                         for hidden in sorted(attachment.hidden_nodes, key=lambda value: int(value.filter_node_id))
@@ -461,7 +513,7 @@ class AdminEditorService:
                     attachments_payload.append(
                         {
                             "id": f"attachment-{int(attachment.id)}",
-                            "kind": str(attachment.attachment_kind),
+                            "kind": attachment_kind,
                             "ref_id": (
                                 int(attachment.filter_id)
                                 if attachment.filter_id is not None
@@ -472,6 +524,8 @@ class AdminEditorService:
                     )
             else:
                 for index, attachment in enumerate(item.attachments, start=1):
+                    if not self._is_showcase_attachment_allowed(item.code, attachment.kind):
+                        continue
                     fallback_catalog = (
                         custom_catalog_by_slug.get(str(attachment.custom_catalog_slug or "").strip())
                         if attachment.kind == "custom_catalog"
@@ -504,6 +558,8 @@ class AdminEditorService:
                     "children": [],
                 }
             )
+
+        categories_payload = self._sort_category_payloads(categories_payload)
 
         designer_state = self.list_designer_editor_state()
         product_count_by_designer = defaultdict(int)
@@ -668,12 +724,19 @@ class AdminEditorService:
                 continue
             category_id = int(category.get("id") or 0)
             category_entity = current_showcase_categories.get(category_id)
+            category_code = (
+                str(category_entity.code).strip()
+                if category_entity is not None and str(getattr(category_entity, "code", "")).strip()
+                else str(category.get("slug") or category.get("behavior") or "").strip()
+            )
             attachments_payload: list[dict] = []
             for attachment in (category.get("attachments") if isinstance(category.get("attachments"), list) else []):
                 if not isinstance(attachment, dict):
                     continue
                 kind = str(attachment.get("kind") or "").strip()
                 ref_id = int(attachment.get("ref_id") or 0)
+                if not self._is_showcase_attachment_allowed(category_code, kind):
+                    continue
                 if kind == "filter":
                     filter_ref_slug = filter_ref_slug_by_id.get(ref_id)
                     if not filter_ref_slug:
@@ -705,11 +768,7 @@ class AdminEditorService:
                     )
             showcase_payloads.append(
                 {
-                    "code": (
-                        str(category_entity.code).strip()
-                        if category_entity is not None and str(getattr(category_entity, "code", "")).strip()
-                        else str(category.get("behavior") or "").strip()
-                    ),
+                    "code": category_code,
                     "title": self._normalize_text(category.get("label")) or "Без названия",
                     "attachments": attachments_payload,
                 }

@@ -49,3 +49,19 @@ class CatalogFilterAssignmentRepository:
             .filter(ProductFilterAssignment.revision != int(keep_revision))
             .delete(synchronize_session=False)
         )
+
+    def list_product_ids_by_filter_slugs(self, *, revision: int, filter_slugs: list[str]) -> list[int]:
+        normalized = sorted({str(slug or "").strip() for slug in filter_slugs if str(slug or "").strip()})
+        if not normalized:
+            return []
+        return [
+            int(product_id)
+            for product_id, in (
+                self.session.query(ProductFilterAssignment.product_id)
+                .filter(ProductFilterAssignment.revision == int(revision))
+                .filter(ProductFilterAssignment.filter_slug.in_(normalized))
+                .distinct()
+                .order_by(ProductFilterAssignment.product_id.asc())
+                .all()
+            )
+        ]

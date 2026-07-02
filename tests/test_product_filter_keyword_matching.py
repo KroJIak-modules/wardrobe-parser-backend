@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from app.core.database import SessionLocal
+from app.models import FilterAssignmentRuntimeState
 from app.models import Filter, FilterLocalCategoryKeyword, FilterTitleKeyword, Product, ProductListing, Source, SourceSetting
 from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
 from app.services.catalog.product_ingest_service import ProductIngestService
@@ -251,6 +253,150 @@ def test_filter_keyword_matches_whole_token_not_substring_inside_word() -> None:
 
         tops_payload = service.list_admin_table_products(limit=10, offset=0, filter_slug=top_slug)
         assert int(tops_payload["total"]) == 0
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_gender_scoped_filters_prevent_cross_gender_leaf_assignment() -> None:
+    db = SessionLocal()
+    source_key = f"gender-scope-{uuid4().hex[:12]}.example"
+    male_slug = f"male-shirts-{uuid4().hex[:8]}"
+    female_slug = f"female-shirts-{uuid4().hex[:8]}"
+    try:
+        source = _create_source(db, source_key)
+        unique_category = f"gender-scope-{uuid4().hex[:8]}"
+        male_product = _ingest_product(
+            db,
+            source_id=int(source.id),
+            source_key=source_key,
+            handle="male-shirt",
+            title="Structured Shirt",
+            category=unique_category,
+            tags=[],
+        )
+        female_product = _ingest_product(
+            db,
+            source_id=int(source.id),
+            source_key=source_key,
+            handle="female-shirt",
+            title="Structured Shirt",
+            category=unique_category,
+            tags=[],
+        )
+        male_product.gender = "male"
+        female_product.gender = "female"
+        db.flush()
+
+        men_root = Filter(title="Мужское", slug=f"men-root-{uuid4().hex[:8]}", node_kind="multifilter", is_enabled=True)
+        women_root = Filter(title="Женское", slug=f"women-root-{uuid4().hex[:8]}", node_kind="multifilter", is_enabled=True)
+        male_filter = Filter(title="Рубашки и поло", slug=male_slug, node_kind="filter", is_enabled=True)
+        female_filter = Filter(title="Рубашки и блузы", slug=female_slug, node_kind="filter", is_enabled=True)
+        db.add_all([men_root, women_root, male_filter, female_filter])
+        db.flush()
+        db.add_all(
+            [
+                FilterLocalCategoryKeyword(filter_id=int(male_filter.id), keyword=unique_category),
+                FilterLocalCategoryKeyword(filter_id=int(female_filter.id), keyword=unique_category),
+            ]
+        )
+        db.flush()
+
+        from app.models import FilterNode, ShowcaseCategory, ShowcaseCategoryAttachment  # local import for test only
+
+        men_root_node = FilterNode(filter_id=int(men_root.id), parent_node_id=None, position=1)
+        women_root_node = FilterNode(filter_id=int(women_root.id), parent_node_id=None, position=2)
+        db.add_all([men_root_node, women_root_node])
+        db.flush()
+        db.add_all(
+            [
+                FilterNode(filter_id=int(male_filter.id), parent_node_id=int(men_root_node.id), position=1),
+                FilterNode(filter_id=int(female_filter.id), parent_node_id=int(women_root_node.id), position=1),
+            ]
+        )
+        db.flush()
+
+        men_category = db.query(ShowcaseCategory).filter(ShowcaseCategory.code == "men").one()
+        women_category = db.query(ShowcaseCategory).filter(ShowcaseCategory.code == "women").one()
+        db.add_all(
+            [
+                ShowcaseCategoryAttachment(
+                    showcase_category_id=int(men_category.id),
+                    attachment_kind="filter",
+                    filter_id=int(men_root.id),
+                    position=1000,
+                ),
+                ShowcaseCategoryAttachment(
+                    showcase_category_id=int(women_category.id),
+                    attachment_kind="filter",
+                    filter_id=int(women_root.id),
+                    position=1000,
+                ),
+            ]
+        )
+        db.flush()
+
+        _refresh_filter_assignments(db, [int(male_product.id), int(female_product.id)])
+
+        service = ProductQueryService(db)
+        assert service._matched_filter_slugs(male_product) == [male_slug]
+        assert service._matched_filter_slugs(female_product) == [female_slug]
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_title_keywords_outrank_generic_local_category_match() -> None:
+    db = SessionLocal()
+    source_key = f"title-priority-{uuid4().hex[:12]}.example"
+    generic_slug = f"generic-footwear-{uuid4().hex[:8]}"
+    boots_slug = f"boots-footwear-{uuid4().hex[:8]}"
+    try:
+        source = _create_source(db, source_key)
+        generic_category = f"generic-footwear-{uuid4().hex[:8]}"
+        specific_title_keyword = f"voidboot-{uuid4().hex[:8]}"
+        product = _ingest_product(
+            db,
+            source_id=int(source.id),
+            source_key=source_key,
+            handle="kiss-boots",
+            title=f"Shield Wader {specific_title_keyword}",
+            category=generic_category,
+            tags=[],
+        )
+
+        generic_filter = Filter(title="Кроссовки", slug=generic_slug, node_kind="filter", is_enabled=True)
+        boots_filter = Filter(title="Ботинки", slug=boots_slug, node_kind="filter", is_enabled=True)
+        db.add_all([generic_filter, boots_filter])
+        db.flush()
+        db.add(FilterLocalCategoryKeyword(filter_id=int(generic_filter.id), keyword=generic_category))
+        db.add(FilterTitleKeyword(filter_id=int(boots_filter.id), keyword=specific_title_keyword))
+        db.flush()
+        _refresh_filter_assignments(db, [int(product.id)])
+
+        service = ProductQueryService(db)
+        assert service._matched_filter_slugs(product) == [boots_slug]
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_rebuild_pending_revision_skips_when_another_rebuild_is_already_marked_running() -> None:
+    db = SessionLocal()
+    try:
+        service = ProductFilterAssignmentService(db)
+        state = service.assignments.get_or_create_runtime_state()
+        state.target_revision = 2
+        state.applied_revision = 1
+        state.rebuild_started_at = datetime.now(timezone.utc)
+        db.commit()
+
+        assert service.rebuild_pending_revision(batch_size=100) == 0
+
+        refreshed = db.query(FilterAssignmentRuntimeState).filter(FilterAssignmentRuntimeState.id == 1).one()
+        assert int(refreshed.target_revision) == 2
+        assert int(refreshed.applied_revision) == 1
+        assert refreshed.rebuild_started_at is not None
     finally:
         db.rollback()
         db.close()

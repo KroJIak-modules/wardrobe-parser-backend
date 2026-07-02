@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import String, and_, case, cast, func, literal, or_
+from sqlalchemy import String, and_, case, cast, func, literal, not_, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.models import (
@@ -16,6 +16,8 @@ from app.models import (
     Product,
     ProductFilterAssignment,
     ProductListing,
+    ProductListingGalleryImage,
+    ProductListingImage,
     ProductListingMember,
     ProductPresentation,
     Source,
@@ -166,8 +168,8 @@ class ProductQueryService:
         )
 
     @classmethod
-    def _apply_default_product_sorting(cls, query):
-        return query.order_by(
+    def _default_product_sorting_expressions(cls):
+        return (
             func.coalesce(SourceSetting.sort_priority, 2147483647).asc(),
             func.lower(func.coalesce(Source.name, "")).asc(),
             cls._product_orderability_rank_expr().asc(),
@@ -175,6 +177,10 @@ class ProductQueryService:
             Product.id.desc(),
             cls._product_visibility_rank_expr().asc(),
         )
+
+    @classmethod
+    def _apply_default_product_sorting(cls, query):
+        return query.order_by(*cls._default_product_sorting_expressions())
 
     def _filtered_product_ids_subquery(
         self,
@@ -434,18 +440,63 @@ class ProductQueryService:
         return str(getattr(product, "dedup_status", "") or "independent").strip().lower() or "independent"
 
     @classmethod
-    def _effective_orderability_state(cls, product: Product, listing: ProductListing | None) -> tuple[str, str | None]:
-        dedup_status = cls._dedup_status(product)
+    def _pricing_unavailable_reason(
+        cls,
+        *,
+        variants: list[dict[str, Any]],
+        price_summary: dict[str, Any] | None,
+    ) -> str | None:
+        if not variants:
+            return "missing_variants"
+        if isinstance(price_summary, dict) and price_summary.get("final_display_price") is not None:
+            return None
+        for variant in sorted(variants, key=cls._variant_summary_sort_key):
+            reason = str(variant.get("pricing_reason") or "").strip()
+            if reason:
+                return reason
+        return "missing_final_price"
+
+    @staticmethod
+    def _has_display_images(gallery: dict[str, Any] | None) -> bool:
+        if not isinstance(gallery, dict):
+            return False
+        return any(str(url or "").strip() for url in gallery.get("display_image_urls") or [])
+
+    def _effective_orderability_state(
+        self,
+        product: Product,
+        listing: ProductListing | None,
+        *,
+        variants: list[dict[str, Any]] | None = None,
+        gallery: dict[str, Any] | None = None,
+        price_summary: dict[str, Any] | None = None,
+    ) -> tuple[str, str | None]:
+        dedup_status = self._dedup_status(product)
         if dedup_status == "combined_source":
             return "unavailable", "dedup_combined_source"
         if dedup_status == "hidden_by_keep":
             return "unavailable", "dedup_hidden_by_keep"
         if listing is None:
             return "unavailable", None
-        return (
-            str(listing.orderability_status or "unavailable").strip().lower() or "unavailable",
-            str(listing.status_reason).strip() if listing.status_reason else None,
+        listing_status = str(listing.orderability_status or "unavailable").strip().lower() or "unavailable"
+        listing_reason = str(listing.status_reason).strip() if listing.status_reason else None
+        if listing_status == "unavailable":
+            return listing_status, listing_reason
+
+        effective_variants = variants if variants is not None else self._build_variants(product)
+        effective_price_summary = price_summary if price_summary is not None else self._build_price_summary(effective_variants)
+        pricing_reason = self._pricing_unavailable_reason(
+            variants=effective_variants,
+            price_summary=effective_price_summary,
         )
+        if pricing_reason is not None:
+            return "unavailable", pricing_reason
+
+        effective_gallery = gallery if gallery is not None else self._gallery_state(product, listing)
+        if not self._has_display_images(effective_gallery):
+            return "unavailable", "missing_images"
+
+        return listing_status, listing_reason
 
     @staticmethod
     def _effective_weight_grams(product: Product, listing: ProductListing | None) -> int | None:
@@ -1182,16 +1233,22 @@ class ProductQueryService:
 
     def _build_shared_payload(self, product: Product) -> tuple[dict, dict]:
         primary_listing = self._resolved_primary_listing(product)
-        effective_orderability_status, effective_status_reason = self._effective_orderability_state(product, primary_listing)
         primary_is_business_source = self._is_business_source_listing(primary_listing)
         title = self._effective_title(product, primary_listing)
         description = self._description_state(product, primary_listing)
         gallery = self._gallery_state(product, primary_listing)
         variants = self._build_variants(product)
+        price_summary = self._build_price_summary(variants)
+        effective_orderability_status, effective_status_reason = self._effective_orderability_state(
+            product,
+            primary_listing,
+            variants=variants,
+            gallery=gallery,
+            price_summary=price_summary,
+        )
         primary_listing_variants = self._listing_variants(product, primary_listing)
         effective_weight_grams = self._effective_weight_grams(product, primary_listing)
         final_price, pricing_components = self._compute_pricing(product, primary_listing, primary_listing_variants, effective_weight_grams)
-        price_summary = self._build_price_summary(variants)
         representative_pricing_components = self._representative_pricing_components(variants, price_summary)
         matched_filter_slugs = self._matched_filter_slugs(product)
         custom_catalog_slugs = self._custom_catalog_slugs(int(product.id))
@@ -1314,13 +1371,17 @@ class ProductQueryService:
 
     def build_dedup_candidate_payload(self, product: Product) -> dict:
         primary_listing = self._resolved_primary_listing(product)
-        effective_orderability_status, effective_status_reason = self._effective_orderability_state(product, primary_listing)
-        image_urls = (
-            [str(primary_listing.images[0].url)]
-            if primary_listing is not None and self._show_images_enabled(primary_listing) and primary_listing.images
-            else []
-        )
+        gallery = self._gallery_state(product, primary_listing)
         variants = self._build_variants(product)
+        price_summary = self._build_price_summary(variants)
+        effective_orderability_status, effective_status_reason = self._effective_orderability_state(
+            product,
+            primary_listing,
+            variants=variants,
+            gallery=gallery,
+            price_summary=price_summary,
+        )
+        image_urls = [str(url) for url in gallery.get("display_image_urls") or []]
         return {
             "id": int(product.id),
             "title": self._effective_title(product, primary_listing),
@@ -1335,7 +1396,7 @@ class ProductQueryService:
                 if primary_listing is not None and self._is_business_source_listing(primary_listing)
                 else None
             ),
-            "price_summary": self._build_price_summary(variants),
+            "price_summary": price_summary,
             "visibility_status": str(product.visibility_status),
             "orderability_status": effective_orderability_status,
             "status_reason": effective_status_reason,
@@ -1413,6 +1474,7 @@ class ProductQueryService:
                 base_query
                 .join(ProductListingMember, ProductListingMember.product_id == Product.id)
                 .join(ProductListing, ProductListing.id == ProductListingMember.listing_id)
+                .outerjoin(SourceSetting, SourceSetting.source_id == ProductListing.source_id)
             )
         if needs_presentation_join:
             base_query = base_query.outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
@@ -1446,8 +1508,66 @@ class ProductQueryService:
             base_query = base_query.filter(Product.availability_mode == str(availability_mode).strip().lower())
         if orderability_status:
             normalized_orderability_status = str(orderability_status).strip().lower()
+            gallery_visibility_sq = (
+                self.db.query(
+                    ProductListingGalleryImage.product_id.label("product_id"),
+                    ProductListingGalleryImage.listing_id.label("listing_id"),
+                    func.bool_or(
+                        and_(
+                            ProductListingGalleryImage.is_hidden.is_(False),
+                            or_(
+                                ProductListingGalleryImage.image_asset_id.is_not(None),
+                                and_(
+                                    ProductListingGalleryImage.listing_image_id.is_not(None),
+                                    func.coalesce(SourceSetting.show_images, True).is_(True),
+                                ),
+                            ),
+                        )
+                    ).label("has_visible_gallery_image"),
+                    func.count(ProductListingGalleryImage.id).label("scope_count"),
+                )
+                .select_from(ProductListingGalleryImage)
+                .join(ProductListing, ProductListing.id == ProductListingGalleryImage.listing_id)
+                .outerjoin(SourceSetting, SourceSetting.source_id == ProductListing.source_id)
+                .group_by(ProductListingGalleryImage.product_id, ProductListingGalleryImage.listing_id)
+                .subquery("product_gallery_visibility")
+            )
+            source_image_counts_sq = (
+                self.db.query(
+                    ProductListingImage.listing_id.label("listing_id"),
+                    func.count(ProductListingImage.id).label("image_count"),
+                )
+                .group_by(ProductListingImage.listing_id)
+                .subquery("product_source_image_counts")
+            )
+            base_query = (
+                base_query
+                .outerjoin(
+                    gallery_visibility_sq,
+                    and_(
+                        gallery_visibility_sq.c.product_id == Product.id,
+                        gallery_visibility_sq.c.listing_id == Product.primary_listing_id,
+                    ),
+                )
+                .outerjoin(
+                    source_image_counts_sq,
+                    source_image_counts_sq.c.listing_id == Product.primary_listing_id,
+                )
+            )
+            has_visible_images_expr = case(
+                (
+                    func.coalesce(gallery_visibility_sq.c.scope_count, 0) > 0,
+                    func.coalesce(gallery_visibility_sq.c.has_visible_gallery_image, False),
+                ),
+                else_=and_(
+                    func.coalesce(SourceSetting.show_images, True).is_(True),
+                    func.coalesce(source_image_counts_sq.c.image_count, 0) > 0,
+                ),
+            )
             effective_orderability_expr = case(
                 (Product.dedup_status != "independent", literal("unavailable")),
+                (Product.site_sort_price_rub.is_(None), literal("unavailable")),
+                (not_(has_visible_images_expr), literal("unavailable")),
                 else_=func.coalesce(ProductListing.orderability_status, literal("unavailable")),
             )
             base_query = base_query.filter(effective_orderability_expr == normalized_orderability_status)
@@ -1604,10 +1724,16 @@ class ProductQueryService:
 
     def build_admin_table_product_payload(self, product: Product, *, custom_catalog_titles: list[str] | None = None) -> dict:
         primary_listing = self._resolved_primary_listing(product)
-        effective_orderability_status, effective_status_reason = self._effective_orderability_state(product, primary_listing)
         variants = self._build_variants(product)
         price_summary = self._build_price_summary(variants)
         gallery = self._gallery_state(product, primary_listing)
+        effective_orderability_status, effective_status_reason = self._effective_orderability_state(
+            product,
+            primary_listing,
+            variants=variants,
+            gallery=gallery,
+            price_summary=price_summary,
+        )
         internal_category_names = self._matched_filter_labels(product)
         for title in custom_catalog_titles or []:
             normalized_title = str(title or "").strip()

@@ -49,6 +49,8 @@ class Product(Base):
         index=True,
     )
     visibility_status = Column(String(16), nullable=False, default="visible", server_default="visible")
+    site_sort_price_rub = Column(Numeric(12, 2), nullable=True, index=True)
+    site_sort_price_synced_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 

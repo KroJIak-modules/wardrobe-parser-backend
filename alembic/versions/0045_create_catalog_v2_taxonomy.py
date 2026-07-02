@@ -127,7 +127,7 @@ def upgrade() -> None:
                 {"id": 2, "code": "designers", "title": "Дизайнеры"},
                 {"id": 3, "code": "men", "title": "Мужское"},
                 {"id": 4, "code": "women", "title": "Женское"},
-                {"id": 5, "code": "sale", "title": "Sale"},
+                {"id": 5, "code": "sale", "title": "Скидки"},
             ],
         )
 

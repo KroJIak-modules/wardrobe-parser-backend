@@ -12,6 +12,7 @@ from app.models import Product, ProductListingGalleryImage, ProductPresentation
 from app.repositories.catalog_dedup import CatalogDedupRepository
 from app.repositories.catalog_products import CatalogProductRepository
 from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
+from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
 
 
 class DedupServiceV2:
@@ -22,6 +23,7 @@ class DedupServiceV2:
         self.products = CatalogProductRepository(db)
         self.decisions = CatalogDedupRepository(db)
         self.filter_assignments = ProductFilterAssignmentService(db)
+        self.site_sort_prices = SiteCatalogSortPriceService(db)
 
     def count_decisions(self) -> int:
         return self.decisions.count_decisions()
@@ -649,6 +651,7 @@ class DedupServiceV2:
             affected_ids.add(created_product_id)
         self.db.flush()
         self.filter_assignments.enqueue_product_ids_after_commit(sorted(affected_ids))
+        self.site_sort_prices.enqueue_product_ids_after_commit(sorted(affected_ids))
         return int(created_product_id or primary_product_id)
 
     def can_undo_decision(self, decision) -> tuple[bool, str | None]:
@@ -749,6 +752,7 @@ class DedupServiceV2:
             self.products.delete_product_hard(created_product_id)
             affected_ids.add(created_product_id)
         self.filter_assignments.enqueue_product_ids_after_commit(sorted(affected_ids))
+        self.site_sort_prices.enqueue_product_ids_after_commit(sorted(affected_ids))
 
     def _decided_pair_keys(self) -> set[str]:
         decided: set[str] = set()

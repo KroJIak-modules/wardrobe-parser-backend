@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from sqlalchemy import and_, delete as sa_delete, func, update as sa_update
+from sqlalchemy import String, and_, case, cast, delete as sa_delete, distinct, func, literal, or_, update as sa_update
 from sqlalchemy.orm import Session, joinedload, load_only, selectinload
 
 from app.core.source_identity import normalize_host, normalize_listing_url
@@ -135,6 +135,172 @@ class CatalogProductRepository:
             .order_by(Product.id.asc())
             .all()
         )
+
+    def list_products_for_site_price_sort_by_ids(self, product_ids: Iterable[int]) -> list[Product]:
+        normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
+        if not normalized_ids:
+            return []
+        return (
+            self.session.query(Product)
+            .options(
+                joinedload(Product.weight_rule),
+                selectinload(Product.memberships)
+                .selectinload(ProductListingMember.listing)
+                .selectinload(ProductListing.source)
+                .selectinload(Source.setting),
+                selectinload(Product.memberships)
+                .selectinload(ProductListingMember.listing)
+                .selectinload(ProductListing.variants),
+            )
+            .filter(Product.id.in_(normalized_ids))
+            .filter(Product.lifecycle_status == "active")
+            .order_by(Product.id.asc())
+            .all()
+        )
+
+    def list_site_catalog_card_rows_by_ids(self, product_ids: Iterable[int]) -> list:
+        normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
+        if not normalized_ids:
+            return []
+        first_listing_image_sq = (
+            self.session.query(
+                ProductListingImage.listing_id.label("listing_id"),
+                ProductListingImage.url.label("image_url"),
+                func.row_number()
+                .over(
+                    partition_by=ProductListingImage.listing_id,
+                    order_by=(ProductListingImage.position.asc(), ProductListingImage.id.asc()),
+                )
+                .label("rn"),
+            )
+            .subquery("site_catalog_first_listing_image")
+        )
+        gallery_scope_sq = (
+            self.session.query(
+                ProductListingGalleryImage.product_id.label("product_id"),
+                ProductListingGalleryImage.listing_id.label("listing_id"),
+            )
+            .group_by(ProductListingGalleryImage.product_id, ProductListingGalleryImage.listing_id)
+            .subquery("site_catalog_gallery_scope")
+        )
+        first_visible_gallery_image_sq = (
+            self.session.query(
+                ProductListingGalleryImage.product_id.label("product_id"),
+                ProductListingGalleryImage.listing_id.label("listing_id"),
+                case(
+                    (
+                        ProductListingGalleryImage.image_asset_id.is_not(None),
+                        func.concat(
+                            literal("/api/v1/products/images/"),
+                            cast(ProductListingGalleryImage.image_asset_id, String()),
+                        ),
+                    ),
+                    else_=ProductListingImage.url,
+                ).label("image_url"),
+                func.row_number()
+                .over(
+                    partition_by=(ProductListingGalleryImage.product_id, ProductListingGalleryImage.listing_id),
+                    order_by=(ProductListingGalleryImage.position.asc(), ProductListingGalleryImage.id.asc()),
+                )
+                .label("rn"),
+            )
+            .select_from(ProductListingGalleryImage)
+            .outerjoin(ProductListingImage, ProductListingImage.id == ProductListingGalleryImage.listing_image_id)
+            .join(ProductListing, ProductListing.id == ProductListingGalleryImage.listing_id)
+            .outerjoin(SourceSetting, SourceSetting.source_id == ProductListing.source_id)
+            .filter(ProductListingGalleryImage.is_hidden.is_(False))
+            .filter(
+                or_(
+                    ProductListingGalleryImage.image_asset_id.is_not(None),
+                    and_(
+                        ProductListingGalleryImage.listing_image_id.is_not(None),
+                        func.coalesce(SourceSetting.show_images, True).is_(True),
+                    ),
+                )
+            )
+            .subquery("site_catalog_first_visible_gallery_image")
+        )
+        return (
+            self.session.query(
+                Product.id.label("product_id"),
+                Product.site_sort_price_rub.label("site_sort_price_rub"),
+                Product.availability_mode.label("availability_mode"),
+                Product.dedup_status.label("dedup_status"),
+                ProductListing.orderability_status.label("orderability_status"),
+                ProductListing.source_title.label("source_title"),
+                ProductListing.source_designer_raw.label("source_designer_raw"),
+                ProductListing.source_category_raw.label("source_category_raw"),
+                ProductPresentation.title_override.label("title_override"),
+                ProductPresentation.brand_override_name.label("brand_override_name"),
+                Designer.name.label("designer_name"),
+                Designer.slug.label("designer_slug"),
+                SourceSetting.show_images.label("show_images"),
+                first_listing_image_sq.c.image_url.label("source_image_url"),
+                first_visible_gallery_image_sq.c.image_url.label("gallery_image_url"),
+                gallery_scope_sq.c.product_id.label("gallery_scope_product_id"),
+            )
+            .join(ProductListing, ProductListing.id == Product.primary_listing_id)
+            .outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
+            .outerjoin(Designer, Designer.id == Product.designer_id)
+            .outerjoin(SourceSetting, SourceSetting.source_id == ProductListing.source_id)
+            .outerjoin(
+                first_listing_image_sq,
+                and_(
+                    first_listing_image_sq.c.listing_id == ProductListing.id,
+                    first_listing_image_sq.c.rn == 1,
+                ),
+            )
+            .outerjoin(
+                first_visible_gallery_image_sq,
+                and_(
+                    first_visible_gallery_image_sq.c.product_id == Product.id,
+                    first_visible_gallery_image_sq.c.listing_id == ProductListing.id,
+                    first_visible_gallery_image_sq.c.rn == 1,
+                ),
+            )
+            .outerjoin(
+                gallery_scope_sq,
+                and_(
+                    gallery_scope_sq.c.product_id == Product.id,
+                    gallery_scope_sq.c.listing_id == ProductListing.id,
+                ),
+            )
+            .filter(Product.id.in_(normalized_ids))
+            .filter(Product.lifecycle_status == "active")
+            .order_by(Product.id.asc())
+            .all()
+        )
+
+    def list_missing_site_sort_price_product_ids(self, *, limit: int) -> list[int]:
+        safe_limit = max(1, int(limit))
+        return [
+            int(product_id)
+            for product_id, in (
+                self.session.query(Product.id)
+                .filter(Product.lifecycle_status == "active")
+                .filter(Product.site_sort_price_synced_at.is_(None))
+                .order_by(Product.id.asc())
+                .limit(safe_limit)
+                .all()
+            )
+        ]
+
+    def list_active_product_ids_by_source_ids(self, source_ids: Iterable[int]) -> list[int]:
+        normalized_ids = sorted({int(source_id) for source_id in source_ids if int(source_id) > 0})
+        if not normalized_ids:
+            return []
+        return [
+            int(product_id)
+            for product_id, in (
+                self.session.query(distinct(Product.id))
+                .join(ProductListingMember, ProductListingMember.product_id == Product.id)
+                .join(ProductListing, ProductListing.id == ProductListingMember.listing_id)
+                .filter(Product.lifecycle_status == "active")
+                .filter(ProductListing.source_id.in_(normalized_ids))
+                .order_by(Product.id.asc())
+                .all()
+            )
+        ]
 
     def list_products_for_filter_assignment_by_ids(self, product_ids: Iterable[int]) -> list[Product]:
         normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})

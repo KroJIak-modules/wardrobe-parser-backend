@@ -21,7 +21,6 @@ from app.core.startup import run_db_bootstrap_with_retry
 from app.services.auth.admin_accounts_service import AdminAccountsService
 from app.services.catalog.catalog_defaults_service import CatalogDefaultsService
 from app.services.catalog.source_registry_service import SourceRegistryService
-from app.services.settings.weight_rule_service import WeightRuleService
 
 
 HTTP_NOT_FOUND = status.HTTP_404_NOT_FOUND
@@ -161,7 +160,6 @@ def create_app() -> FastAPI:
                 AdminAccountsService(db).ensure_superadmin_user()
                 SourceRegistryService(db).ensure_manual_source()
                 CatalogDefaultsService(db).ensure()
-                WeightRuleService(db).ensure_default_rules()
                 mark_interrupted_jobs_on_startup()
                 db.commit()
             finally:

@@ -46,6 +46,49 @@ class WeightMissingProductResponse(BaseModel):
     source_name: str | None = None
 
 
+class WeightRecalcStatusResponse(BaseModel):
+    status: Literal["idle", "queued", "running"] = "idle"
+    is_running: bool = False
+    queued_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    last_error: str | None = None
+    total_products: int = Field(default=0, ge=0)
+    processed_products: int = Field(default=0, ge=0)
+
+
+class WeightRecalcStartResponse(BaseModel):
+    ok: bool = True
+    queued: int = Field(default=0, ge=0)
+    started: bool = False
+    status: WeightRecalcStatusResponse
+
+
+class FilterWeightRuleUpdateEntry(BaseModel):
+    filter_slug: str = Field(min_length=1, max_length=255)
+    weight_rule_id: int | None = Field(default=None, ge=1)
+
+
+class FilterWeightRuleUpdateRequest(BaseModel):
+    items: list[FilterWeightRuleUpdateEntry] = Field(default_factory=list)
+
+
+class FilterWeightRuleResponse(BaseModel):
+    filter_slug: str
+    filter_title: str
+    display_title: str | None = None
+    product_count: int = Field(default=0, ge=0)
+    weight_rule_id: int | None = None
+    weight_grams: int | None = None
+
+
+class PricingSvcRuleEntry(BaseModel):
+    min_rub: float = Field(ge=0.0, le=100000000.0)
+    max_rub: float | None = Field(default=None, ge=0.0, le=100000000.0)
+    mode: Literal["fixed_rub", "percent"] = "fixed_rub"
+    value: float = Field(ge=0.0, le=100000000.0)
+
+
 class PricingSettingsUpdateRequest(BaseModel):
     markup_multiplier: float | None = Field(default=None, ge=0.1, le=20.0)
     weight_tolerance: float | None = Field(default=None, ge=0.1, le=5.0)
@@ -60,6 +103,7 @@ class PricingSettingsUpdateRequest(BaseModel):
     customs_processing_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     customs_fixed_rub: float | None = Field(default=None, ge=0.0, le=1_000_000.0)
     tax_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    svc_rules: list[PricingSvcRuleEntry] | None = None
 
 
 class AdminUiSettingsResponse(BaseModel):
@@ -132,6 +176,7 @@ class PricingSettingsResponse(BaseModel):
     bybit_worker_interval_sec: int = 0
     bybit_last_updated_at: str | None = None
     bybit_last_error: str | None = None
+    svc_rules: list[PricingSvcRuleEntry] = Field(default_factory=list)
     suppliers: list[PricingSupplierResponse] = Field(default_factory=list)
     formula_latex: str = ""
     formula_lines: list[str] = Field(default_factory=list)
@@ -152,6 +197,7 @@ class SettingsTransferPricingSettings(BaseModel):
     customs_processing_rate: float
     customs_fixed_rub: float
     tax_rate: float
+    svc_rules: list[PricingSvcRuleEntry] = Field(default_factory=list)
 
 
 class SettingsTransferAdminUiSettings(BaseModel):
@@ -221,6 +267,7 @@ class SettingsTransferTaxonomyFilterNode(BaseModel):
     title: str = Field(min_length=1)
     display_title: str | None = None
     mobile_pair_slug: str | None = Field(default=None, min_length=1, max_length=255)
+    default_weight_grams: int | None = Field(default=None, ge=1, le=1000000)
     node_kind: Literal["filter", "multifilter"] = "filter"
     is_enabled: bool = True
     local_category_keywords: list[str] = Field(default_factory=list)
@@ -267,8 +314,37 @@ class SettingsTransferShowcaseMedia(BaseModel):
     mobile_carousel: list[SettingsTransferShowcaseCarouselEntry] = Field(default_factory=list)
 
 
+class SettingsTransferSiteAbout(BaseModel):
+    text: str = ""
+    photo_asset_checksums: list[str] = Field(default_factory=list)
+
+
+class SettingsTransferSiteQuestionItem(BaseModel):
+    question: str = ""
+    answer: str = ""
+    is_enabled: bool = True
+    is_expanded_by_default: bool = False
+    position: int = Field(ge=1, le=1000000)
+
+
+class SettingsTransferSiteNotification(BaseModel):
+    title: str = ""
+    description: str = ""
+    button_text: str = ""
+    button_url: str = ""
+    image_asset_checksum: str | None = Field(default=None, min_length=64, max_length=64)
+    version: int = Field(default=1, ge=1, le=1000000)
+    position: int = Field(default=1, ge=1, le=1000000)
+
+
+class SettingsTransferSiteContent(BaseModel):
+    about: SettingsTransferSiteAbout = Field(default_factory=SettingsTransferSiteAbout)
+    notifications: list[SettingsTransferSiteNotification] = Field(default_factory=list)
+    questions: list[SettingsTransferSiteQuestionItem] = Field(default_factory=list)
+
+
 class SettingsTransferPayload(BaseModel):
-    schema_version: int = Field(default=5, ge=1, le=1000)
+    schema_version: int = Field(default=8, ge=1, le=1000)
     exported_at: str | None = None
     project: str | None = None
     pricing_settings: SettingsTransferPricingSettings
@@ -280,6 +356,7 @@ class SettingsTransferPayload(BaseModel):
     designer_source_names: list[SettingsTransferDesignerSourceNameEntry] = Field(default_factory=list)
     taxonomy: SettingsTransferTaxonomyState = Field(default_factory=SettingsTransferTaxonomyState)
     showcase_media: SettingsTransferShowcaseMedia = Field(default_factory=SettingsTransferShowcaseMedia)
+    site_content: SettingsTransferSiteContent = Field(default_factory=SettingsTransferSiteContent)
     image_assets: list[SettingsTransferImageAssetEntry] = Field(default_factory=list)
 
 

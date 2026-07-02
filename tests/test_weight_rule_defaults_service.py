@@ -27,3 +27,20 @@ def test_weight_rule_defaults_do_not_reseed_missing_rules_when_custom_rules_exis
     finally:
         db.rollback()
         db.close()
+
+
+def test_weight_rule_defaults_do_not_seed_rules_when_database_is_empty() -> None:
+    db = SessionLocal()
+    try:
+        db.query(WeightRuleKeyword).delete(synchronize_session=False)
+        db.query(WeightRule).delete(synchronize_session=False)
+        db.flush()
+
+        WeightRuleService(db).ensure_default_rules()
+        db.flush()
+
+        active_rules = db.query(WeightRule).filter(WeightRule.is_enabled.is_(True)).all()
+        assert active_rules == []
+    finally:
+        db.rollback()
+        db.close()

@@ -37,13 +37,14 @@ _FORMULA_LINES = [
     "PFR = BUY * PFRP",
     "CDR = ((max(0, SPE - THR) * DUT) * (1 + CPR)) * (E2U * BFX) + CFX",
     "SUB = BUY + PFR + CDR + SSR[SUP,RNG]",
-    "SUBM = SUB * MUP",
+    "SVC = configurable surcharge by BUY (fixed RUB or percent)",
+    "SUBM = SUB * MUP + SVC",
     "TAX = SUBM * TXR",
     "FPR = round(SUBM + TAX, RND)",
 ]
 
 _FORMULA_LATEX = (
-    r"\operatorname{round}_{RND}\!\left(\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,RNG]\right)\cdot MUP\right)+\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,RNG]\right)\cdot MUP\cdot TXR\right)\right)"
+    r"\operatorname{round}_{RND}\!\left(\left(\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,RNG]\right)\cdot MUP\right)+SVC\right)+\left(\left(\left(\left((SPU\cdot(BBR+BEX)\cdot PRM+BSC)+((SPU\cdot(BBR+BEX)\cdot PRM+BSC)\cdot PFRP)+\left((\max\!\left(0,SPE-THR\right)\cdot DUT)\cdot(1+CPR)\cdot(E2U\cdot(BBR+BEX))+CFX\right)+SSR[SUP,RNG]\right)\cdot MUP\right)+SVC\right)\cdot TXR\right)\right)"
 )
 
 _FORMULA_LEGEND = [
@@ -71,7 +72,8 @@ _FORMULA_LEGEND = [
     {"key": "SUP", "description": "Поставщик."},
     {"key": "RNG", "description": "Весовой диапазон тарифа доставки."},
     {"key": "SUB", "description": "База до наценки: BUY + PFR + CDR + SSR."},
-    {"key": "SUBM", "description": "Сумма до налога: SUB * MUP."},
+    {"key": "SVC", "description": "Своя надбавка по диапазону BUY (фикс в RUB или процент от BUY)."},
+    {"key": "SUBM", "description": "Сумма до налога: SUB * MUP + SVC."},
     {"key": "TXR", "description": "Ставка налога."},
     {"key": "TAX", "description": "Налог в RUB."},
     {"key": "MUP", "description": "Множитель наценки для SUB."},
@@ -100,6 +102,11 @@ class PricingSettingsService:
         self.supplier_repo = CatalogSupplierRepository(db)
         self.source_repo = CatalogSourceRepository(db)
 
+    def _enqueue_site_sort_price_refresh_for_all_products(self) -> None:
+        from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
+
+        SiteCatalogSortPriceService(self.db).enqueue_all_active_products()
+
     def _get_or_create_pricing_entity(self) -> tuple[PricingSetting, bool]:
         current = self.repo.get_singleton()
         if current is not None:
@@ -119,6 +126,7 @@ class PricingSettingsService:
             customs_processing_rate=float(seed.customs_processing_rate),
             customs_fixed_rub=float(seed.customs_fixed_rub),
             tax_rate=float(seed.tax_rate),
+            svc_rules=[rule.model_dump() for rule in seed.svc_rules],
             final_rounding_mode=str(seed.final_rounding_mode),
             bybit_bucket_rates=[],
         )
@@ -154,6 +162,7 @@ class PricingSettingsService:
         pricing.customs_processing_rate = float(seed.pricing_settings.customs_processing_rate)
         pricing.customs_fixed_rub = float(seed.pricing_settings.customs_fixed_rub)
         pricing.tax_rate = float(seed.pricing_settings.tax_rate)
+        pricing.svc_rules = [rule.model_dump() for rule in seed.pricing_settings.svc_rules]
         pricing.final_rounding_mode = str(seed.pricing_settings.final_rounding_mode)
         pricing.bybit_bucket_rates = []
         pricing.bybit_last_updated_at = None
@@ -233,6 +242,13 @@ class PricingSettingsService:
         return value
 
     @staticmethod
+    def _normalize_svc_rule_mode(raw: str | None, *, default: str = "fixed_rub") -> str:
+        value = (raw or default).strip().lower()
+        if value not in {"fixed_rub", "percent"}:
+            return default
+        return value
+
+    @staticmethod
     def _apply_final_rounding(value: float, mode: str) -> float:
         safe_value = float(value)
         normalized_mode = PricingSettingsService._normalize_final_rounding_mode(mode)
@@ -247,6 +263,60 @@ class PricingSettingsService:
         }
         step = float(step_map.get(normalized_mode, 1.0))
         return float(math.ceil(safe_value / step) * step)
+
+    @classmethod
+    def _normalize_svc_rules(cls, raw_rules: Any) -> list[dict[str, float | str | None]]:
+        if not isinstance(raw_rules, list):
+            return []
+        normalized: list[dict[str, float | str | None]] = []
+        for row in raw_rules:
+            if not isinstance(row, dict):
+                continue
+            min_rub = cls._safe_float(row.get("min_rub"))
+            max_rub = cls._safe_float(row.get("max_rub"))
+            value = cls._safe_float(row.get("value"))
+            if min_rub is None or value is None:
+                continue
+            safe_min = max(0.0, float(min_rub))
+            safe_max = None if max_rub is None else max(0.0, float(max_rub))
+            if safe_max is not None and safe_max <= safe_min:
+                continue
+            safe_mode = cls._normalize_svc_rule_mode(str(row.get("mode") or "fixed_rub"))
+            safe_value = max(0.0, float(value))
+            normalized.append(
+                {
+                    "min_rub": round(safe_min, 6),
+                    "max_rub": (round(safe_max, 6) if safe_max is not None else None),
+                    "mode": safe_mode,
+                    "value": round(safe_value, 6),
+                }
+            )
+        normalized.sort(
+            key=lambda item: (
+                float(item["min_rub"]),
+                float(item["max_rub"]) if item.get("max_rub") is not None else float("inf"),
+            )
+        )
+        return normalized
+
+    @staticmethod
+    def _validate_svc_rules_no_overlap(rules: list[dict[str, float | str | None]]) -> None:
+        previous_max: float | None = None
+        for item in rules:
+            min_rub = float(item["min_rub"])
+            max_raw = item.get("max_rub")
+            max_rub = None if max_raw is None else float(max_raw)
+            if max_rub is not None and max_rub <= min_rub:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="SVC: конец диапазона должен быть больше начала",
+                )
+            if previous_max is not None and min_rub < previous_max:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="SVC: диапазоны пересекаются, укажи непересекающиеся интервалы",
+                )
+            previous_max = max_rub
 
     @staticmethod
     def _to_rub(value: float, currency: str, *, usd_to_rub: float, eur_to_rub: float) -> float:
@@ -325,6 +395,35 @@ class PricingSettingsService:
                 normalized.append({"min_kg": previous_kg, "max_kg": None, "rub": float(normalized[-1]["rub"])})
         normalized.sort(key=lambda item: (float(item.get("min_kg") or 0.0), float(item.get("max_kg") or float("inf"))))
         return normalized
+
+    @staticmethod
+    def _pick_range_rule(
+        *,
+        value: float,
+        rules: list[Any],
+        min_key: str,
+        max_key: str,
+    ) -> Any | None:
+        target = float(value)
+        for row in rules:
+            min_raw = PricingSettingsService._safe_float(PricingSettingsService._read_row_value(row, min_key))
+            max_raw = PricingSettingsService._safe_float(PricingSettingsService._read_row_value(row, max_key))
+            min_ok = True if min_raw is None else target >= float(min_raw)
+            max_ok = True if max_raw is None else target <= float(max_raw)
+            if min_ok and max_ok:
+                return row
+        return None
+
+    @staticmethod
+    def _compute_rule_amount(base_value: float, rule: Any | None) -> tuple[float, dict[str, Any]]:
+        if rule is None:
+            return 0.0, {"mode": "missing_rule", "value": 0.0}
+        mode = PricingSettingsService._normalize_svc_rule_mode(
+            str(PricingSettingsService._read_row_value(rule, "mode") or "fixed_rub")
+        )
+        value = max(0.0, float(PricingSettingsService._safe_float(PricingSettingsService._read_row_value(rule, "value")) or 0.0))
+        amount = float(base_value) * value if mode == "percent" else value
+        return max(0.0, float(amount)), {"mode": mode, "value": value}
 
     @staticmethod
     def _normalize_image_asset_ids(raw: Any, *, limit: int) -> list[int]:
@@ -409,6 +508,10 @@ class PricingSettingsService:
 
     def get_settings(self, *, refresh_bybit: bool = True) -> PricingSettingsResponse:
         entity, created = self._get_or_create_pricing_entity()
+        normalized_svc_rules = self._normalize_svc_rules(getattr(entity, "svc_rules", None))
+        svc_rules_changed = normalized_svc_rules != (getattr(entity, "svc_rules", None) or [])
+        if svc_rules_changed:
+            entity.svc_rules = normalized_svc_rules
         bybit_status = "skipped"
         bybit_warning = None
         bybit_snapshot = None
@@ -425,9 +528,11 @@ class PricingSettingsService:
             bybit_error = str(getattr(entity, "bybit_last_error", "") or "") or None
             if bybit_error:
                 bybit_warning = f"WARN: Bybit временно недоступен, используется сохраненный курс. Причина: {bybit_error}"
-        if created or bybit_changed:
+        if created or svc_rules_changed or bybit_changed:
             self.db.commit()
             self.db.refresh(entity)
+            if bybit_changed:
+                self._enqueue_site_sort_price_refresh_for_all_products()
         suppliers = self.supplier_repo.list_all_with_rates()
         return self._to_response(
             entity,
@@ -441,6 +546,9 @@ class PricingSettingsService:
     def update_settings(self, payload: PricingSettingsUpdateRequest) -> PricingSettingsResponse:
         entity, created = self._get_or_create_pricing_entity()
         patch = payload.model_dump(exclude_none=True)
+        if "svc_rules" in patch:
+            patch["svc_rules"] = self._normalize_svc_rules(patch.get("svc_rules"))
+            self._validate_svc_rules_no_overlap(patch["svc_rules"])
         if "final_rounding_mode" in patch:
             patch["final_rounding_mode"] = self._normalize_final_rounding_mode(
                 patch.get("final_rounding_mode"),
@@ -451,6 +559,8 @@ class PricingSettingsService:
         self.db.commit()
         if created or patch:
             self.db.refresh(entity)
+        if patch:
+            self._enqueue_site_sort_price_refresh_for_all_products()
         suppliers = self.supplier_repo.list_all_with_rates()
         return self._to_response(entity, suppliers=suppliers)
 
@@ -485,6 +595,7 @@ class PricingSettingsService:
         if bybit_last_error_value is None and bybit_rate_status == "fallback_stored":
             bybit_last_error_value = "Bybit fetch failed"
         effective_usd_to_rub, effective_eur_to_rub = PricingSettingsService._effective_rates_from_entity(entity)
+        normalized_svc_rules = PricingSettingsService._normalize_svc_rules(getattr(entity, "svc_rules", None))
         return PricingSettingsResponse(
             markup_multiplier=float(entity.markup_multiplier),
             weight_tolerance=float(entity.weight_tolerance),
@@ -511,6 +622,7 @@ class PricingSettingsService:
             bybit_worker_interval_sec=int(app_settings.pricing_bybit_worker_interval_sec),
             bybit_last_updated_at=bybit_last_updated_at,
             bybit_last_error=bybit_last_error_value,
+            svc_rules=normalized_svc_rules,
             suppliers=[
                 PricingSettingsService._supplier_to_response(
                     item,
@@ -637,6 +749,8 @@ class PricingSettingsService:
             self.supplier_repo.replace_ranges(supplier_id=int(supplier.id), ranges=normalized)
 
         self.db.commit()
+        if patch:
+            self._enqueue_site_sort_price_refresh_for_all_products()
         refreshed = self.supplier_repo.get_by_id(supplier.id)
         if refreshed is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Тариф не найден после обновления")
@@ -1111,10 +1225,16 @@ class PricingSettingsService:
             )
         delivery_rub = supplier_shipping_rub
 
-        service_fee_rub = 0.0
+        svc_rule = PricingSettingsService._pick_range_rule(
+            value=buyout_rub,
+            rules=getattr(settings, "svc_rules", []) or [],
+            min_key="min_rub",
+            max_key="max_rub",
+        )
+        service_fee_rub, service_fee_meta = PricingSettingsService._compute_rule_amount(buyout_rub, svc_rule)
         subtotal_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub
         markup_multiplier = max(0.0, float(settings.markup_multiplier))
-        subtotal_after_markup_rub = subtotal_rub * markup_multiplier
+        subtotal_after_markup_rub = (subtotal_rub * markup_multiplier) + service_fee_rub
         tax_rub = subtotal_after_markup_rub * max(0.0, float(settings.tax_rate))
         pass_through_costs_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub
         raw_final_price_rub = float(subtotal_after_markup_rub + tax_rub)
@@ -1168,8 +1288,8 @@ class PricingSettingsService:
                 "shipping_rule_max_kg": supplier_meta.get("shipping_tariff_max_kg"),
                 "shipping_rule_label": supplier_meta.get("shipping_tariff_label"),
                 "service_fee_rub": round(service_fee_rub, 4),
-                "service_fee_mode": "not_used",
-                "service_fee_value": 0.0,
+                "service_fee_mode": service_fee_meta.get("mode"),
+                "service_fee_value": service_fee_meta.get("value"),
                 "tax_rate": round(float(settings.tax_rate), 6),
                 "tax_rub": round(tax_rub, 4),
                 "subtotal_rub": round(subtotal_rub, 4),

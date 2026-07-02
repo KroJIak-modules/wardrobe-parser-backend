@@ -20,6 +20,10 @@ from app.models import (
     PricingSetting,
     Product,
     ProductListing,
+    SiteAboutPhoto,
+    SiteAboutSetting,
+    SiteNotificationSetting,
+    SiteQuestionItem,
     Source,
     SourceSetting,
     ShowcaseCarouselImage,
@@ -52,7 +56,6 @@ from app.schemas.taxonomy import (
 )
 from app.services.settings.pricing_service import PricingSettingsService
 from app.services.settings.default_admin_settings import DefaultAdminSettingsLoader
-from app.services.settings.weight_rule_service import WeightRuleService
 from app.schemas.admin_settings import (
     SettingsTransferAdminUiSettings,
     SettingsTransferDesignerEntry,
@@ -70,11 +73,16 @@ from app.schemas.admin_settings import (
     SettingsTransferTaxonomyState,
     SettingsTransferShowcaseCarouselEntry,
     SettingsTransferShowcaseMedia,
+    SettingsTransferSiteAbout,
+    SettingsTransferSiteContent,
+    SettingsTransferSiteNotification,
+    SettingsTransferSiteQuestionItem,
     SettingsTransferWeightRuleEntry,
 )
 from app.schemas.showcase_media import ShowcaseStateUpdateRequest
+from app.services.catalog.site_content_service import SiteContentService
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 8
 _PROJECT_NAME = "wardrobe-parser-platform"
 
 _PRICING_EXPORT_FIELDS = [
@@ -91,6 +99,7 @@ _PRICING_EXPORT_FIELDS = [
     "customs_processing_rate",
     "customs_fixed_rub",
     "tax_rate",
+    "svc_rules",
 ]
 
 _PRICING_IMPORT_FIELDS = set(_PRICING_EXPORT_FIELDS)
@@ -198,6 +207,7 @@ class SettingsTransferService:
                 title=str(node.title),
                 display_title=(str(node.display_title) if node.display_title else None),
                 mobile_pair_slug=(str(node.mobile_pair_slug) if node.mobile_pair_slug else None),
+                default_weight_grams=None,
                 node_kind=str(node.node_kind),
                 is_enabled=bool(node.is_enabled),
                 local_category_keywords=[str(item) for item in node.local_category_keywords],
@@ -210,8 +220,28 @@ class SettingsTransferService:
 
     def _export_taxonomy(self) -> SettingsTransferTaxonomyState:
         state = self.taxonomy.get_state()
+        weight_rule_by_id = {
+            int(rule.id): int(rule.weight_grams)
+            for rule in self.weight_rule_repo.list_active()
+            if rule.id is not None and rule.weight_grams is not None
+        }
+
+        def inject_weight_grams(nodes: list[SettingsTransferTaxonomyFilterNode], source_nodes: list[TaxonomyFilterNode]) -> None:
+            source_by_slug = {
+                str(node.slug or "").strip(): node
+                for node in source_nodes
+                if str(node.slug or "").strip()
+            }
+            for node in nodes:
+                source = source_by_slug.get(str(node.slug or "").strip())
+                rule_id = int(source.default_weight_rule_id) if source is not None and source.default_weight_rule_id is not None else None
+                node.default_weight_grams = weight_rule_by_id.get(rule_id) if rule_id is not None else None
+                inject_weight_grams(node.children, source.children if source is not None else [])
+
+        serialized_filters = self._serialize_taxonomy_filters(state.filters)
+        inject_weight_grams(serialized_filters, state.filters)
         return SettingsTransferTaxonomyState(
-            filters=self._serialize_taxonomy_filters(state.filters),
+            filters=serialized_filters,
             custom_catalogs=[
                 SettingsTransferTaxonomyCustomCatalog(
                     slug=str(catalog.slug or "").strip(),
@@ -240,20 +270,85 @@ class SettingsTransferService:
             ],
         )
 
+    def _export_site_content(self) -> SettingsTransferSiteContent:
+        about = self.db.query(SiteAboutSetting).order_by(SiteAboutSetting.id.asc()).first()
+        notifications = (
+            self.db.query(SiteNotificationSetting)
+            .filter(SiteNotificationSetting.deleted_at.is_(None))
+            .order_by(SiteNotificationSetting.created_at.asc(), SiteNotificationSetting.id.asc())
+            .all()
+        )
+        about_rows = (
+            self.db.query(SiteAboutPhoto)
+            .join(ImageAsset, ImageAsset.id == SiteAboutPhoto.image_asset_id)
+            .order_by(SiteAboutPhoto.position.asc(), SiteAboutPhoto.id.asc())
+            .all()
+        )
+        return SettingsTransferSiteContent(
+            about=SettingsTransferSiteAbout(
+                text=str(getattr(about, "body_text", "") or ""),
+                photo_asset_checksums=[
+                    str(row.image_asset.checksum_sha256)
+                    for row in about_rows
+                    if getattr(row, "image_asset", None) is not None
+                    and str(getattr(row.image_asset, "checksum_sha256", "") or "").strip()
+                ],
+            ),
+            notifications=[
+                SettingsTransferSiteNotification(
+                    title=str(getattr(notification, "title", "") or ""),
+                    description=str(getattr(notification, "description", "") or ""),
+                    button_text=str(getattr(notification, "button_text", "") or ""),
+                    button_url=str(getattr(notification, "button_url", "") or ""),
+                    image_asset_checksum=(
+                        str(notification.image_asset.checksum_sha256)
+                        if getattr(notification, "image_asset", None) is not None
+                        and str(getattr(notification.image_asset, "checksum_sha256", "") or "").strip()
+                        else None
+                    ),
+                    version=int(getattr(notification, "version", 1) or 1),
+                    position=index,
+                )
+                for index, notification in enumerate(notifications, start=1)
+            ],
+            questions=[
+                SettingsTransferSiteQuestionItem(
+                    question=str(item.question or ""),
+                    answer=str(item.answer or ""),
+                    is_enabled=bool(item.is_enabled),
+                    is_expanded_by_default=bool(item.is_expanded_by_default),
+                    position=int(item.position),
+                )
+                for item in (
+                    self.db.query(SiteQuestionItem)
+                    .order_by(SiteQuestionItem.position.asc(), SiteQuestionItem.id.asc())
+                    .all()
+                )
+            ],
+        )
+
     @staticmethod
-    def _import_taxonomy_filters(nodes: list[SettingsTransferTaxonomyFilterNode]) -> list[TaxonomyFilterNode]:
+    def _import_taxonomy_filters(
+        nodes: list[SettingsTransferTaxonomyFilterNode],
+        *,
+        weight_rule_id_by_grams: dict[int, int],
+    ) -> list[TaxonomyFilterNode]:
         return [
             TaxonomyFilterNode(
                 slug=str(node.slug).strip(),
                 title=node.title,
                 display_title=node.display_title,
                 mobile_pair_slug=node.mobile_pair_slug,
+                default_weight_rule_id=weight_rule_id_by_grams.get(int(node.default_weight_grams)) if node.default_weight_grams is not None else None,
                 node_kind=node.node_kind,
                 is_enabled=node.is_enabled,
                 local_category_keywords=[str(item) for item in node.local_category_keywords],
                 title_keywords=[str(item) for item in node.title_keywords],
                 manual_product_ids=[],
-                children=SettingsTransferService._import_taxonomy_filters(node.children),
+                children=SettingsTransferService._import_taxonomy_filters(
+                    node.children,
+                    weight_rule_id_by_grams=weight_rule_id_by_grams,
+                ),
             )
             for node in nodes
         ]
@@ -394,6 +489,30 @@ class SettingsTransferService:
         for row in showcase_media_settings:
             if getattr(row, "image_asset", None) is not None:
                 export_assets.append((row.image_asset, "showcase"))
+        site_content = self._export_site_content()
+        for checksum in site_content.about.photo_asset_checksums:
+            asset = (
+                self.db.query(ImageAsset)
+                .filter(
+                    ImageAsset.scope == SiteContentService.ASSET_SCOPE,
+                    ImageAsset.checksum_sha256 == str(checksum or "").strip(),
+                )
+                .one_or_none()
+            )
+            if asset is not None:
+                export_assets.append((asset, SiteContentService.ASSET_SCOPE))
+        for notification in site_content.notifications:
+            if notification.image_asset_checksum:
+                asset = (
+                    self.db.query(ImageAsset)
+                    .filter(
+                        ImageAsset.scope == SiteContentService.ASSET_SCOPE,
+                        ImageAsset.checksum_sha256 == str(notification.image_asset_checksum or "").strip(),
+                    )
+                    .one_or_none()
+                )
+                if asset is not None:
+                    export_assets.append((asset, SiteContentService.ASSET_SCOPE))
 
         return SettingsTransferPayload(
             schema_version=_SCHEMA_VERSION,
@@ -456,6 +575,7 @@ class SettingsTransferService:
                     if getattr(row, "image_asset", None) is not None and str(getattr(row, "viewport", "") or "") == "mobile"
                 ],
             ),
+            site_content=site_content,
             image_assets=self._export_image_assets(export_assets),
         )
 
@@ -466,7 +586,7 @@ class SettingsTransferService:
                 detail=f"Unsupported schema_version: {payload.schema_version}",
             )
 
-        asset_map: dict[str, ImageAsset] = {}
+        asset_map: dict[tuple[str, str], ImageAsset] = {}
         created_assets: list[ImageAsset] = []
         try:
             asset_map, created_assets = self._import_image_assets(payload.image_assets)
@@ -479,6 +599,7 @@ class SettingsTransferService:
             weight_count = self._import_weight_rules(payload.weight_rules)
             taxonomy_state = self._import_taxonomy(payload.taxonomy)
             showcase_media_updated = self._import_showcase_media(payload.showcase_media, asset_map=asset_map)
+            site_content_updated = self._import_site_content(payload.site_content, asset_map=asset_map)
             DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
             pruned_source_count = self._prune_sources(payload.sources)
             pruned_supplier_count = self._prune_suppliers(payload.suppliers)
@@ -506,6 +627,9 @@ class SettingsTransferService:
                     "taxonomy_custom_catalogs_replaced": len(taxonomy_state.custom_catalogs),
                     "showcase_categories_replaced": len(taxonomy_state.showcase_categories),
                     "showcase_media_assets_linked": showcase_media_updated,
+                    "site_about_photos_linked": site_content_updated["about_photos"],
+                    "site_notifications_replaced": site_content_updated["notifications"],
+                    "site_questions_replaced": site_content_updated["questions"],
                 },
             )
         except HTTPException:
@@ -559,11 +683,18 @@ class SettingsTransferService:
         self.db.query(WeightRuleKeyword).delete(synchronize_session=False)
         self.db.query(WeightRule).delete(synchronize_session=False)
         self.db.flush()
-        WeightRuleService(self.db).ensure_default_rules()
-        weight_rule_count = len(self.weight_rule_repo.list_active())
+        weight_rule_count = 0
 
         # 4) Reset designer source names.
         self.db.query(DesignerSourceName).delete(synchronize_session=False)
+        self.db.query(SiteAboutPhoto).delete(synchronize_session=False)
+        self.db.query(SiteQuestionItem).delete(synchronize_session=False)
+        about = self.db.query(SiteAboutSetting).filter(SiteAboutSetting.id == 1).one_or_none()
+        if about is None:
+            about = SiteAboutSetting(id=1, body_text="")
+            self.db.add(about)
+        else:
+            about.body_text = ""
 
         self.db.commit()
         return SettingsTransferResponse(
@@ -692,8 +823,16 @@ class SettingsTransferService:
         return len(kept_ids)
 
     def _import_taxonomy(self, payload: SettingsTransferTaxonomyState) -> TaxonomyState:
+        weight_rule_id_by_grams = {
+            int(rule.weight_grams): int(rule.id)
+            for rule in self.weight_rule_repo.list_active()
+            if rule.id is not None and rule.weight_grams is not None
+        }
         state = TaxonomyState(
-            filters=self._import_taxonomy_filters(payload.filters),
+            filters=self._import_taxonomy_filters(
+                payload.filters,
+                weight_rule_id_by_grams=weight_rule_id_by_grams,
+            ),
             custom_catalogs=[
                 TaxonomyCustomCatalog(
                     slug=str(item.slug).strip(),
@@ -805,6 +944,83 @@ class SettingsTransferService:
             + len(state.mobile.carousel_assets)
         )
 
+    def _import_site_content(
+        self,
+        payload: SettingsTransferSiteContent,
+        *,
+        asset_map: dict[tuple[str, str], ImageAsset],
+    ) -> dict[str, int]:
+        about = self.db.query(SiteAboutSetting).order_by(SiteAboutSetting.id.asc()).first()
+        if about is None:
+            about = SiteAboutSetting(id=1)
+            self.db.add(about)
+            self.db.flush()
+        about.body_text = str(payload.about.text or "")
+
+        self.db.query(SiteAboutPhoto).delete(synchronize_session=False)
+        self.db.flush()
+        linked_about_photos = 0
+        seen_checksums: set[str] = set()
+        for position, checksum in enumerate(payload.about.photo_asset_checksums, start=1):
+            normalized_checksum = str(checksum or "").strip()
+            if not normalized_checksum or normalized_checksum in seen_checksums:
+                continue
+            seen_checksums.add(normalized_checksum)
+            asset = self._require_asset_checksum(
+                asset_map=asset_map,
+                checksum=normalized_checksum,
+                expected_scope=SiteContentService.ASSET_SCOPE,
+                field_label=f"Фото 'Обо мне' #{position}",
+            )
+            self.db.add(SiteAboutPhoto(image_asset_id=int(asset.id), position=linked_about_photos + 1))
+            linked_about_photos += 1
+
+        self.db.query(SiteQuestionItem).delete(synchronize_session=False)
+        self.db.flush()
+        linked_questions = 0
+        for item in sorted(payload.questions, key=lambda row: int(row.position)):
+            self.db.add(
+                SiteQuestionItem(
+                    question=str(item.question or ""),
+                    answer=str(item.answer or ""),
+                    is_enabled=bool(item.is_enabled),
+                    is_expanded_by_default=bool(item.is_expanded_by_default),
+                    position=linked_questions + 1,
+                )
+            )
+            linked_questions += 1
+        self.db.flush()
+        self.db.query(SiteNotificationSetting).delete(synchronize_session=False)
+        self.db.flush()
+        linked_notifications = 0
+        for item in sorted(payload.notifications, key=lambda row: int(row.position)):
+            image_asset_id = None
+            if item.image_asset_checksum:
+                notification_asset = self._require_asset_checksum(
+                    asset_map=asset_map,
+                    checksum=str(item.image_asset_checksum or "").strip(),
+                    expected_scope=SiteContentService.ASSET_SCOPE,
+                    field_label=f"Фото уведомления #{linked_notifications + 1}",
+                )
+                image_asset_id = int(notification_asset.id)
+            self.db.add(
+                SiteNotificationSetting(
+                    title=str(item.title or ""),
+                    description=str(item.description or ""),
+                    button_text=str(item.button_text or ""),
+                    button_url=str(item.button_url or ""),
+                    version=max(1, int(item.version or 1)),
+                    image_asset_id=image_asset_id,
+                )
+            )
+            linked_notifications += 1
+        self.db.flush()
+        return {
+            "about_photos": linked_about_photos,
+            "notifications": linked_notifications,
+            "questions": linked_questions,
+        }
+
     def _prune_sources(self, rows: list[SettingsTransferSourceEntry]) -> int:
         desired_keys = {
             SourceRegistryService.normalize_source_key(item.key)
@@ -905,7 +1121,6 @@ class SettingsTransferService:
         return deleted
 
     def _import_pricing(self, payload: SettingsTransferPricingSettings) -> int:
-        row, _ = self.pricing_repo.get_or_create_default()
         values = payload.model_dump()
         updated_fields = 0
         numeric_fields = {
@@ -922,6 +1137,8 @@ class SettingsTransferService:
             "customs_fixed_rub",
             "tax_rate",
         }
+        normalized_svc_rules = PricingSettingsService._normalize_svc_rules(values.get("svc_rules"))
+        PricingSettingsService._validate_svc_rules_no_overlap(normalized_svc_rules)
         mapped_values = {
             "markup_multiplier": float(values["markup_multiplier"]),
             "weight_tolerance": float(values["weight_tolerance"]),
@@ -936,7 +1153,31 @@ class SettingsTransferService:
             "customs_processing_rate": float(values["customs_processing_rate"]),
             "customs_fixed_rub": float(values["customs_fixed_rub"]),
             "tax_rate": float(values["tax_rate"]),
+            "svc_rules": normalized_svc_rules,
         }
+        row = self.pricing_repo.get_singleton()
+        if row is None:
+            row = PricingSetting(
+                id=1,
+                markup_multiplier=mapped_values["markup_multiplier"],
+                weight_tolerance=mapped_values["weight_tolerance"],
+                customs_threshold_eur=mapped_values["customs_threshold_eur"],
+                customs_duty_rate=mapped_values["customs_duty_rate"],
+                eur_to_rub_rate=mapped_values["eur_to_rub_rate"],
+                usd_to_rub_rate=mapped_values["usd_to_rub_rate"],
+                usdt_to_rub_rate=mapped_values["usdt_to_rub_rate"],
+                usdt_extra_rub=mapped_values["usdt_extra_rub"],
+                final_rounding_mode=mapped_values["final_rounding_mode"],
+                payment_fee_rate=mapped_values["payment_fee_rate"],
+                customs_processing_rate=mapped_values["customs_processing_rate"],
+                customs_fixed_rub=mapped_values["customs_fixed_rub"],
+                tax_rate=mapped_values["tax_rate"],
+                svc_rules=mapped_values["svc_rules"],
+                bybit_bucket_rates=[],
+            )
+            self.db.add(row)
+            self.db.flush()
+            return len(mapped_values)
         for key, raw_value in mapped_values.items():
             current_value = getattr(row, key)
             value_changed = (
@@ -1022,7 +1263,7 @@ class SettingsTransferService:
         sources: list[SettingsTransferSourceEntry],
         *,
         supplier_map: dict[str, Supplier],
-        asset_map: dict[str, ImageAsset],
+        asset_map: dict[tuple[str, str], ImageAsset],
     ) -> int:
         if not supplier_map:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет тарифов для назначения источникам")

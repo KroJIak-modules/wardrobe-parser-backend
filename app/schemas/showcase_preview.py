@@ -109,7 +109,7 @@ class CatalogPageHeader(BaseModel):
 
     title: str
     description: str | None = None
-    source: Literal["sale", "custom_catalog", "designer", "menu_filter", "all_products", "multiple_designers", "catalog"]
+    source: Literal["search", "sale", "custom_catalog", "designer", "menu_filter", "all_products", "multiple_designers", "catalog"]
 
 
 class CatalogViewContext(BaseModel):

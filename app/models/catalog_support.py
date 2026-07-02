@@ -181,19 +181,20 @@ class PricingSetting(Base):
     __tablename__ = "pricing_settings"
 
     id = Column(BigInteger, primary_key=True)
-    markup_multiplier = Column(Numeric(10, 4), nullable=False, default=1, server_default="1")
-    weight_tolerance = Column(Numeric(10, 4), nullable=False, default=1, server_default="1")
-    customs_threshold_eur = Column(Numeric(12, 2), nullable=False, default=200, server_default="200")
-    customs_duty_rate = Column(Numeric(10, 4), nullable=False, default=0.15, server_default="0.15")
-    eur_to_rub_rate = Column(Numeric(12, 4), nullable=False, default=105, server_default="105")
-    usd_to_rub_rate = Column(Numeric(12, 4), nullable=False, default=95, server_default="95")
-    usdt_to_rub_rate = Column(Numeric(12, 4), nullable=False, default=95, server_default="95")
-    usdt_extra_rub = Column(Numeric(12, 4), nullable=False, default=1, server_default="1")
-    payment_fee_rate = Column(Numeric(10, 4), nullable=False, default=0.02, server_default="0.02")
-    customs_processing_rate = Column(Numeric(10, 4), nullable=False, default=0.08, server_default="0.08")
-    customs_fixed_rub = Column(Numeric(12, 2), nullable=False, default=540, server_default="540")
-    tax_rate = Column(Numeric(10, 4), nullable=False, default=0.06, server_default="0.06")
-    final_rounding_mode = Column(String(32), nullable=False, default="unit", server_default="unit")
+    markup_multiplier = Column(Numeric(10, 4), nullable=False)
+    weight_tolerance = Column(Numeric(10, 4), nullable=False)
+    customs_threshold_eur = Column(Numeric(12, 2), nullable=False)
+    customs_duty_rate = Column(Numeric(10, 4), nullable=False)
+    eur_to_rub_rate = Column(Numeric(12, 4), nullable=False)
+    usd_to_rub_rate = Column(Numeric(12, 4), nullable=False)
+    usdt_to_rub_rate = Column(Numeric(12, 4), nullable=False)
+    usdt_extra_rub = Column(Numeric(12, 4), nullable=False)
+    payment_fee_rate = Column(Numeric(10, 4), nullable=False)
+    customs_processing_rate = Column(Numeric(10, 4), nullable=False)
+    customs_fixed_rub = Column(Numeric(12, 2), nullable=False)
+    tax_rate = Column(Numeric(10, 4), nullable=False)
+    svc_rules = Column(JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb"))
+    final_rounding_mode = Column(String(32), nullable=False)
     bybit_bucket_rates = Column(JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb"))
     bybit_last_updated_at = Column(DateTime(timezone=True), nullable=True)
     bybit_last_error = Column(String(1024), nullable=True)
@@ -223,6 +224,27 @@ class WeightRuleKeyword(Base):
 
     __table_args__ = (
         UniqueConstraint("rule_id", "keyword", name="uq_weight_rule_keyword"),
+    )
+
+
+class WeightRecalcRuntimeState(Base):
+    __tablename__ = "weight_recalc_runtime_state"
+
+    id = Column(Integer, primary_key=True)
+    status = Column(String(16), nullable=False, default="idle", server_default="idle")
+    queued_at = Column(DateTime(timezone=True), nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
+    total_products = Column(BigInteger, nullable=False, default=0, server_default="0")
+    processed_products = Column(BigInteger, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('idle', 'queued', 'running')", name="ck_weight_recalc_runtime_state_status"),
+        CheckConstraint("total_products >= 0", name="ck_weight_recalc_runtime_state_total_non_negative"),
+        CheckConstraint("processed_products >= 0", name="ck_weight_recalc_runtime_state_processed_non_negative"),
     )
 
 
@@ -278,6 +300,69 @@ class ShowcaseCarouselImage(Base):
     __table_args__ = (
         UniqueConstraint("viewport", "position", name="uq_showcase_carousel_images_viewport_position"),
         CheckConstraint("viewport IN ('desktop', 'mobile')", name="ck_showcase_carousel_images_viewport"),
+    )
+
+
+class SiteAboutSetting(Base):
+    __tablename__ = "site_about_settings"
+
+    id = Column(BigInteger, primary_key=True)
+    body_text = Column(Text, nullable=False, default="", server_default="")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class SiteAboutPhoto(Base):
+    __tablename__ = "site_about_photos"
+
+    id = Column(BigInteger, primary_key=True)
+    image_asset_id = Column(BigInteger, ForeignKey("image_assets.id", ondelete="CASCADE"), nullable=False)
+    position = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    image_asset = relationship("ImageAsset")
+
+    __table_args__ = (
+        UniqueConstraint("position", name="uq_site_about_photos_position"),
+    )
+
+
+class SiteQuestionItem(Base):
+    __tablename__ = "site_question_items"
+
+    id = Column(BigInteger, primary_key=True)
+    question = Column(Text, nullable=False)
+    answer = Column(Text, nullable=False, default="", server_default="")
+    is_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    is_expanded_by_default = Column(Boolean, nullable=False, default=False, server_default="false")
+    position = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("position", name="uq_site_question_items_position"),
+    )
+
+
+class SiteNotificationSetting(Base):
+    __tablename__ = "site_notification_settings"
+
+    id = Column(BigInteger, primary_key=True)
+    title = Column(Text, nullable=False, default="", server_default="")
+    description = Column(Text, nullable=False, default="", server_default="")
+    button_text = Column(String(255), nullable=False, default="", server_default="")
+    button_url = Column(String(2048), nullable=False, default="", server_default="")
+    image_asset_id = Column(BigInteger, ForeignKey("image_assets.id", ondelete="SET NULL"), nullable=True)
+    version = Column(Integer, nullable=False, default=1, server_default="1")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+    image_asset = relationship("ImageAsset", foreign_keys=[image_asset_id])
+
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="ck_site_notification_settings_version_positive"),
     )
 
 

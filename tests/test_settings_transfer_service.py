@@ -49,6 +49,7 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
     filter_slug = f"transfer-filter-{marker}"
     catalog_slug = f"transfer-catalog-{marker}"
     title_override = f"Витрина {marker}"
+    default_weight_grams = 2300
 
     shared_logo_hero_bytes = f"<svg xmlns='http://www.w3.org/2000/svg'><text>{marker}-shared</text></svg>".encode("utf-8")
     manual_logo_bytes = shared_logo_hero_bytes
@@ -106,6 +107,7 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
                         "title": f"Filter Child {marker}",
                         "display_title": None,
                         "mobile_pair_slug": None,
+                        "default_weight_grams": default_weight_grams,
                         "node_kind": "filter",
                         "is_enabled": True,
                         "local_category_keywords": ["child"],
@@ -114,6 +116,13 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
                     }
                 ],
             }
+        ]
+        payload_data["weight_rules"] = [
+            *payload_data["weight_rules"],
+            {
+                "weight_grams": default_weight_grams,
+                "keywords": ["transfer-bag"],
+            },
         ]
         payload_data["taxonomy"]["custom_catalogs"] = [
             {
@@ -183,8 +192,11 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
 
         exported_showcase_new = next(item for item in exported.taxonomy.showcase_categories if item.code == "new")
         assert exported_showcase_new.title == title_override
-        assert any(item.filter_slug == filter_slug for item in exported_showcase_new.attachments if item.kind == "filter")
+        assert not any(item.kind == "filter" for item in exported_showcase_new.attachments)
         assert any(item.custom_catalog_slug == catalog_slug for item in exported_showcase_new.attachments if item.kind == "custom_catalog")
+
+        exported_filter = exported.taxonomy.filters[0].children[0]
+        assert exported_filter.default_weight_grams == default_weight_grams
 
         assert exported.showcase_media.desktop_hero_asset_checksum == hero_entry["checksum_sha256"]
         assert exported.showcase_media.mobile_hero_asset_checksum is None
@@ -244,6 +256,10 @@ def test_settings_transfer_roundtrip_restores_pricing_ui_supplier_source_and_wei
                 "customs_processing_rate": 0.13,
                 "customs_fixed_rub": 4444.0,
                 "tax_rate": 0.08,
+                "svc_rules": [
+                    {"min_rub": 0.0, "max_rub": 15000.0, "mode": "fixed_rub", "value": 2500.0},
+                    {"min_rub": 15000.0, "max_rub": None, "mode": "percent", "value": 0.18},
+                ],
             }
         )
         payload_data["admin_ui_settings"]["auto_sync_period_minutes"] = 720
@@ -275,6 +291,7 @@ def test_settings_transfer_roundtrip_restores_pricing_ui_supplier_source_and_wei
         source_entry["url"] = "https://roundtrip-source.example/"
         source_entry["adapter_key"] = "roundtrip-adapter"
         source_entry["parser_config"] = {"mode": "roundtrip", "flag": True}
+        source_entry["sort_priority"] = 7
         source_entry["enabled"] = False
         source_entry["sync_enabled"] = False
         source_entry["dedup_enabled"] = False
@@ -321,6 +338,7 @@ def test_settings_transfer_roundtrip_restores_pricing_ui_supplier_source_and_wei
         assert exported_source.url == "https://roundtrip-source.example/"
         assert exported_source.adapter_key == "roundtrip-adapter"
         assert exported_source.parser_config == {"mode": "roundtrip", "flag": True}
+        assert exported_source.sort_priority == 7
         assert exported_source.enabled is False
         assert exported_source.sync_enabled is False
         assert exported_source.dedup_enabled is False
@@ -334,6 +352,77 @@ def test_settings_transfer_roundtrip_restores_pricing_ui_supplier_source_and_wei
         assert exported_source.buyout_surcharge_currency == "USD"
 
         assert [item.model_dump() for item in exported.weight_rules] == payload_data["weight_rules"]
+    finally:
+        SettingsTransferService(db).import_payload(restore_payload)
+        db.commit()
+        db.close()
+
+
+def test_settings_transfer_roundtrip_restores_site_content_without_photos() -> None:
+    db = SessionLocal()
+    _reset_showcase_media_state(db)
+    service = SettingsTransferService(db)
+    original_payload = service.export_payload()
+    restore_payload = original_payload.model_copy(deep=True)
+    marker = uuid4().hex[:10]
+
+    try:
+        payload_data = original_payload.model_dump()
+        payload_data["site_content"] = {
+            "about": {
+                "text": f"Обо мне без фото {marker}",
+                "photo_asset_checksums": [],
+            },
+            "questions": [
+                {
+                    "question": f"Вопрос A {marker}",
+                    "answer": f"Ответ A {marker}",
+                    "is_enabled": True,
+                    "is_expanded_by_default": False,
+                    "position": 1,
+                },
+                {
+                    "question": f"Вопрос B {marker}",
+                    "answer": f"Ответ B {marker}",
+                    "is_enabled": False,
+                    "is_expanded_by_default": True,
+                    "position": 2,
+                },
+            ],
+            "notifications": [
+                {
+                    "title": f"Уведомление A {marker}",
+                    "description": f"Описание A {marker}",
+                    "button_text": "Открыть",
+                    "button_url": "/catalog",
+                    "image_asset_checksum": None,
+                    "version": 3,
+                    "position": 1,
+                },
+                {
+                    "title": f"Уведомление B {marker}",
+                    "description": f"Описание B {marker}",
+                    "button_text": "Подробнее",
+                    "button_url": "https://example.com/content",
+                    "image_asset_checksum": None,
+                    "version": 1,
+                    "position": 2,
+                },
+            ],
+        }
+
+        payload = original_payload.__class__.model_validate(payload_data)
+        import_result = SettingsTransferService(db).import_payload(payload)
+        assert import_result.ok is True
+        assert import_result.imported_counts["site_about_photos_linked"] == 0
+        assert import_result.imported_counts["site_notifications_replaced"] == 2
+        assert import_result.imported_counts["site_questions_replaced"] == 2
+
+        exported = SettingsTransferService(db).export_payload()
+        assert exported.site_content.about.text == f"Обо мне без фото {marker}"
+        assert exported.site_content.about.photo_asset_checksums == []
+        assert [item.model_dump() for item in exported.site_content.questions] == payload_data["site_content"]["questions"]
+        assert [item.model_dump() for item in exported.site_content.notifications] == payload_data["site_content"]["notifications"]
     finally:
         SettingsTransferService(db).import_payload(restore_payload)
         db.commit()

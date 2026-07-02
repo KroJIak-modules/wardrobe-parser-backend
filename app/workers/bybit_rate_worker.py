@@ -12,9 +12,12 @@ from app.core.database import SessionLocal
 from app.models import AdminUiSettings
 from app.services.catalog.filter_assignment_queue import ProductFilterAssignmentQueue
 from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
+from app.services.catalog.site_catalog_sort_price_queue import SiteCatalogSortPriceQueue
+from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
 from app.services.catalog.sync_job_service import SyncJobService
 from app.services.settings.pricing_service import PricingSettingsService
 from app.services.settings.weight_recalc_queue import WeightRuleRecalcQueue
+from app.services.settings.weight_recalc_runtime_service import WeightRecalcRuntimeService
 from app.services.settings.weight_rule_service import WeightRuleService
 
 
@@ -131,15 +134,20 @@ def _run_weight_recalc_once(batch_size: int) -> int:
 
     db = SessionLocal()
     try:
+        WeightRecalcRuntimeService(db).mark_running()
         processed = WeightRuleService(db).recalculate_product_ids(product_ids)
+        has_more_work = queue.size() > 0
+        WeightRecalcRuntimeService(db).advance_after_batch(processed_count=processed, has_more_work=has_more_work)
         logger.info("Weight recalculation done for %s products", processed)
         return processed
     except Exception as exc:  # pragma: no cover - worker runtime guard
         logger.exception("Weight recalculation failed: %s", exc)
         try:
             queue.enqueue_product_ids(product_ids)
+            WeightRecalcRuntimeService(db).mark_retryable_error(message=f"{exc.__class__.__name__}: {exc}")
         except Exception as requeue_exc:  # pragma: no cover - worker runtime guard
             logger.exception("Weight recalculation requeue failed: %s", requeue_exc)
+            WeightRecalcRuntimeService(db).mark_failed(message=f"{exc.__class__.__name__}: {exc}")
         return 0
     finally:
         db.close()
@@ -184,6 +192,45 @@ def _run_filter_assignment_refresh_once(batch_size: int) -> int:
         db.close()
 
 
+def _run_site_sort_price_rebuild_once(batch_size: int) -> int:
+    db = SessionLocal()
+    try:
+        processed = SiteCatalogSortPriceService(db).refresh_missing_batch(batch_size=batch_size)
+        if processed > 0:
+            logger.info("Site sort price rebuild done for %s products", processed)
+        return processed
+    except Exception as exc:  # pragma: no cover - worker runtime guard
+        logger.exception("Site sort price rebuild failed: %s", exc)
+        return 0
+    finally:
+        db.close()
+
+
+def _run_site_sort_price_refresh_once(batch_size: int) -> int:
+    queue = SiteCatalogSortPriceQueue()
+    product_ids = queue.pop_ready_batch(
+        limit=batch_size,
+        debounce_sec=int(settings.site_sort_price_worker_debounce_sec),
+    )
+    if not product_ids:
+        return 0
+
+    db = SessionLocal()
+    try:
+        processed = SiteCatalogSortPriceService(db).refresh_product_ids(product_ids)
+        logger.info("Site sort price refresh done for %s products", processed)
+        return processed
+    except Exception as exc:  # pragma: no cover - worker runtime guard
+        logger.exception("Site sort price refresh failed: %s", exc)
+        try:
+            queue.enqueue_product_ids(product_ids)
+        except Exception as requeue_exc:  # pragma: no cover - worker runtime guard
+            logger.exception("Site sort price requeue failed: %s", requeue_exc)
+        return 0
+    finally:
+        db.close()
+
+
 def run_forever() -> None:
     bybit_interval_sec = max(30, int(settings.pricing_bybit_worker_interval_sec))
     bybit_retry_sec = max(10, min(30, bybit_interval_sec // 2))
@@ -193,8 +240,11 @@ def run_forever() -> None:
     filter_assignment_idle_sec = max(1, int(settings.filter_assignment_worker_idle_sec))
     filter_assignment_batch_size = max(1, int(settings.filter_assignment_worker_batch_size))
     filter_assignment_debounce_sec = max(0, int(settings.filter_assignment_worker_debounce_sec))
+    site_sort_price_idle_sec = max(1, int(settings.site_sort_price_worker_idle_sec))
+    site_sort_price_batch_size = max(1, int(settings.site_sort_price_worker_batch_size))
+    site_sort_price_debounce_sec = max(0, int(settings.site_sort_price_worker_debounce_sec))
     logger.info(
-        "Bybit+AutoSync worker started. bybit_interval_sec=%s weight_recalc_idle_sec=%s weight_recalc_batch_size=%s weight_recalc_debounce_sec=%s filter_assignment_idle_sec=%s filter_assignment_batch_size=%s filter_assignment_debounce_sec=%s",
+        "Bybit+AutoSync worker started. bybit_interval_sec=%s weight_recalc_idle_sec=%s weight_recalc_batch_size=%s weight_recalc_debounce_sec=%s filter_assignment_idle_sec=%s filter_assignment_batch_size=%s filter_assignment_debounce_sec=%s site_sort_price_idle_sec=%s site_sort_price_batch_size=%s site_sort_price_debounce_sec=%s",
         bybit_interval_sec,
         weight_recalc_idle_sec,
         weight_recalc_batch_size,
@@ -202,11 +252,15 @@ def run_forever() -> None:
         filter_assignment_idle_sec,
         filter_assignment_batch_size,
         filter_assignment_debounce_sec,
+        site_sort_price_idle_sec,
+        site_sort_price_batch_size,
+        site_sort_price_debounce_sec,
     )
     next_bybit_at = time.time()
     next_auto_sync_at = time.time()
     next_weight_recalc_at = time.time()
     next_filter_assignment_at = time.time()
+    next_site_sort_price_at = time.time()
     while True:
         now = time.time()
         if now >= next_bybit_at:
@@ -227,6 +281,13 @@ def run_forever() -> None:
             else:
                 processed = _run_filter_assignment_refresh_once(filter_assignment_batch_size)
                 next_filter_assignment_at = now + (1 if processed > 0 else filter_assignment_idle_sec)
+        if now >= next_site_sort_price_at:
+            rebuilt = _run_site_sort_price_rebuild_once(site_sort_price_batch_size)
+            if rebuilt > 0:
+                next_site_sort_price_at = now + 1
+            else:
+                processed = _run_site_sort_price_refresh_once(site_sort_price_batch_size)
+                next_site_sort_price_at = now + (1 if processed > 0 else site_sort_price_idle_sec)
         time.sleep(1)
 
 

@@ -27,6 +27,7 @@ class Filter(Base):
     slug = Column(String(255), nullable=False, unique=True)
     node_kind = Column(String(16), nullable=False, default="filter", server_default="filter")
     mobile_menu_group_code = Column(String(64), nullable=True)
+    default_weight_rule_id = Column(BigInteger, ForeignKey("weight_rules.id", ondelete="SET NULL"), nullable=True, index=True)
     is_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -36,6 +37,7 @@ class Filter(Base):
     title_keywords = relationship("FilterTitleKeyword", back_populates="filter", cascade="all, delete-orphan")
     manual_products = relationship("FilterManualProduct", back_populates="filter", cascade="all, delete-orphan")
     showcase_attachments = relationship("ShowcaseCategoryAttachment", back_populates="filter")
+    default_weight_rule = relationship("WeightRule")
 
     __table_args__ = (
         CheckConstraint("node_kind IN ('filter', 'multifilter')", name="ck_filters_node_kind"),

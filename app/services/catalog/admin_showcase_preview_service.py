@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.models import Designer, FilterAssignmentRuntimeState, ProductFilterAssignment
 from app.services.catalog.admin_editor_service import AdminEditorService
 
 
@@ -38,12 +40,15 @@ class AdminShowcasePreviewService:
     _NON_RESTRICTIVE_QUERY_KEYS = {"sort", "ctx", "ctx_ref"}
     _TOP_MENU_DESIGNERS_LIMIT = 18
     _TOP_MENU_DESIGNERS_PER_COLUMN = 9
+    _NEW_SECTION_FILTER_LIMIT = 9
 
     def __init__(self, db: Session) -> None:
         self.db = db
         self.editors = AdminEditorService(db)
         self._taxonomy_state: dict | None = None
         self._designer_state: dict | None = None
+        self._designer_slugs_by_id: dict[str, str] | None = None
+        self._filter_product_counts_by_slug_cache: dict[str, int] | None = None
 
     @staticmethod
     def _normalize_text(value: object | None) -> str:
@@ -89,6 +94,23 @@ class AdminShowcasePreviewService:
         if self._designer_state is None:
             self._designer_state = self.editors.list_designer_editor_state()
         return self._designer_state
+
+    @property
+    def designer_slugs_by_id(self) -> dict[str, str]:
+        if self._designer_slugs_by_id is None:
+            rows = self.db.query(Designer.id, Designer.slug).all()
+            self._designer_slugs_by_id = {
+                str(designer_id): str(slug or "").strip()
+                for designer_id, slug in rows
+                if str(designer_id or "").strip() and str(slug or "").strip()
+            }
+        return self._designer_slugs_by_id
+
+    def _designer_slug_from_directory_item(self, item: dict) -> str:
+        explicit_slug = str(item.get("slug") or "").strip()
+        if explicit_slug:
+            return explicit_slug
+        return self.designer_slugs_by_id.get(str(item.get("id") or "").strip(), "")
 
     def _flatten_filters(self, nodes: list[dict]) -> list[dict]:
         result: list[dict] = []
@@ -252,16 +274,18 @@ class AdminShowcasePreviewService:
         entries = []
         for item in self.taxonomy_state.get("designer_directory") or []:
             label = self._normalize_text(item.get("label"))
-            if not label:
+            slug = self._designer_slug_from_directory_item(item)
+            if not label or not slug:
                 continue
             entries.append(
                 {
                     "id": str(item.get("id") or ""),
+                    "slug": slug,
                     "label": label,
                     "letter": self._letter_for_designer(label),
                 }
             )
-        entries.sort(key=lambda item: (str(item["label"]).casefold(), str(item["id"])))
+        entries.sort(key=lambda item: (str(item["label"]).casefold(), str(item["slug"])))
         return entries
 
     def designers_directory(self) -> dict:
@@ -294,9 +318,9 @@ class AdminShowcasePreviewService:
                             "target": {
                                 "pathname": "/catalog/designers",
                                 "query": {
-                                    "designer": option["id"],
+                                    "designer": option["value"],
                                     "ctx": "designer",
-                                    "ctx_ref": option["id"],
+                                    "ctx_ref": option["value"],
                                 },
                             },
                         }
@@ -380,6 +404,20 @@ class AdminShowcasePreviewService:
                             {
                                 "id": f"filter-group-{node['id']}",
                                 "title": self._node_label(node),
+                                "titleTarget": self._build_filter_target(
+                                    view_key=view_key,
+                                    gender=gender,  # type: ignore[arg-type]
+                                    section_values=[
+                                        str(item.get("slug") or "")
+                                        for item in self._collect_visible_leaf_filters([node], hidden_node_ids)
+                                        if str(item.get("slug") or "").strip()
+                                    ],
+                                    ctx="menu_filter",
+                                    ctx_ref=self._menu_filter_context_ref(
+                                        attachment.get("id"),
+                                        self._int_or_zero(node.get("id")),
+                                    ),
+                                ),
                                 "items": group_items,
                             }
                         )
@@ -397,6 +435,24 @@ class AdminShowcasePreviewService:
                 {
                     "id": f"filter-{root['id']}",
                     "title": self._node_label(root) if show_block_title else None,
+                    "titleTarget": (
+                        self._build_filter_target(
+                            view_key=view_key,
+                            gender=gender,  # type: ignore[arg-type]
+                            section_values=[
+                                str(item.get("slug") or "")
+                                for item in self._collect_visible_leaf_filters([root], hidden_node_ids)
+                                if str(item.get("slug") or "").strip()
+                            ],
+                            ctx="menu_filter",
+                            ctx_ref=self._menu_filter_context_ref(
+                                attachment.get("id"),
+                                self._int_or_zero(root.get("id")),
+                            ),
+                        )
+                        if show_block_title
+                        else None
+                    ),
                     "items": block_items,
                     "groups": block_groups,
                 }
@@ -413,7 +469,7 @@ class AdminShowcasePreviewService:
                     "menu": {
                         "id": "new-menu",
                         "layout": "new",
-                        "blocks": self._build_category_menu_blocks("new"),
+                        "blocks": self._build_new_menu_blocks(),
                     },
                 },
                 {
@@ -463,18 +519,143 @@ class AdminShowcasePreviewService:
         items = []
         for item in self.taxonomy_state.get("designer_directory") or []:
             label = self._normalize_text(item.get("label"))
-            if not label:
+            slug = self._designer_slug_from_directory_item(item)
+            if not label or not slug:
                 continue
             items.append(
                 {
-                    "id": str(item.get("id") or ""),
+                    "id": slug,
                     "label": label,
-                    "value": str(item.get("id") or ""),
+                    "value": slug,
                     "product_count": self._int_or_zero(item.get("product_count")),
                 }
             )
-        items.sort(key=lambda item: (-int(item["product_count"]), str(item["label"]).casefold(), str(item["id"])))
+        items.sort(key=lambda item: (-int(item["product_count"]), str(item["label"]).casefold(), str(item["value"])))
         return items
+
+    def _filter_product_counts_by_slug(self) -> dict[str, int]:
+        if self._filter_product_counts_by_slug_cache is not None:
+            return dict(self._filter_product_counts_by_slug_cache)
+        state = (
+            self.db.query(FilterAssignmentRuntimeState)
+            .filter(FilterAssignmentRuntimeState.id == 1)
+            .one_or_none()
+        )
+        revision = int(getattr(state, "applied_revision", 0) or 0)
+        if revision <= 0:
+            self._filter_product_counts_by_slug_cache = {}
+            return {}
+        self._filter_product_counts_by_slug_cache = {
+            str(slug): int(count)
+            for slug, count in (
+                self.db.query(
+                    ProductFilterAssignment.filter_slug,
+                    func.count(func.distinct(ProductFilterAssignment.product_id)).label("product_count"),
+                )
+                .filter(ProductFilterAssignment.revision == revision)
+                .group_by(ProductFilterAssignment.filter_slug)
+                .all()
+            )
+            if str(slug or "").strip()
+        }
+        return dict(self._filter_product_counts_by_slug_cache)
+
+    def _top_new_section_filter_items(self) -> list[dict]:
+        counts_by_slug = self._filter_product_counts_by_slug()
+        leaf_filters = [
+            node
+            for node in self._collect_visible_leaf_filters(self.taxonomy_state.get("filters") or [], set())
+            if self._normalize_slug(node.get("slug"))
+        ]
+        leaf_filters.sort(
+            key=lambda node: (
+                -int(counts_by_slug.get(self._normalize_slug(node.get("slug")), 0)),
+                self._node_label(node).casefold(),
+                self._normalize_slug(node.get("slug")),
+            )
+        )
+        items: list[dict] = []
+        for node in leaf_filters[: self._NEW_SECTION_FILTER_LIMIT]:
+            slug = self._normalize_slug(node.get("slug"))
+            if not slug:
+                continue
+            items.append(
+                {
+                    "id": f"new-section-{slug}",
+                    "kind": "filter_link",
+                    "label": self._node_label(node),
+                    "target": {
+                        "pathname": "/catalog",
+                        "query": {
+                            "section": [slug],
+                            "ctx": "menu_filter",
+                            "ctx_ref": f"new-section:{slug}",
+                        },
+                    },
+                }
+            )
+        return items
+
+    def _new_collection_items(self) -> list[dict]:
+        items = [
+            {
+                "id": "new-availability-in-stock",
+                "kind": "system_link",
+                "label": "В наличии",
+                "target": {"pathname": "/catalog", "query": {"availability": "in-stock"}},
+            },
+            {
+                "id": "new-availability-preorder",
+                "kind": "system_link",
+                "label": "Под заказ",
+                "target": {"pathname": "/catalog", "query": {"availability": "preorder"}},
+            },
+        ]
+        new_category = self._find_category_for_scope("new")
+        if new_category is not None:
+            for attachment in new_category.get("attachments") or []:
+                if str(attachment.get("kind") or "").strip() != "custom_catalog":
+                    continue
+                catalog = self._find_custom_catalog_by_id(self._int_or_zero(attachment.get("ref_id")))
+                if catalog is None or not bool(catalog.get("is_enabled")):
+                    continue
+                items.append(
+                    {
+                        "id": f"new-catalog-{catalog['id']}",
+                        "kind": "curated_listing",
+                        "label": str(catalog.get("label") or ""),
+                        "target": {
+                            "pathname": "/catalog",
+                            "query": {
+                                "ctx": "custom",
+                                "ctx_ref": str(catalog.get("slug") or ""),
+                            },
+                        },
+                    }
+                )
+        items.append(
+            {
+                "id": "new-all-products",
+                "kind": "system_link",
+                "label": "Все товары",
+                "target": {"pathname": "/catalog", "query": None},
+            }
+        )
+        return items
+
+    def _build_new_menu_blocks(self) -> list[dict]:
+        return [
+            {
+                "id": "new-availability",
+                "title": "Коллекции",
+                "items": self._new_collection_items(),
+            },
+            {
+                "id": "new-sections",
+                "title": "Разделы",
+                "items": self._top_new_section_filter_items(),
+            },
+        ]
 
     def _collect_section_filter_options_for_scope(self, scope: CategoryScope) -> list[dict]:
         category = self._find_category_for_scope(scope)
@@ -504,22 +685,26 @@ class AdminShowcasePreviewService:
                         "label": self._node_display_label(node),
                     }
                 )
-        options.sort(key=lambda item: str(item["label"]).casefold())
+        return options
+
+    def _collect_all_section_filter_options(self) -> list[dict]:
+        options: list[dict] = []
+        seen: set[str] = set()
+        for node in self._collect_visible_leaf_filters(self.taxonomy_state.get("filters") or [], set()):
+            slug = self._normalize_slug(node.get("slug"))
+            if not slug or slug in seen:
+                continue
+            seen.add(slug)
+            options.append(
+                {
+                    "value": slug,
+                    "label": self._node_display_label(node),
+                }
+            )
         return options
 
     def _build_section_filter_options(self, scope: CategoryScope) -> list[dict]:
-        primary_options = self._collect_section_filter_options_for_scope(scope)
-        if primary_options:
-            return primary_options
-
-        fallback_scopes: list[CategoryScope] = ["new", "men", "women", "designers"]
-        options_by_value: dict[str, dict] = {}
-        for fallback_scope in fallback_scopes:
-            for option in self._collect_section_filter_options_for_scope(fallback_scope):
-                value = str(option.get("value") or "").strip()
-                if value and value not in options_by_value:
-                    options_by_value[value] = option
-        return sorted(options_by_value.values(), key=lambda item: str(item["label"]).casefold())
+        return self._collect_all_section_filter_options()
 
     def _build_catalog_filter_groups(self, view_key: CatalogViewKey, search_params: dict[str, list[str]]) -> list[dict]:
         scope = self._category_scope_from_view(view_key, search_params)
@@ -643,6 +828,17 @@ class AdminShowcasePreviewService:
 
     def _build_catalog_header_menu_filters(self) -> list[_CatalogHeaderMenuFilterEntry]:
         items: list[_CatalogHeaderMenuFilterEntry] = []
+        for node in self._collect_visible_leaf_filters(self.taxonomy_state.get("filters") or [], set()):
+            slug = str(node.get("slug") or "").strip()
+            if not slug:
+                continue
+            items.append(
+                _CatalogHeaderMenuFilterEntry(
+                    id=f"new-section:{slug}",
+                    label=self._node_label(node),
+                    section_values=[slug],
+                )
+            )
         for category in self.taxonomy_state.get("categories") or []:
             if str(category.get("behavior") or "").strip() != "gender":
                 continue
@@ -657,6 +853,19 @@ class AdminShowcasePreviewService:
                     for value in (attachment.get("hidden_node_ids") or [])
                     if self._int_or_zero(value) > 0
                 }
+                root_section_values = [
+                    str(item.get("slug") or "")
+                    for item in self._collect_visible_leaf_filters([root], hidden_node_ids)
+                    if str(item.get("slug") or "").strip()
+                ]
+                if root_section_values:
+                    items.append(
+                        _CatalogHeaderMenuFilterEntry(
+                            id=self._menu_filter_context_ref(attachment.get("id"), self._int_or_zero(root.get("id"))),
+                            label=self._node_label(root),
+                            section_values=root_section_values,
+                        )
+                    )
                 for node in self._collect_visible_branch_filters(root, hidden_node_ids):
                     section_values = [
                         str(item.get("slug") or "")
@@ -672,7 +881,33 @@ class AdminShowcasePreviewService:
                             section_values=section_values,
                         )
                     )
-        return items
+                    slug = str(node.get("slug") or "").strip()
+                    if slug:
+                        items.append(
+                            _CatalogHeaderMenuFilterEntry(
+                                id=f"mobile:{slug}",
+                                label=self._node_label(node),
+                                section_values=section_values,
+                            )
+                        )
+        merged: dict[str, _CatalogHeaderMenuFilterEntry] = {}
+        for item in items:
+            current = merged.get(item.id)
+            if current is None:
+                merged[item.id] = item
+                continue
+            values = list(current.section_values)
+            seen = set(values)
+            for value in item.section_values:
+                if value not in seen:
+                    seen.add(value)
+                    values.append(value)
+            merged[item.id] = _CatalogHeaderMenuFilterEntry(
+                id=current.id,
+                label=current.label,
+                section_values=values,
+            )
+        return list(merged.values())
 
     def _build_catalog_header_designers(self) -> list[_CatalogHeaderDesignerEntry]:
         descriptions_by_id = {
@@ -684,11 +919,12 @@ class AdminShowcasePreviewService:
         for item in self.taxonomy_state.get("designer_directory") or []:
             label = self._normalize_text(item.get("label"))
             designer_id = str(item.get("id") or "").strip()
-            if not label or not designer_id:
+            slug = self._designer_slug_from_directory_item(item)
+            if not label or not designer_id or not slug:
                 continue
             result.append(
                 _CatalogHeaderDesignerEntry(
-                    id=designer_id,
+                    id=slug,
                     label=label,
                     catalog_title=label,
                     catalog_description=descriptions_by_id.get(designer_id),
@@ -723,7 +959,17 @@ class AdminShowcasePreviewService:
             "source": "designer",
         }
 
+    @classmethod
+    def _search_header(cls, search_params: dict[str, list[str]]) -> dict | None:
+        query = cls._normalize_text((search_params.get("q") or [None])[0])
+        if not query:
+            return None
+        return {"title": f"Поиск: {query}", "description": None, "source": "search"}
+
     def _resolve_catalog_page_header(self, *, view_key: CatalogViewKey, search_params: dict[str, list[str]]) -> dict:
+        search_header = self._search_header(search_params)
+        if search_header is not None:
+            return search_header
         context = self._read_context(search_params)
         context_ref = self._normalize_text((search_params.get("ctx_ref") or [None])[0])
         selected_designers = self._read_query_values(search_params, "designer")

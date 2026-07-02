@@ -116,6 +116,24 @@ class Settings(BaseSettings):
         le=300,
         validation_alias="FILTER_ASSIGNMENT_WORKER_DEBOUNCE_SEC",
     )
+    site_sort_price_worker_idle_sec: int = Field(
+        default=5,
+        ge=1,
+        le=3600,
+        validation_alias="SITE_SORT_PRICE_WORKER_IDLE_SEC",
+    )
+    site_sort_price_worker_batch_size: int = Field(
+        default=500,
+        ge=1,
+        le=10000,
+        validation_alias="SITE_SORT_PRICE_WORKER_BATCH_SIZE",
+    )
+    site_sort_price_worker_debounce_sec: int = Field(
+        default=3,
+        ge=0,
+        le=300,
+        validation_alias="SITE_SORT_PRICE_WORKER_DEBOUNCE_SEC",
+    )
     admin_superuser_login: str = Field(default="admin", validation_alias="ADMIN_SUPERUSER_LOGIN")
     admin_superuser_password: str = Field(default="", validation_alias="ADMIN_SUPERUSER_PASSWORD")
     admin_access_token_ttl_sec: int = Field(default=86_400, ge=300, le=2_592_000, validation_alias="ADMIN_ACCESS_TOKEN_TTL_SEC")

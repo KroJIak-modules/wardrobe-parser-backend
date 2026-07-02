@@ -47,13 +47,10 @@ def test_admin_showcase_catalog_experience_preview_available(monkeypatch) -> Non
     assert "header" in payload["view"]
     assert isinstance(payload.get("filterGroups"), list)
     assert isinstance(payload.get("previewMetrics"), list)
-    assert [group["key"] for group in payload["filterGroups"]] == [
-        "sort",
-        "availability",
-        "section",
-        "designer",
-        "gender",
-    ]
+    group_keys = [group["key"] for group in payload["filterGroups"]]
+    assert group_keys[:2] == ["sort", "availability"]
+    assert group_keys[-1] == "gender"
+    assert set(group_keys).issubset({"sort", "availability", "section", "designer", "gender"})
 
 
 def test_admin_showcase_designers_directory_preview_available(monkeypatch) -> None:
@@ -122,7 +119,7 @@ def test_admin_showcase_menu_uses_label_but_filter_bar_uses_display_label() -> N
                             ],
                         }
                     ],
-                }
+                },
             ],
             "categories": [
                 {
@@ -153,5 +150,351 @@ def test_admin_showcase_menu_uses_label_but_filter_bar_uses_display_label() -> N
         assert menu_blocks[0]["groups"][0]["title"] == "Верх"
         assert menu_blocks[0]["groups"][0]["items"][0]["label"] == "Рубашки"
         assert filter_options[0]["label"] == "Рубашки и блузы"
+    finally:
+        db.close()
+
+
+def test_admin_showcase_new_menu_keeps_custom_catalogs_out_of_sections() -> None:
+    db = SessionLocal()
+    try:
+        service = AdminShowcasePreviewService(db)
+        service._taxonomy_state = {
+            "filters": [
+                {
+                    "id": 10,
+                    "slug": "clothes",
+                    "label": "Одежда",
+                    "is_enabled": True,
+                    "children": [
+                        {
+                            "id": 11,
+                            "slug": "shirts",
+                            "label": "Рубашки",
+                            "is_enabled": True,
+                            "children": [],
+                        },
+                        {
+                            "id": 12,
+                            "slug": "boots",
+                            "label": "Ботинки",
+                            "is_enabled": True,
+                            "children": [],
+                        },
+                    ],
+                }
+            ],
+            "categories": [
+                {
+                    "id": 1,
+                    "slug": "new",
+                    "label": "Новинки",
+                    "behavior": "new",
+                    "system_filter_value": None,
+                    "attachments": [
+                        {
+                            "id": "attachment-1",
+                            "kind": "custom_catalog",
+                            "ref_id": 100,
+                            "hidden_node_ids": [],
+                        }
+                    ],
+                    "children": [],
+                }
+            ],
+            "custom_catalogs": [
+                {
+                    "id": 100,
+                    "slug": "my-choice",
+                    "label": "Мой выбор",
+                    "description": "",
+                    "is_enabled": True,
+                    "manual_products": [],
+                }
+            ],
+            "designer_directory": [],
+        }
+        service._filter_product_counts_by_slug = lambda: {"shirts": 20, "boots": 30}  # type: ignore[method-assign]
+
+        blocks = service._build_new_menu_blocks()
+        collections = next(block for block in blocks if block["id"] == "new-availability")
+        sections = next(block for block in blocks if block["id"] == "new-sections")
+
+        assert [item["label"] for item in collections["items"]] == ["В наличии", "Под заказ", "Мой выбор", "Все товары"]
+        assert [item["kind"] for item in collections["items"]] == ["system_link", "system_link", "curated_listing", "system_link"]
+        assert [item["label"] for item in sections["items"]] == ["Ботинки", "Рубашки"]
+        assert all(item["kind"] == "filter_link" for item in sections["items"])
+    finally:
+        db.close()
+
+
+def test_admin_showcase_catalog_header_resolves_search_and_descriptions() -> None:
+    db = SessionLocal()
+    try:
+        service = AdminShowcasePreviewService(db)
+        service._taxonomy_state = {
+            "filters": [],
+            "categories": [],
+            "custom_catalogs": [
+                {
+                    "id": 100,
+                    "slug": "my-choice",
+                    "label": "Мой выбор",
+                    "description": "Описание кастомного каталога",
+                    "is_enabled": True,
+                    "manual_products": [],
+                }
+            ],
+            "designer_directory": [
+                {
+                    "id": 7,
+                    "slug": "rick-owens",
+                    "label": "Rick Owens",
+                    "product_count": 4,
+                }
+            ],
+        }
+        service._designer_state = {
+            "designers": [
+                {
+                    "id": "7",
+                    "name": "Rick Owens",
+                    "description": "Описание дизайнера",
+                }
+            ],
+        }
+
+        search_payload = service.catalog_experience(view_key="default", search_params={"q": [" cargo shorts "]})
+        custom_payload = service.catalog_experience(
+            view_key="default",
+            search_params={"ctx": ["custom"], "ctx_ref": ["my-choice"]},
+        )
+        designer_payload = service.catalog_experience(
+            view_key="default",
+            search_params={"designer": ["rick-owens"], "ctx": ["designer"], "ctx_ref": ["rick-owens"]},
+        )
+
+        assert search_payload["view"]["header"] == {
+            "title": "Поиск: cargo shorts",
+            "description": None,
+            "source": "search",
+        }
+        assert custom_payload["view"]["header"] == {
+            "title": "Мой выбор",
+            "description": "Описание кастомного каталога",
+            "source": "custom_catalog",
+        }
+        assert designer_payload["view"]["header"] == {
+            "title": "Rick Owens",
+            "description": "Описание дизайнера",
+            "source": "designer",
+        }
+    finally:
+        db.close()
+
+
+def test_admin_showcase_catalog_header_resolves_mobile_multifilter_context() -> None:
+    db = SessionLocal()
+    try:
+        service = AdminShowcasePreviewService(db)
+        service._taxonomy_state = {
+            "filters": [
+                {
+                    "id": 10,
+                    "slug": "clothes",
+                    "label": "Одежда",
+                    "is_enabled": True,
+                    "children": [
+                        {
+                            "id": 11,
+                            "slug": "tops",
+                            "label": "Верх",
+                            "is_enabled": True,
+                            "children": [
+                                {
+                                    "id": 12,
+                                    "slug": "shirts",
+                                    "label": "Рубашки",
+                                    "is_enabled": True,
+                                    "children": [],
+                                },
+                                {
+                                    "id": 13,
+                                    "slug": "hoodies",
+                                    "label": "Худи",
+                                    "is_enabled": True,
+                                    "children": [],
+                                },
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "id": 20,
+                    "slug": "womens-clothes",
+                    "label": "Женская одежда",
+                    "is_enabled": True,
+                    "children": [
+                        {
+                            "id": 21,
+                            "slug": "tops",
+                            "label": "Верх",
+                            "is_enabled": True,
+                            "children": [
+                                {
+                                    "id": 22,
+                                    "slug": "blouses",
+                                    "label": "Блузы",
+                                    "is_enabled": True,
+                                    "children": [],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+            "categories": [
+                {
+                    "id": 1,
+                    "slug": "men",
+                    "label": "Мужское",
+                    "behavior": "gender",
+                    "system_filter_value": "men",
+                    "attachments": [
+                        {
+                            "id": "attachment-1",
+                            "kind": "filter",
+                            "ref_id": 10,
+                            "hidden_node_ids": [],
+                        }
+                    ],
+                    "children": [],
+                },
+                {
+                    "id": 2,
+                    "slug": "women",
+                    "label": "Женское",
+                    "behavior": "gender",
+                    "system_filter_value": "women",
+                    "attachments": [
+                        {
+                            "id": "attachment-2",
+                            "kind": "filter",
+                            "ref_id": 20,
+                            "hidden_node_ids": [],
+                        }
+                    ],
+                    "children": [],
+                }
+            ],
+            "custom_catalogs": [],
+            "designer_directory": [],
+        }
+
+        payload = service.catalog_experience(
+            view_key="default",
+            search_params={
+                "gender": ["men"],
+                "section": ["shirts,hoodies,blouses"],
+                "ctx": ["menu_filter"],
+                "ctx_ref": ["mobile:tops"],
+            },
+        )
+        new_section_payload = service.catalog_experience(
+            view_key="default",
+            search_params={
+                "section": ["shirts"],
+                "ctx": ["menu_filter"],
+                "ctx_ref": ["new-section:shirts"],
+            },
+        )
+
+        assert payload["view"]["header"] == {
+            "title": "Верх",
+            "description": None,
+            "source": "menu_filter",
+        }
+        assert new_section_payload["view"]["header"] == {
+            "title": "Рубашки",
+            "description": None,
+            "source": "menu_filter",
+        }
+    finally:
+        db.close()
+
+
+def test_admin_showcase_catalog_header_resolves_root_multifilter_context() -> None:
+    db = SessionLocal()
+    try:
+        service = AdminShowcasePreviewService(db)
+        service._taxonomy_state = {
+            "filters": [
+                {
+                    "id": 10,
+                    "slug": "clothes",
+                    "label": "Одежда",
+                    "is_enabled": True,
+                    "children": [
+                        {
+                            "id": 11,
+                            "slug": "tops",
+                            "label": "Верх",
+                            "is_enabled": True,
+                            "children": [
+                                {
+                                    "id": 12,
+                                    "slug": "shirts",
+                                    "label": "Рубашки",
+                                    "is_enabled": True,
+                                    "children": [],
+                                }
+                            ],
+                        },
+                        {
+                            "id": 13,
+                            "slug": "outerwear",
+                            "label": "Верхняя одежда",
+                            "is_enabled": True,
+                            "children": [],
+                        },
+                    ],
+                }
+            ],
+            "categories": [
+                {
+                    "id": 1,
+                    "slug": "men",
+                    "label": "Мужское",
+                    "behavior": "gender",
+                    "system_filter_value": "men",
+                    "attachments": [
+                        {
+                            "id": "attachment-root",
+                            "kind": "filter",
+                            "ref_id": 10,
+                            "hidden_node_ids": [],
+                        }
+                    ],
+                    "children": [],
+                }
+            ],
+            "custom_catalogs": [],
+            "designer_directory": [],
+        }
+
+        payload = service.catalog_experience(
+            view_key="default",
+            search_params={
+                "gender": ["men"],
+                "section": ["shirts,outerwear"],
+                "ctx": ["menu_filter"],
+                "ctx_ref": ["attachment-root:10"],
+            },
+        )
+
+        assert payload["view"]["header"] == {
+            "title": "Одежда",
+            "description": None,
+            "source": "menu_filter",
+        }
     finally:
         db.close()

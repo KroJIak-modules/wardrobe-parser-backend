@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 import json
+import os
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -10,7 +11,6 @@ from app.schemas.admin_settings import (
     SettingsTransferAdminUiSettings,
     SettingsTransferPricingSettings,
     SettingsTransferSupplierEntry,
-    SettingsTransferWeightRuleEntry,
 )
 
 
@@ -33,14 +33,27 @@ class DefaultAdminSettingsSeed(BaseModel):
     default_source_supplier_key: str = Field(min_length=1, max_length=64)
     source_setting_defaults: DefaultSourceSettingSeed
     suppliers: list[SettingsTransferSupplierEntry] = Field(default_factory=list)
-    weight_rules: list[SettingsTransferWeightRuleEntry] = Field(default_factory=list)
 
 
 class DefaultAdminSettingsLoader:
-    _FILE_PATH = Path(__file__).resolve().parents[3] / "config" / "default-admin-settings.json"
+    _ENV_PATH_KEY = "ADMIN_DEFAULTS_CONFIG_PATH"
+    _LOCAL_SHARED_FILE_PATH = Path(__file__).resolve().parents[4] / "service" / "config" / "sources.json"
+    _CONTAINER_SHARED_FILE_PATH = Path(__file__).resolve().parents[3] / "shared-config" / "sources.json"
+
+    @classmethod
+    def _resolve_file_path(cls) -> Path:
+        explicit_path = str(os.getenv(cls._ENV_PATH_KEY, "") or "").strip()
+        if explicit_path:
+            return Path(explicit_path)
+        if cls._CONTAINER_SHARED_FILE_PATH.exists():
+            return cls._CONTAINER_SHARED_FILE_PATH
+        return cls._LOCAL_SHARED_FILE_PATH
 
     @classmethod
     @lru_cache(maxsize=1)
     def load(cls) -> DefaultAdminSettingsSeed:
-        payload = json.loads(cls._FILE_PATH.read_text(encoding="utf-8"))
-        return DefaultAdminSettingsSeed.model_validate(payload)
+        payload = json.loads(cls._resolve_file_path().read_text(encoding="utf-8"))
+        defaults = payload.get("admin_defaults") if isinstance(payload, dict) else None
+        if not isinstance(defaults, dict):
+            raise ValueError("admin_defaults section is missing in shared sources config")
+        return DefaultAdminSettingsSeed.model_validate(defaults)

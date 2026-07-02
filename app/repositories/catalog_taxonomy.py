@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from sqlalchemy import case
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
@@ -16,6 +17,12 @@ from app.models import (
     ShowcaseCategoryAttachment,
 )
 
+SHOWCASE_CATEGORY_ORDER = ("new", "designers", "men", "women", "sale")
+SHOWCASE_CATEGORY_ORDER_INDEX = {
+    code: index
+    for index, code in enumerate(SHOWCASE_CATEGORY_ORDER, start=1)
+}
+
 
 class CatalogTaxonomyRepository:
     def __init__(self, session: Session) -> None:
@@ -26,6 +33,7 @@ class CatalogTaxonomyRepository:
             self.session.query(Filter)
             .options(
                 selectinload(Filter.node),
+                selectinload(Filter.default_weight_rule),
                 selectinload(Filter.local_category_keywords),
                 selectinload(Filter.title_keywords),
                 selectinload(Filter.manual_products),
@@ -57,7 +65,14 @@ class CatalogTaxonomyRepository:
                 selectinload(ShowcaseCategory.attachments).selectinload(ShowcaseCategoryAttachment.filter),
                 selectinload(ShowcaseCategory.attachments).selectinload(ShowcaseCategoryAttachment.custom_catalog),
             )
-            .order_by(ShowcaseCategory.code.asc(), ShowcaseCategory.id.asc())
+            .order_by(
+                case(
+                    SHOWCASE_CATEGORY_ORDER_INDEX,
+                    value=ShowcaseCategory.code,
+                    else_=len(SHOWCASE_CATEGORY_ORDER_INDEX) + 1,
+                ),
+                ShowcaseCategory.id.asc(),
+            )
             .all()
         )
 

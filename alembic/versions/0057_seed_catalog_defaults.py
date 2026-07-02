@@ -8,6 +8,8 @@ Create Date: 2026-06-21 15:30:00.000000
 from __future__ import annotations
 
 from alembic import op
+import json
+from pathlib import Path
 import sqlalchemy as sa
 
 
@@ -18,49 +20,59 @@ depends_on = None
 
 
 _MANUAL_SOURCE_KEY = "manual.local"
-_DEFAULT_SUPPLIER_KEY = "eu"
-_SUPPLIERS = (
-    {
-        "key": "usa",
-        "name": "США",
-        "provider_kind": "main",
-        "parent_key": None,
-        "rate_currency": "RUB",
-        "rates": ((0.0, 0.5, 1400.0), (0.5, 1.0, 1650.0), (1.0, 1.5, 2250.0), (1.5, 2.0, 2900.0), (2.0, 2.5, 3500.0), (2.5, None, 4100.0)),
-    },
-    {
-        "key": "usa-alt-1",
-        "name": "ALT 1 США",
-        "provider_kind": "alternate",
-        "parent_key": "usa",
-        "rate_currency": "RUB",
-        "rates": ((0.0, 0.5, 1700.0), (0.5, 1.0, 3350.0), (1.0, 1.5, 4100.0), (1.5, 2.0, 4950.0), (2.0, 2.5, 5650.0), (2.5, None, 6500.0)),
-    },
-    {
-        "key": "eu",
-        "name": "ЕС",
-        "provider_kind": "main",
-        "parent_key": None,
-        "rate_currency": "RUB",
-        "rates": ((0.0, 0.5, 1100.0), (0.5, 1.0, 1500.0), (1.0, 1.5, 1900.0), (1.5, 2.0, 2300.0), (2.0, 2.5, 2700.0), (2.5, None, 3150.0)),
-    },
-    {
-        "key": "eu-alt-1",
-        "name": "ALT 1 ЕС",
-        "provider_kind": "alternate",
-        "parent_key": "eu",
-        "rate_currency": "RUB",
-        "rates": ((0.0, 0.5, 2300.0), (0.5, 1.0, 2750.0), (1.0, 1.5, 3750.0), (1.5, 2.0, 4800.0), (2.0, 2.5, 5800.0), (2.5, None, 6800.0)),
-    },
-    {
-        "key": "uk",
-        "name": "Великобритания",
-        "provider_kind": "main",
-        "parent_key": None,
-        "rate_currency": "RUB",
-        "rates": ((0.0, 0.5, 3400.0), (0.5, 1.0, 3900.0), (1.0, 1.5, 4400.0), (1.5, 2.0, 4900.0), (2.0, 2.5, 5450.0), (2.5, None, 5950.0)),
-    },
-)
+
+
+def _shared_config_path() -> Path:
+    repo_path = Path(__file__).resolve().parents[3] / "service" / "config" / "sources.json"
+    container_path = Path(__file__).resolve().parents[2] / "shared-config" / "sources.json"
+    return container_path if container_path.exists() else repo_path
+
+
+def _load_admin_defaults() -> dict[str, object]:
+    payload = json.loads(_shared_config_path().read_text(encoding="utf-8"))
+    defaults = payload.get("admin_defaults") if isinstance(payload, dict) else None
+    if not isinstance(defaults, dict):
+        raise RuntimeError("admin_defaults section is missing in shared sources config")
+    return defaults
+
+
+def _load_suppliers() -> tuple[list[dict[str, object]], str]:
+    defaults = _load_admin_defaults()
+    suppliers = defaults.get("suppliers")
+    default_supplier_key = str(defaults.get("default_source_supplier_key") or "").strip()
+    if not isinstance(suppliers, list) or not default_supplier_key:
+        raise RuntimeError("shared admin defaults do not contain suppliers or default supplier key")
+    normalized: list[dict[str, object]] = []
+    for item in suppliers:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        name = str(item.get("name") or "").strip()
+        provider_kind = str(item.get("provider_kind") or "").strip()
+        rate_currency = str(item.get("rate_currency") or "").strip()
+        if not key or not name or not provider_kind or not rate_currency:
+            continue
+        rates_raw = item.get("rates")
+        rates: list[tuple[float, float | None, float]] = []
+        if isinstance(rates_raw, list):
+            for rate in rates_raw:
+                if not isinstance(rate, dict):
+                    continue
+                min_kg = float(rate.get("min_kg") or 0.0)
+                max_kg = float(rate["max_kg"]) if rate.get("max_kg") is not None else None
+                rub = float(rate.get("rub") or 0.0)
+                rates.append((min_kg, max_kg, rub))
+        normalized.append(
+            {
+                "key": key,
+                "name": name,
+                "provider_kind": provider_kind,
+                "parent_key": (str(item.get("parent_supplier_key") or "").strip() or None),
+                "rate_currency": rate_currency,
+                "rates": tuple(rates),
+            }
+        )
+    return normalized, default_supplier_key
 
 
 def _get_supplier_id(conn, key: str) -> int | None:
@@ -90,15 +102,16 @@ def _insert_supplier(conn, item: dict[str, object]) -> int:
 
 def upgrade() -> None:
     conn = op.get_bind()
+    suppliers_seed, default_supplier_key = _load_suppliers()
 
     supplier_ids: dict[str, int] = {}
-    for item in _SUPPLIERS:
+    for item in suppliers_seed:
         supplier_id = _get_supplier_id(conn, str(item["key"]))
         if supplier_id is None:
             supplier_id = _insert_supplier(conn, item)
         supplier_ids[str(item["key"])] = supplier_id
 
-    for item in _SUPPLIERS:
+    for item in suppliers_seed:
         supplier_id = supplier_ids[str(item["key"])]
         parent_key = item["parent_key"]
         parent_supplier_id = supplier_ids[str(parent_key)] if parent_key else None
@@ -152,7 +165,7 @@ def upgrade() -> None:
                 },
             )
 
-    default_supplier_id = supplier_ids[_DEFAULT_SUPPLIER_KEY]
+    default_supplier_id = supplier_ids[default_supplier_key]
     conn.execute(
         sa.text(
             """

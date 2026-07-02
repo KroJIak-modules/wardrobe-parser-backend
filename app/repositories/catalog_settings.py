@@ -12,15 +12,6 @@ class CatalogPricingSettingsRepository:
     def get_singleton(self) -> PricingSetting | None:
         return self.session.query(PricingSetting).order_by(PricingSetting.id.asc()).first()
 
-    def get_or_create_default(self) -> tuple[PricingSetting, bool]:
-        current = self.get_singleton()
-        if current is not None:
-            return current, False
-        entity = PricingSetting(id=1)
-        self.session.add(entity)
-        self.session.flush()
-        return entity, True
-
 
 class CatalogSupplierRepository:
     def __init__(self, session: Session) -> None:

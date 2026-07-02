@@ -5,7 +5,13 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from app.core.database import SessionLocal
-from app.schemas.taxonomy import TaxonomyFilterNode, TaxonomyShowcaseCategory, TaxonomyState
+from app.schemas.taxonomy import (
+    TaxonomyCustomCatalog,
+    TaxonomyFilterNode,
+    TaxonomyShowcaseAttachment,
+    TaxonomyShowcaseCategory,
+    TaxonomyState,
+)
 from app.services.catalog.admin_editor_service import AdminEditorService
 from app.services.catalog.taxonomy_service import TaxonomyService
 
@@ -249,6 +255,51 @@ def test_admin_editor_preserves_display_label_for_multifilter() -> None:
         db.close()
 
 
+def test_taxonomy_service_strips_match_rules_from_multifilters() -> None:
+    db = SessionLocal()
+    taxonomy = TaxonomyService(db)
+    original_state = _clone_state(taxonomy.get_state())
+    suffix = uuid4().hex[:8]
+    try:
+        saved = taxonomy.replace_state(
+            TaxonomyState(
+                filters=[
+                    TaxonomyFilterNode(
+                        slug=f"group-rules-{suffix}",
+                        title=f"Group Rules {suffix}",
+                        node_kind="multifilter",
+                        local_category_keywords=["must-not-stay"],
+                        title_keywords=["must-not-stay"],
+                        children=[
+                            TaxonomyFilterNode(
+                                slug=f"group-rules-leaf-{suffix}",
+                                title=f"Group Rules Leaf {suffix}",
+                                node_kind="filter",
+                                local_category_keywords=["must-stay-local"],
+                                title_keywords=["must-stay-title"],
+                            ),
+                        ],
+                    ),
+                ],
+                custom_catalogs=[],
+                showcase_categories=_blank_showcase_categories(original_state),
+            )
+        )
+
+        root = saved.filters[0]
+        leaf = root.children[0]
+        assert root.node_kind == "multifilter"
+        assert root.local_category_keywords == []
+        assert root.title_keywords == []
+        assert root.manual_product_ids == []
+        assert leaf.node_kind == "filter"
+        assert leaf.local_category_keywords == ["must-stay-local"]
+        assert leaf.title_keywords == ["must-stay-title"]
+    finally:
+        taxonomy.replace_state(original_state)
+        db.close()
+
+
 def test_taxonomy_service_keeps_showcase_category_title_from_payload() -> None:
     db = SessionLocal()
     service = TaxonomyService(db)
@@ -272,6 +323,63 @@ def test_taxonomy_service_keeps_showcase_category_title_from_payload() -> None:
         saved = service.replace_state(payload)
         updated_category = next(item for item in saved.showcase_categories if item.code == "new")
         assert updated_category.title == custom_title
+    finally:
+        service.replace_state(original_state)
+        db.close()
+
+
+def test_taxonomy_service_sanitizes_showcase_category_rules_and_order() -> None:
+    db = SessionLocal()
+    service = TaxonomyService(db)
+    original_state = _clone_state(service.get_state())
+    suffix = uuid4().hex[:8]
+    filter_slug = f"showcase-filter-{suffix}"
+    catalog_slug = f"showcase-catalog-{suffix}"
+    filter_attachment = TaxonomyShowcaseAttachment(
+        kind="filter",
+        filter_slug=filter_slug,
+        custom_catalog_slug=None,
+        hidden_filter_slugs=[],
+    )
+    catalog_attachment = TaxonomyShowcaseAttachment(
+        kind="custom_catalog",
+        filter_slug=None,
+        custom_catalog_slug=catalog_slug,
+        hidden_filter_slugs=[],
+    )
+    try:
+        saved = service.replace_state(
+            TaxonomyState(
+                filters=[
+                    TaxonomyFilterNode(
+                        slug=filter_slug,
+                        title=f"Showcase Filter {suffix}",
+                        node_kind="filter",
+                    ),
+                ],
+                custom_catalogs=[
+                    TaxonomyCustomCatalog(
+                        slug=catalog_slug,
+                        title=f"Showcase Catalog {suffix}",
+                    ),
+                ],
+                showcase_categories=[
+                    TaxonomyShowcaseCategory(code="sale", title="Скидки", attachments=[filter_attachment, catalog_attachment]),
+                    TaxonomyShowcaseCategory(code="women", title="Женское", attachments=[filter_attachment]),
+                    TaxonomyShowcaseCategory(code="men", title="Мужское", attachments=[filter_attachment, catalog_attachment]),
+                    TaxonomyShowcaseCategory(code="designers", title="Дизайнеры", attachments=[filter_attachment]),
+                    TaxonomyShowcaseCategory(code="new", title="Новинки", attachments=[filter_attachment, catalog_attachment]),
+                ],
+            )
+        )
+
+        categories_by_code = {item.code: item for item in saved.showcase_categories}
+        assert [item.code for item in saved.showcase_categories] == ["new", "designers", "men", "women", "sale"]
+        assert [item.kind for item in categories_by_code["new"].attachments] == ["custom_catalog"]
+        assert [item.kind for item in categories_by_code["men"].attachments] == ["filter"]
+        assert [item.kind for item in categories_by_code["women"].attachments] == ["filter"]
+        assert categories_by_code["designers"].attachments == []
+        assert categories_by_code["sale"].attachments == []
     finally:
         service.replace_state(original_state)
         db.close()

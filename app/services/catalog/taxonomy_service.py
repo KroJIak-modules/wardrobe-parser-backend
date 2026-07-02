@@ -20,7 +20,7 @@ from app.models import (
     ShowcaseCategoryAttachment,
     ShowcaseCategoryAttachmentHiddenNode,
 )
-from app.repositories.catalog_taxonomy import CatalogTaxonomyRepository
+from app.repositories.catalog_taxonomy import CatalogTaxonomyRepository, SHOWCASE_CATEGORY_ORDER
 from app.schemas.taxonomy import (
     TaxonomyCustomCatalog,
     TaxonomyCustomCatalogWrite,
@@ -84,6 +84,39 @@ class TaxonomyService:
         normalized = str(value or "").strip()
         return normalized or None
 
+    @staticmethod
+    def _is_showcase_attachment_allowed(code: object, attachment_kind: object) -> bool:
+        normalized_code = str(code or "").strip()
+        normalized_kind = str(attachment_kind or "").strip()
+        if normalized_code == "new":
+            return normalized_kind == "custom_catalog"
+        if normalized_code in {"men", "women"}:
+            return normalized_kind == "filter"
+        return False
+
+    @classmethod
+    def _sanitize_showcase_attachments(
+        cls,
+        code: object,
+        attachments: list[TaxonomyShowcaseAttachment],
+    ) -> list[TaxonomyShowcaseAttachment]:
+        return [
+            attachment
+            for attachment in attachments
+            if cls._is_showcase_attachment_allowed(code, attachment.kind)
+        ]
+
+    @staticmethod
+    def _sort_showcase_categories(categories: list[TaxonomyShowcaseCategory]) -> list[TaxonomyShowcaseCategory]:
+        order_index = {code: index for index, code in enumerate(SHOWCASE_CATEGORY_ORDER)}
+        return sorted(
+            categories,
+            key=lambda category: (
+                order_index.get(str(category.code or "").strip(), len(order_index)),
+                str(category.code or "").strip(),
+            ),
+        )
+
     def _serialize_filter_tree(self) -> list[TaxonomyFilterNode]:
         filters = self.repo.list_filters()
         nodes = self.repo.list_filter_nodes()
@@ -118,6 +151,7 @@ class TaxonomyService:
                 title=str(entity.title),
                 display_title=(str(entity.display_title) if entity.display_title else None),
                 mobile_pair_slug=mobile_pair_slug_by_slug.get(str(entity.slug)),
+                default_weight_rule_id=(int(entity.default_weight_rule_id) if entity.default_weight_rule_id is not None else None),
                 node_kind=str(entity.node_kind),
                 is_enabled=bool(entity.is_enabled),
                 local_category_keywords=[str(item.keyword) for item in sorted(entity.local_category_keywords, key=lambda value: int(value.id))],
@@ -145,6 +179,8 @@ class TaxonomyService:
         for category in self.repo.list_showcase_categories():
             attachments: list[TaxonomyShowcaseAttachment] = []
             for attachment in sorted(category.attachments, key=lambda item: (int(item.position), int(item.id))):
+                if not self._is_showcase_attachment_allowed(category.code, attachment.attachment_kind):
+                    continue
                 attachments.append(
                     TaxonomyShowcaseAttachment(
                         kind=str(attachment.attachment_kind),
@@ -179,7 +215,7 @@ class TaxonomyService:
         return TaxonomyState(
             filters=self._serialize_filter_tree(),
             custom_catalogs=custom_catalogs,
-            showcase_categories=showcase_categories,
+            showcase_categories=self._sort_showcase_categories(showcase_categories),
         )
 
     def _prepare_payload(self, payload: TaxonomyState) -> TaxonomyState:
@@ -204,23 +240,26 @@ class TaxonomyService:
             out: list[TaxonomyFilterNode] = []
             for node in nodes:
                 old_slug = self._clean_optional_slug(node.slug)
-                slug_seed = old_slug or self._slugify(node.title)
+                slug_seed = self._slugify(node.title)
                 new_slug = next_unique_slug(slug_seed, used_filter_slugs)
                 if old_slug:
                     filter_slug_aliases[old_slug] = new_slug
                 filter_slug_aliases[new_slug] = new_slug
+                children = rewrite_nodes(node.children)
+                is_multifilter = bool(children)
                 out.append(
                     TaxonomyFilterNode(
                         slug=new_slug,
                         title=node.title,
                         display_title=node.display_title,
-                        mobile_pair_slug=self._clean_optional_slug(node.mobile_pair_slug),
-                        node_kind=node.node_kind,
+                        mobile_pair_slug=self._clean_optional_slug(node.mobile_pair_slug) if is_multifilter else None,
+                        default_weight_rule_id=(int(node.default_weight_rule_id) if node.default_weight_rule_id is not None else None),
+                        node_kind="multifilter" if is_multifilter else "filter",
                         is_enabled=node.is_enabled,
-                        local_category_keywords=node.local_category_keywords,
-                        title_keywords=node.title_keywords,
-                        manual_product_ids=node.manual_product_ids,
-                        children=rewrite_nodes(node.children),
+                        local_category_keywords=[] if is_multifilter else node.local_category_keywords,
+                        title_keywords=[] if is_multifilter else node.title_keywords,
+                        manual_product_ids=[] if is_multifilter else node.manual_product_ids,
+                        children=children,
                     )
                 )
             return out
@@ -239,6 +278,7 @@ class TaxonomyService:
                         if self._clean_optional_slug(node.mobile_pair_slug)
                         else None
                     ),
+                    default_weight_rule_id=(int(node.default_weight_rule_id) if node.default_weight_rule_id is not None else None),
                     node_kind=node.node_kind,
                     is_enabled=node.is_enabled,
                     local_category_keywords=node.local_category_keywords,
@@ -270,28 +310,29 @@ class TaxonomyService:
 
         prepared_showcase: list[TaxonomyShowcaseCategory] = []
         for showcase_category in payload.showcase_categories:
+            attachments = [
+                TaxonomyShowcaseAttachment(
+                    kind=attachment.kind,
+                    filter_slug=filter_slug_aliases.get(str(attachment.filter_slug or "").strip()) if attachment.filter_slug else None,
+                    custom_catalog_slug=catalog_slug_aliases.get(str(attachment.custom_catalog_slug or "").strip()) if attachment.custom_catalog_slug else None,
+                    hidden_filter_slugs=[
+                        filter_slug_aliases.get(str(hidden_slug).strip(), str(hidden_slug).strip())
+                        for hidden_slug in attachment.hidden_filter_slugs
+                    ],
+                )
+                for attachment in showcase_category.attachments
+            ]
             prepared_showcase.append(
                 TaxonomyShowcaseCategory(
                     code=showcase_category.code,
                     title=showcase_category.title,
-                    attachments=[
-                        TaxonomyShowcaseAttachment(
-                            kind=attachment.kind,
-                            filter_slug=filter_slug_aliases.get(str(attachment.filter_slug or "").strip()) if attachment.filter_slug else None,
-                            custom_catalog_slug=catalog_slug_aliases.get(str(attachment.custom_catalog_slug or "").strip()) if attachment.custom_catalog_slug else None,
-                            hidden_filter_slugs=[
-                                filter_slug_aliases.get(str(hidden_slug).strip(), str(hidden_slug).strip())
-                                for hidden_slug in attachment.hidden_filter_slugs
-                            ],
-                        )
-                        for attachment in showcase_category.attachments
-                    ],
+                    attachments=self._sanitize_showcase_attachments(showcase_category.code, attachments),
                 )
             )
         return TaxonomyState(
             filters=prepared_filters,
             custom_catalogs=prepared_catalogs,
-            showcase_categories=prepared_showcase,
+            showcase_categories=self._sort_showcase_categories(prepared_showcase),
         )
 
     def _coerce_write_payload(self, payload: TaxonomyWriteState) -> TaxonomyState:
@@ -302,6 +343,7 @@ class TaxonomyService:
                     title=node.title,
                     display_title=node.display_title,
                     mobile_pair_slug=self._clean_optional_slug(node.mobile_pair_slug),
+                    default_weight_rule_id=(int(node.default_weight_rule_id) if node.default_weight_rule_id is not None else None),
                     node_kind=node.node_kind,
                     is_enabled=node.is_enabled,
                     local_category_keywords=node.local_category_keywords,
@@ -328,7 +370,7 @@ class TaxonomyService:
                 TaxonomyShowcaseCategory(
                     code=category.code,
                     title=category.title,
-                    attachments=[
+                    attachments=self._sanitize_showcase_attachments(category.code, [
                         TaxonomyShowcaseAttachment(
                             kind=attachment.kind,
                             filter_slug=attachment.filter_slug,
@@ -336,7 +378,7 @@ class TaxonomyService:
                             hidden_filter_slugs=attachment.hidden_filter_slugs,
                         )
                         for attachment in category.attachments
-                    ],
+                    ]),
                 )
                 for category in payload.showcase_categories
             ],
@@ -480,6 +522,11 @@ class TaxonomyService:
         prepared = self._prepare_payload(payload)
         filters_by_slug, catalogs_by_slug, mobile_group_code_by_slug = self._validate_state(prepared)
         try:
+            current_default_weight_rule_id_by_slug = {
+                str(item.slug): (int(item.default_weight_rule_id) if item.default_weight_rule_id is not None else None)
+                for item in self.repo.list_filters()
+                if str(item.slug or "").strip()
+            }
             self.repo.clear_editable_state()
             self.repo.flush()
 
@@ -494,6 +541,11 @@ class TaxonomyService:
                         slug=str(node.slug).strip(),
                         node_kind=str(node.node_kind).strip() or "filter",
                         mobile_menu_group_code=mobile_group_code_by_slug.get(str(node.slug).strip()),
+                        default_weight_rule_id=(
+                            int(node.default_weight_rule_id)
+                            if node.default_weight_rule_id is not None
+                            else current_default_weight_rule_id_by_slug.get(str(node.slug).strip())
+                        ),
                         is_enabled=bool(node.is_enabled),
                     )
                     self.repo.add(entity)

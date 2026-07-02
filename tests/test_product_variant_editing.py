@@ -8,10 +8,35 @@ from app.models import Designer, DesignerSourceName, ImageAsset, Product, Produc
 from app.services.catalog.product_ingest_service import ProductIngestService
 from app.services.catalog.product_query_service import ProductQueryService
 from app.services.catalog.product_write_service import ProductWriteService
+from app.services.settings.pricing_service import PricingSettingsService
 from app.services.settings.weight_rule_service import WeightRuleService
 
 
+def _create_image_asset_id(db, marker: str) -> int:
+    asset = ImageAsset(
+        scope="products",
+        storage_key=f"products/tests/{marker}.jpg",
+        mime_type="image/jpeg",
+        byte_size=128,
+        width_px=40,
+        height_px=40,
+        checksum_sha256=f"{marker:0<64}"[:64],
+    )
+    db.add(asset)
+    db.flush()
+    return int(asset.id)
+
+
+def _default_supplier_id(db) -> int:
+    settings = PricingSettingsService(db).get_settings()
+    supplier = next(iter(settings.suppliers or []), None)
+    if supplier is None:
+        raise AssertionError("Seed supplier is required for tests")
+    return int(supplier.id)
+
+
 def _create_manual_product(db) -> int:
+    image_asset_id = _create_image_asset_id(db, uuid4().hex)
     return ProductWriteService(db).create_manual_product(
         {
             "title": "Personal product",
@@ -23,7 +48,7 @@ def _create_manual_product(db) -> int:
             "visibility_status": "visible",
             "orderability_status": "orderable",
             "variants": [{"title": "Default", "price": 1000, "currency": "RUB", "available": True}],
-            "manual_image_asset_ids": [],
+            "manual_image_asset_ids": [image_asset_id],
             "manual_weight_grams": 500,
             "filter_slugs": [],
             "custom_catalog_slugs": [],
@@ -231,7 +256,7 @@ def test_product_write_service_rejects_variant_editing_when_sync_bound() -> None
         )
         db.add(sync_source)
         db.flush()
-        db.add(SourceSetting(source_id=int(sync_source.id), is_enabled=True, is_sync_enabled=True))
+        db.add(SourceSetting(source_id=int(sync_source.id), is_enabled=True, is_sync_enabled=True, supplier_id=_default_supplier_id(db)))
         db.flush()
 
         ProductIngestService(db).apply_batch(
@@ -285,7 +310,7 @@ def test_sync_bound_created_product_belongs_to_real_source_instead_of_personal()
         )
         db.add(sync_source)
         db.flush()
-        db.add(SourceSetting(source_id=int(sync_source.id), is_enabled=True, is_sync_enabled=True))
+        db.add(SourceSetting(source_id=int(sync_source.id), is_enabled=True, is_sync_enabled=True, supplier_id=_default_supplier_id(db)))
         db.flush()
 
         product_id = ProductWriteService(db).create_sync_bound_product(

@@ -57,7 +57,6 @@ def _bootstrap_seed_data() -> None:
     from app.services.catalog.catalog_defaults_service import CatalogDefaultsService
     from app.services.catalog.source_registry_service import SourceRegistryService
     from app.services.settings.pricing_service import PricingSettingsService
-    from app.services.settings.weight_rule_service import WeightRuleService
 
     db = SessionLocal()
     try:
@@ -66,7 +65,6 @@ def _bootstrap_seed_data() -> None:
         registry = SourceRegistryService(db)
         registry.ensure_manual_source()
         CatalogDefaultsService(db).ensure()
-        WeightRuleService(db).ensure_default_rules()
         if not any(
             str(source.key or "").strip().lower() != SourceRegistryService.MANUAL_SOURCE_KEY
             for source in registry.list_all()

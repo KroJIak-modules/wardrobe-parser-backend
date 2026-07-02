@@ -4,7 +4,7 @@ import app.api.v1.auth as auth_module
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.schemas.admin_settings import PricingSettingsResponse, PricingSupplierRateResponse, PricingSupplierResponse
+from app.schemas.admin_settings import PricingSettingsResponse, PricingSupplierRateResponse, PricingSupplierResponse, PricingSvcRuleEntry
 from app.services.settings.pricing_service import PricingSettingsService
 
 
@@ -19,7 +19,7 @@ class DummyLimiter:
         self.failed[client_key] = self.failed.get(client_key, 0) + 1
 
 
-def _build_settings(*, suppliers: list[PricingSupplierResponse]) -> PricingSettingsResponse:
+def _build_settings(*, suppliers: list[PricingSupplierResponse], svc_rules: list[PricingSvcRuleEntry] | None = None) -> PricingSettingsResponse:
     return PricingSettingsResponse(
         markup_multiplier=1.0,
         weight_tolerance=1.0,
@@ -43,6 +43,7 @@ def _build_settings(*, suppliers: list[PricingSupplierResponse]) -> PricingSetti
         bybit_worker_interval_sec=0,
         bybit_last_updated_at=None,
         bybit_last_error=None,
+        svc_rules=list(svc_rules or []),
         suppliers=suppliers,
         formula_latex="",
         formula_lines=[],
@@ -187,6 +188,90 @@ def test_calculate_for_product_requires_manual_when_supplier_has_no_tariff() -> 
     assert result.manual_required is True
     assert result.reason == "missing_tariff"
     assert result.components["shipping_rate_mode"] == "missing_tariff"
+
+
+def test_calculate_for_product_applies_fixed_svc_rule_after_markup() -> None:
+    settings = _build_settings(
+        suppliers=[
+            PricingSupplierResponse(
+                id=1,
+                key="uk",
+                name="Великобритания",
+                provider_kind="main",
+                parent_supplier_id=None,
+                rate_currency="RUB",
+                is_enabled=True,
+                rates=[PricingSupplierRateResponse(min_kg=0.0, max_kg=1.0, rub=3400.0)],
+            )
+        ],
+        svc_rules=[
+            PricingSvcRuleEntry(min_rub=10000.0, max_rub=15000.0, mode="fixed_rub", value=2500.0),
+        ],
+    )
+
+    result = PricingSettingsService.calculate_for_product(
+        source_price=100.0,
+        source_currency="USD",
+        weight_grams=500.0,
+        supplier_id=1,
+        promo_factor=None,
+        promo_only_no_discount=None,
+        buyout_surcharge_value=None,
+        buyout_surcharge_currency=None,
+        variants=[],
+        settings=settings,
+    )
+
+    assert result.manual_required is False
+    assert result.reason is None
+    assert result.components["buyout_rub"] == 10000.0
+    assert result.components["service_fee_mode"] == "fixed_rub"
+    assert result.components["service_fee_value"] == 2500.0
+    assert result.components["service_fee_rub"] == 2500.0
+    assert result.components["subtotal_rub"] == 13400.0
+    assert result.components["subtotal_after_markup_rub"] == 15900.0
+    assert result.final_price_rub == 15900.0
+
+
+def test_calculate_for_product_applies_percent_svc_rule_from_buyout() -> None:
+    settings = _build_settings(
+        suppliers=[
+            PricingSupplierResponse(
+                id=1,
+                key="uk",
+                name="Великобритания",
+                provider_kind="main",
+                parent_supplier_id=None,
+                rate_currency="RUB",
+                is_enabled=True,
+                rates=[PricingSupplierRateResponse(min_kg=0.0, max_kg=1.0, rub=3400.0)],
+            )
+        ],
+        svc_rules=[
+            PricingSvcRuleEntry(min_rub=10000.0, max_rub=None, mode="percent", value=0.15),
+        ],
+    )
+
+    result = PricingSettingsService.calculate_for_product(
+        source_price=100.0,
+        source_currency="USD",
+        weight_grams=500.0,
+        supplier_id=1,
+        promo_factor=None,
+        promo_only_no_discount=None,
+        buyout_surcharge_value=None,
+        buyout_surcharge_currency=None,
+        variants=[],
+        settings=settings,
+    )
+
+    assert result.manual_required is False
+    assert result.components["buyout_rub"] == 10000.0
+    assert result.components["service_fee_mode"] == "percent"
+    assert result.components["service_fee_value"] == 0.15
+    assert result.components["service_fee_rub"] == 1500.0
+    assert result.components["subtotal_after_markup_rub"] == 14900.0
+    assert result.final_price_rub == 14900.0
 
 
 def test_create_supplier_generates_internal_key_from_id(monkeypatch) -> None:

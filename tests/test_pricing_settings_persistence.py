@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from app.core.database import SessionLocal
 from app.models import PricingSetting
-from app.repositories.catalog_settings import CatalogPricingSettingsRepository
+from app.services.settings.pricing_service import PricingSettingsService
 
 
 def test_pricing_settings_persists_bybit_runtime_fields() -> None:
@@ -27,7 +27,7 @@ def test_pricing_settings_persists_bybit_runtime_fields() -> None:
     original_error: str | None = None
     entity_id = 1
     try:
-        entity, _ = CatalogPricingSettingsRepository(initial_db).get_or_create_default()
+        entity, _ = PricingSettingsService(initial_db)._get_or_create_pricing_entity()
         entity_id = int(entity.id)
         original_bucket_rates = list(getattr(entity, "bybit_bucket_rates", None) or [])
         original_updated_at = getattr(entity, "bybit_last_updated_at", None)
@@ -55,6 +55,51 @@ def test_pricing_settings_persists_bybit_runtime_fields() -> None:
         restore.bybit_bucket_rates = original_bucket_rates or []
         restore.bybit_last_updated_at = original_updated_at
         restore.bybit_last_error = original_error
+        restore_db.commit()
+    finally:
+        restore_db.close()
+
+
+def test_pricing_settings_persists_svc_rules() -> None:
+    marker = uuid4().hex[:12]
+    expected_rules = [
+        {
+            "min_rub": 10000.0,
+            "max_rub": 20000.0,
+            "mode": "fixed_rub",
+            "value": 2500.0,
+        },
+        {
+            "min_rub": 20000.0,
+            "max_rub": None,
+            "mode": "percent",
+            "value": 0.15,
+        },
+    ]
+
+    initial_db = SessionLocal()
+    original_rules: list[dict] | None = None
+    entity_id = 1
+    try:
+        entity, _ = PricingSettingsService(initial_db)._get_or_create_pricing_entity()
+        entity_id = int(entity.id)
+        original_rules = list(getattr(entity, "svc_rules", None) or [])
+        entity.svc_rules = expected_rules
+        initial_db.commit()
+    finally:
+        initial_db.close()
+
+    verify_db = SessionLocal()
+    try:
+        stored = verify_db.query(PricingSetting).filter(PricingSetting.id == entity_id).one()
+        assert stored.svc_rules == expected_rules, marker
+    finally:
+        verify_db.close()
+
+    restore_db = SessionLocal()
+    try:
+        restore = restore_db.query(PricingSetting).filter(PricingSetting.id == entity_id).one()
+        restore.svc_rules = original_rules or []
         restore_db.commit()
     finally:
         restore_db.close()

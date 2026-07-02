@@ -11,6 +11,7 @@ from app.core.exceptions import ValidationError
 from app.models import Product, ProductListing, WeightRule, WeightRuleKeyword
 from app.repositories.catalog_products import CatalogProductRepository
 from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
+from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
 from app.services.settings.weight_rule_matcher import WeightRuleMatcherEntry, WeightRuleMatcherField, resolve_match_for_fields
 
 
@@ -424,4 +425,5 @@ class ProductIngestService:
 
         self.db.flush()
         ProductFilterAssignmentService(self.db).enqueue_product_ids_after_commit(affected_product_ids)
+        SiteCatalogSortPriceService(self.db).enqueue_product_ids_after_commit(affected_product_ids)
         return result

@@ -25,6 +25,7 @@ class _FilterSpec:
     local_keywords: list[str]
     title_keywords: list[str]
     manual_product_ids: set[int]
+    allowed_genders: set[str] | None
 
 
 @dataclass(slots=True)
@@ -39,6 +40,9 @@ class _AssignmentResult:
 
 
 class ProductFilterAssignmentService:
+    _LOCAL_KEYWORD_SCORE = 1
+    _TITLE_KEYWORD_SCORE = 2
+
     def __init__(self, db: Session) -> None:
         self.db = db
         self.assignments = CatalogFilterAssignmentRepository(db)
@@ -110,8 +114,86 @@ class ProductFilterAssignmentService:
             if str(text or "").strip()
         )
 
+    @staticmethod
+    def _normalized_product_gender(product: Product) -> str:
+        normalized = str(getattr(product, "gender", "") or "").strip().lower()
+        if normalized in {"male", "female", "unisex"}:
+            return normalized
+        return "unisex"
+
+    def _filter_allowed_genders_by_slug(self) -> dict[str, set[str]]:
+        filters_by_id = {
+            int(entity.id): entity
+            for entity in self.taxonomy.list_filters()
+        }
+        nodes = self.taxonomy.list_filter_nodes()
+        node_by_filter_id = {
+            int(node.filter_id): node
+            for node in nodes
+        }
+        children_by_parent: dict[int | None, list] = {}
+        for node in nodes:
+            parent_id = int(node.parent_node_id) if node.parent_node_id is not None else None
+            children_by_parent.setdefault(parent_id, []).append(node)
+        for bucket in children_by_parent.values():
+            bucket.sort(key=lambda item: (int(item.position), int(item.id)))
+
+        def collect_visible_leaf_slugs(*, root_filter_id: int, hidden_node_ids: set[int]) -> list[str]:
+            root_node = node_by_filter_id.get(int(root_filter_id))
+            if root_node is None:
+                return []
+            result: list[str] = []
+
+            def walk(node) -> None:
+                node_id = int(node.id)
+                if node_id in hidden_node_ids:
+                    return
+                visible_children = [
+                    child
+                    for child in children_by_parent.get(node_id, [])
+                    if int(child.id) not in hidden_node_ids
+                ]
+                if not visible_children:
+                    entity = filters_by_id.get(int(node.filter_id))
+                    if entity is None or str(entity.node_kind or "").strip() != "filter":
+                        return
+                    slug = str(entity.slug or "").strip()
+                    if slug:
+                        result.append(slug)
+                    return
+                for child in visible_children:
+                    walk(child)
+
+            walk(root_node)
+            return result
+
+        allowed_genders_by_slug: dict[str, set[str]] = {}
+        for category in self.taxonomy.list_showcase_categories():
+            scope = str(getattr(category, "code", "") or "").strip().lower()
+            if scope == "men":
+                allowed_genders = {"male", "unisex"}
+            elif scope == "women":
+                allowed_genders = {"female"}
+            else:
+                continue
+            for attachment in category.attachments:
+                if str(getattr(attachment, "attachment_kind", "") or "").strip() != "filter":
+                    continue
+                filter_id = int(attachment.filter_id or 0)
+                if filter_id <= 0:
+                    continue
+                hidden_node_ids = {
+                    int(hidden.filter_node_id)
+                    for hidden in attachment.hidden_nodes
+                    if int(hidden.filter_node_id or 0) > 0
+                }
+                for slug in collect_visible_leaf_slugs(root_filter_id=filter_id, hidden_node_ids=hidden_node_ids):
+                    allowed_genders_by_slug.setdefault(slug, set()).update(allowed_genders)
+        return allowed_genders_by_slug
+
     def _enabled_filter_specs(self) -> list[_FilterSpec]:
         specs: list[_FilterSpec] = []
+        allowed_genders_by_slug = self._filter_allowed_genders_by_slug()
         for entity in self.taxonomy.list_filters():
             slug = str(entity.slug or "").strip()
             if not slug or not bool(entity.is_enabled):
@@ -139,15 +221,23 @@ class ProductFilterAssignmentService:
                         if normalized
                     ],
                     manual_product_ids={int(link.product_id) for link in entity.manual_products},
+                    allowed_genders=(
+                        set(allowed_genders_by_slug.get(slug, set()))
+                        if slug in allowed_genders_by_slug
+                        else None
+                    ),
                 )
             )
         return specs
 
     def _resolve_assignment(self, *, product: Product, filter_specs: list[_FilterSpec]) -> _AssignmentResult | None:
         title_texts, category_and_tag_texts = self._normalized_listing_texts(product)
+        product_gender = self._normalized_product_gender(product)
         best: _AssignmentResult | None = None
         best_filter_id = 0
         for spec in filter_specs:
+            if spec.allowed_genders is not None and product_gender not in spec.allowed_genders:
+                continue
             manual_rank = 1 if int(product.id) in spec.manual_product_ids else 0
             matched_local_keywords = [
                 keyword
@@ -159,7 +249,10 @@ class ProductFilterAssignmentService:
                 for keyword in spec.title_keywords
                 if self._keyword_matches_any(keyword=keyword, texts=title_texts)
             ]
-            match_score = len(matched_local_keywords) + len(matched_title_keywords)
+            match_score = (
+                len(matched_local_keywords) * self._LOCAL_KEYWORD_SCORE
+                + len(matched_title_keywords) * self._TITLE_KEYWORD_SCORE
+            )
             if manual_rank == 0 and match_score == 0:
                 continue
             candidate = _AssignmentResult(
@@ -224,6 +317,7 @@ class ProductFilterAssignmentService:
         return len(rows)
 
     def refresh_current_revision_product_ids(self, product_ids: set[int] | list[int] | tuple[int, ...]) -> int:
+        normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
         state = self.assignments.get_or_create_runtime_state(for_update=True)
         current_revision = int(state.applied_revision or 0)
         if current_revision <= 0:
@@ -231,9 +325,13 @@ class ProductFilterAssignmentService:
             return 0
         applied = self._replace_revision_assignments_for_product_ids(
             revision=current_revision,
-            product_ids=sorted({int(product_id) for product_id in product_ids if int(product_id) > 0}),
+            product_ids=normalized_ids,
         )
         self.db.commit()
+        if normalized_ids:
+            from app.services.settings.weight_rule_service import WeightRuleService
+
+            WeightRuleService(self.db).enqueue_product_ids(normalized_ids)
         return applied
 
     def rebuild_pending_revision(self, *, batch_size: int) -> int:
@@ -241,6 +339,9 @@ class ProductFilterAssignmentService:
         target_revision = int(state.target_revision or 0)
         applied_revision = int(state.applied_revision or 0)
         if target_revision <= applied_revision:
+            self.db.rollback()
+            return 0
+        if state.rebuild_started_at is not None:
             self.db.rollback()
             return 0
 
@@ -274,6 +375,9 @@ class ProductFilterAssignmentService:
             state.last_error = None
             self.assignments.delete_other_revisions(keep_revision=target_revision)
             self.db.commit()
+            from app.services.settings.weight_rule_service import WeightRuleService
+
+            WeightRuleService(self.db).enqueue_all_active_products()
             return target_revision
         except Exception as exc:
             LOGGER.exception("Filter assignment rebuild failed: %s", exc)
