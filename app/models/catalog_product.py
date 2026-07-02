@@ -90,6 +90,7 @@ class ProductListing(Base):
     source_designer_raw = Column(String(255), nullable=True)
     source_category_raw = Column(String(255), nullable=True)
     source_tags = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    source_published_at = Column(DateTime(timezone=True), nullable=True)
     orderability_status = Column(String(16), nullable=False, default="orderable", server_default="orderable")
     status_reason = Column(String(255), nullable=True)
     ingest_mode = Column(String(16), nullable=False, default="sync", server_default="sync")
@@ -114,6 +115,7 @@ class ProductListing(Base):
         UniqueConstraint("source_id", "url", name="uq_product_listings_source_url"),
         Index("idx_product_listings_last_seen_at", "last_seen_at"),
         Index("idx_product_listings_last_synced_at", "last_synced_at"),
+        Index("idx_product_listings_source_published_at", "source_published_at"),
         Index("idx_product_listings_url_normalized", "url_normalized"),
         Index("idx_product_listings_host_handle", "host_normalized", "handle"),
     )

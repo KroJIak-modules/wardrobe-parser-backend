@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from app.core.database import SessionLocal
@@ -143,6 +144,9 @@ def test_default_product_sorting_uses_source_orderability_novelty_and_visibility
         alpha_sold_out.availability_mode = "in_stock"
         beta_orderable_newest.availability_mode = "in_stock"
         source_b_alpha.availability_mode = "in_stock"
+        alpha_orderable_older_visible.primary_listing.source_published_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        alpha_orderable_newer_hidden.primary_listing.source_published_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        beta_orderable_newest.primary_listing.source_published_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
         db.flush()
 
         service = ProductQueryService(db)
@@ -150,9 +154,9 @@ def test_default_product_sorting_uses_source_orderability_novelty_and_visibility
         admin_list_ids = [int(item["id"]) for item in service.list_products(limit=50, offset=0, audience="admin")["items"]]
 
         expected_ids = [
-            int(beta_orderable_newest.id),
-            int(alpha_orderable_newer_hidden.id),
             int(alpha_orderable_older_visible.id),
+            int(alpha_orderable_newer_hidden.id),
+            int(beta_orderable_newest.id),
             int(alpha_unavailable.id),
             int(alpha_sold_out.id),
             int(source_b_alpha.id),

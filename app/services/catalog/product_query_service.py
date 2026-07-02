@@ -173,7 +173,7 @@ class ProductQueryService:
             func.coalesce(SourceSetting.sort_priority, 2147483647).asc(),
             func.lower(func.coalesce(Source.name, "")).asc(),
             cls._product_orderability_rank_expr().asc(),
-            Product.created_at.desc(),
+            func.coalesce(ProductListing.source_published_at, Product.created_at).desc(),
             Product.id.desc(),
             cls._product_visibility_rank_expr().asc(),
         )

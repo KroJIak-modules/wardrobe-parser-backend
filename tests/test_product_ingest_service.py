@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from app.core.database import SessionLocal
@@ -78,6 +79,75 @@ def test_product_ingest_service_preserves_existing_optional_source_snapshot_fiel
         assert int(listing.source_weight_grams or 0) == 720
         assert listing.orderability_status == "orderable"
         assert listing.status_reason is None
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_product_ingest_service_persists_and_preserves_source_published_at() -> None:
+    db = SessionLocal()
+    source_key = f"ingest-{uuid4().hex[:12]}.example"
+    product_url = f"https://{source_key}/products/test-item"
+    try:
+        source = Source(
+            key=source_key,
+            name=source_key,
+            base_url=f"https://{source_key}",
+            base_url_normalized=source_key,
+        )
+        db.add(source)
+        db.flush()
+        db.add(SourceSetting(source_id=int(source.id)))
+        db.flush()
+
+        service = ProductIngestService(db)
+        service.apply_batch(
+            source_id=int(source.id),
+            items=[
+                {
+                    "url": product_url,
+                    "handle": "test-item",
+                    "title": "Published Item",
+                    "description": "",
+                    "published_at": "2026-01-10T12:30:00Z",
+                    "designer": "Test Designer",
+                    "category": "Outerwear",
+                    "gender": "male",
+                    "source_weight_grams": 720,
+                    "orderability_status": "orderable",
+                    "variants": [{"title": "Default", "price": 120.0, "currency": "USD", "available": True}],
+                    "images": [],
+                }
+            ],
+        )
+        db.flush()
+
+        listing = db.query(ProductListing).filter(ProductListing.source_id == int(source.id)).one()
+        assert listing.source_published_at == datetime(2026, 1, 10, 12, 30, tzinfo=timezone.utc)
+
+        service.apply_batch(
+            source_id=int(source.id),
+            items=[
+                {
+                    "url": product_url,
+                    "handle": "test-item",
+                    "title": "Published Item",
+                    "description": "",
+                    "published_at": "",
+                    "designer": "Test Designer",
+                    "category": "Outerwear",
+                    "gender": "male",
+                    "source_weight_grams": 720,
+                    "orderability_status": "orderable",
+                    "variants": [{"title": "Default", "price": 130.0, "currency": "USD", "available": True}],
+                    "images": [],
+                }
+            ],
+        )
+        db.flush()
+        db.refresh(listing)
+
+        assert listing.source_published_at == datetime(2026, 1, 10, 12, 30, tzinfo=timezone.utc)
     finally:
         db.rollback()
         db.close()

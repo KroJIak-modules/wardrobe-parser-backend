@@ -53,6 +53,27 @@ class ProductIngestService:
         return text or None
 
     @staticmethod
+    def _parse_source_published_at(value: object) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _prefer_existing_datetime(cls, incoming: object, existing: datetime | None) -> datetime | None:
+        parsed = cls._parse_source_published_at(incoming)
+        if parsed is not None:
+            return parsed
+        return existing
+
+    @staticmethod
     def _normalized_variant_currency_code(variant: object) -> str | None:
         if isinstance(variant, dict):
             raw_currency = variant.get("currency_code")
@@ -328,6 +349,7 @@ class ProductIngestService:
                     source_designer_raw=self._normalized_optional_text(item.get("designer")),
                     source_category_raw=self._normalized_optional_text(item.get("category")),
                     source_tags=self._normalized_text_list(item.get("tags")),
+                    source_published_at=self._parse_source_published_at(item.get("published_at")),
                     ingest_mode="sync",
                     last_seen_at=self._utcnow(),
                     last_synced_at=self._utcnow(),
@@ -346,6 +368,7 @@ class ProductIngestService:
                 listing.source_designer_raw = self._prefer_existing_text(item.get("designer"), listing.source_designer_raw)
                 listing.source_category_raw = self._prefer_existing_text(item.get("category"), listing.source_category_raw)
                 listing.source_tags = self._prefer_existing_text_list(item.get("tags"), listing.source_tags)
+                listing.source_published_at = self._prefer_existing_datetime(item.get("published_at"), listing.source_published_at)
                 listing.last_seen_at = self._utcnow()
                 listing.last_synced_at = self._utcnow()
 

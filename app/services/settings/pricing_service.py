@@ -37,7 +37,7 @@ _FORMULA_LINES = [
     "PFR = BUY * PFRP",
     "CDR = ((max(0, SPE - THR) * DUT) * (1 + CPR)) * (E2U * BFX) + CFX",
     "SUB = BUY + PFR + CDR + SSR[SUP,RNG]",
-    "SVC = configurable surcharge by BUY (fixed RUB or percent)",
+    "SVC = configurable surcharge by SUB (fixed RUB or percent)",
     "SUBM = SUB * MUP + SVC",
     "TAX = SUBM * TXR",
     "FPR = round(SUBM + TAX, RND)",
@@ -72,7 +72,7 @@ _FORMULA_LEGEND = [
     {"key": "SUP", "description": "Поставщик."},
     {"key": "RNG", "description": "Весовой диапазон тарифа доставки."},
     {"key": "SUB", "description": "База до наценки: BUY + PFR + CDR + SSR."},
-    {"key": "SVC", "description": "Своя надбавка по диапазону BUY (фикс в RUB или процент от BUY)."},
+    {"key": "SVC", "description": "Своя надбавка по диапазону SUB (фикс в RUB или процент от SUB)."},
     {"key": "SUBM", "description": "Сумма до налога: SUB * MUP + SVC."},
     {"key": "TXR", "description": "Ставка налога."},
     {"key": "TAX", "description": "Налог в RUB."},
@@ -1296,14 +1296,14 @@ class PricingSettingsService:
             )
         delivery_rub = supplier_shipping_rub
 
+        subtotal_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub
         svc_rule = PricingSettingsService._pick_range_rule(
-            value=buyout_rub,
+            value=subtotal_rub,
             rules=getattr(settings, "svc_rules", []) or [],
             min_key="min_rub",
             max_key="max_rub",
         )
-        service_fee_rub, service_fee_meta = PricingSettingsService._compute_rule_amount(buyout_rub, svc_rule)
-        subtotal_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub
+        service_fee_rub, service_fee_meta = PricingSettingsService._compute_rule_amount(subtotal_rub, svc_rule)
         markup_multiplier = max(0.0, float(settings.markup_multiplier))
         subtotal_after_markup_rub = (subtotal_rub * markup_multiplier) + service_fee_rub
         tax_rub = subtotal_after_markup_rub * max(0.0, float(settings.tax_rate))
