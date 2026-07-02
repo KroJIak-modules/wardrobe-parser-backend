@@ -103,3 +103,42 @@ def test_pricing_settings_persists_svc_rules() -> None:
         restore_db.commit()
     finally:
         restore_db.close()
+
+
+def test_pricing_settings_persists_conversion_coefficients() -> None:
+    initial_db = SessionLocal()
+    original_values: tuple[float, float, float] | None = None
+    entity_id = 1
+    try:
+        entity, _ = PricingSettingsService(initial_db)._get_or_create_pricing_entity()
+        entity_id = int(entity.id)
+        original_values = (
+            float(getattr(entity, "eur_to_usd_rate", 0.0) or 0.0),
+            float(getattr(entity, "gbp_to_usd_rate", 0.0) or 0.0),
+            float(getattr(entity, "jpy_to_usd_rate", 0.0) or 0.0),
+        )
+        entity.eur_to_usd_rate = 1.23
+        entity.gbp_to_usd_rate = 1.41
+        entity.jpy_to_usd_rate = 0.0067
+        initial_db.commit()
+    finally:
+        initial_db.close()
+
+    verify_db = SessionLocal()
+    try:
+        stored = verify_db.query(PricingSetting).filter(PricingSetting.id == entity_id).one()
+        assert float(stored.eur_to_usd_rate) == 1.23
+        assert float(stored.gbp_to_usd_rate) == 1.41
+        assert float(stored.jpy_to_usd_rate) == 0.0067
+    finally:
+        verify_db.close()
+
+    restore_db = SessionLocal()
+    try:
+        restore = restore_db.query(PricingSetting).filter(PricingSetting.id == entity_id).one()
+        restore.eur_to_usd_rate = original_values[0] if original_values is not None else 1.18
+        restore.gbp_to_usd_rate = original_values[1] if original_values is not None else 1.4
+        restore.jpy_to_usd_rate = original_values[2] if original_values is not None else 0.0065
+        restore_db.commit()
+    finally:
+        restore_db.close()

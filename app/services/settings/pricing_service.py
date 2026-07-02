@@ -81,9 +81,6 @@ _FORMULA_LEGEND = [
     {"key": "FPR", "description": "Финальная цена в RUB."},
 ]
 
-_DEFAULT_GBP_TO_USD_RATE = 1.27
-_DEFAULT_JPY_TO_USD_RATE = 0.0065
-
 @dataclass(slots=True)
 class ProductPricingComputation:
     final_price_rub: float | None
@@ -107,17 +104,24 @@ class PricingSettingsService:
 
         SiteCatalogSortPriceService(self.db).enqueue_all_active_products()
 
+    @staticmethod
+    def _seed_pricing_settings():
+        return DefaultAdminSettingsLoader.load().pricing_settings
+
     def _get_or_create_pricing_entity(self) -> tuple[PricingSetting, bool]:
         current = self.repo.get_singleton()
         if current is not None:
             return current, False
-        seed = DefaultAdminSettingsLoader.load().pricing_settings
+        seed = self._seed_pricing_settings()
         entity = PricingSetting(
             id=1,
             markup_multiplier=float(seed.markup_multiplier),
             weight_tolerance=float(seed.weight_tolerance),
             customs_threshold_eur=float(seed.customs_threshold_eur),
             customs_duty_rate=float(seed.customs_duty_rate),
+            eur_to_usd_rate=float(seed.eur_to_usd_rate),
+            gbp_to_usd_rate=float(seed.gbp_to_usd_rate),
+            jpy_to_usd_rate=float(seed.jpy_to_usd_rate),
             eur_to_rub_rate=float(seed.eur_to_rub_rate),
             usd_to_rub_rate=float(seed.usd_to_rub_rate),
             usdt_to_rub_rate=float(seed.usdt_to_rub_rate),
@@ -154,6 +158,9 @@ class PricingSettingsService:
         pricing.weight_tolerance = float(seed.pricing_settings.weight_tolerance)
         pricing.customs_threshold_eur = float(seed.pricing_settings.customs_threshold_eur)
         pricing.customs_duty_rate = float(seed.pricing_settings.customs_duty_rate)
+        pricing.eur_to_usd_rate = float(seed.pricing_settings.eur_to_usd_rate)
+        pricing.gbp_to_usd_rate = float(seed.pricing_settings.gbp_to_usd_rate)
+        pricing.jpy_to_usd_rate = float(seed.pricing_settings.jpy_to_usd_rate)
         pricing.eur_to_rub_rate = float(seed.pricing_settings.eur_to_rub_rate)
         pricing.usd_to_rub_rate = float(seed.pricing_settings.usd_to_rub_rate)
         pricing.usdt_to_rub_rate = float(seed.pricing_settings.usdt_to_rub_rate)
@@ -347,7 +354,47 @@ class PricingSettingsService:
         return usd_to_rub, eur_to_rub
 
     @classmethod
+    def _coerce_conversion_fields(cls, entity) -> bool:
+        changed = False
+        seed = cls._seed_pricing_settings()
+        seed_usdt_to_rub_rate = max(0.01, float(seed.usdt_to_rub_rate))
+        seed_eur_to_usd_rate = max(0.01, float(seed.eur_to_usd_rate))
+        seed_gbp_to_usd_rate = max(0.01, float(seed.gbp_to_usd_rate))
+        seed_jpy_to_usd_rate = max(0.000001, float(seed.jpy_to_usd_rate))
+        usdt_to_rub_rate = max(0.01, float(getattr(entity, "usdt_to_rub_rate", seed_usdt_to_rub_rate) or seed_usdt_to_rub_rate))
+        usd_to_rub_rate = max(0.01, float(getattr(entity, "usd_to_rub_rate", usdt_to_rub_rate) or usdt_to_rub_rate))
+        eur_to_usd_rate = float(getattr(entity, "eur_to_usd_rate", 0.0) or 0.0)
+        if eur_to_usd_rate <= 0:
+            eur_to_rub_current = float(getattr(entity, "eur_to_rub_rate", 0.0) or 0.0)
+            eur_to_usd_rate = (eur_to_rub_current / usd_to_rub_rate) if eur_to_rub_current > 0 and usd_to_rub_rate > 0 else seed_eur_to_usd_rate
+        gbp_to_usd_rate = float(getattr(entity, "gbp_to_usd_rate", 0.0) or 0.0)
+        if gbp_to_usd_rate <= 0:
+            gbp_to_usd_rate = seed_gbp_to_usd_rate
+        jpy_to_usd_rate = float(getattr(entity, "jpy_to_usd_rate", 0.0) or 0.0)
+        if jpy_to_usd_rate <= 0:
+            jpy_to_usd_rate = seed_jpy_to_usd_rate
+        eur_to_rub_rate = max(0.01, usd_to_rub_rate * eur_to_usd_rate)
+
+        if float(getattr(entity, "usd_to_rub_rate", 0.0) or 0.0) != usd_to_rub_rate:
+            entity.usd_to_rub_rate = usd_to_rub_rate
+            changed = True
+        if float(getattr(entity, "eur_to_usd_rate", 0.0) or 0.0) != eur_to_usd_rate:
+            entity.eur_to_usd_rate = eur_to_usd_rate
+            changed = True
+        if float(getattr(entity, "gbp_to_usd_rate", 0.0) or 0.0) != gbp_to_usd_rate:
+            entity.gbp_to_usd_rate = gbp_to_usd_rate
+            changed = True
+        if float(getattr(entity, "jpy_to_usd_rate", 0.0) or 0.0) != jpy_to_usd_rate:
+            entity.jpy_to_usd_rate = jpy_to_usd_rate
+            changed = True
+        if float(getattr(entity, "eur_to_rub_rate", 0.0) or 0.0) != eur_to_rub_rate:
+            entity.eur_to_rub_rate = eur_to_rub_rate
+            changed = True
+        return changed
+
+    @classmethod
     def _effective_rates_from_entity(cls, entity) -> tuple[float, float]:
+        cls._coerce_conversion_fields(entity)
         return cls._effective_fx_rates(
             usd_to_rub_rate=float(entity.usd_to_rub_rate),
             eur_to_rub_rate=float(entity.eur_to_rub_rate),
@@ -483,6 +530,8 @@ class PricingSettingsService:
             entity.usdt_to_rub_rate = float(rate)
             entity.usd_to_rub_rate = float(rate)
             changed = True
+        if PricingSettingsService._coerce_conversion_fields(entity):
+            changed = True
         if (getattr(entity, "bybit_bucket_rates", None) or []) != bucket_rates:
             entity.bybit_bucket_rates = bucket_rates
         if getattr(entity, "bybit_last_error", None):
@@ -512,6 +561,7 @@ class PricingSettingsService:
         svc_rules_changed = normalized_svc_rules != (getattr(entity, "svc_rules", None) or [])
         if svc_rules_changed:
             entity.svc_rules = normalized_svc_rules
+        conversion_changed = self._coerce_conversion_fields(entity)
         bybit_status = "skipped"
         bybit_warning = None
         bybit_snapshot = None
@@ -528,7 +578,7 @@ class PricingSettingsService:
             bybit_error = str(getattr(entity, "bybit_last_error", "") or "") or None
             if bybit_error:
                 bybit_warning = f"WARN: Bybit временно недоступен, используется сохраненный курс. Причина: {bybit_error}"
-        if created or svc_rules_changed or bybit_changed:
+        if created or svc_rules_changed or conversion_changed or bybit_changed:
             self.db.commit()
             self.db.refresh(entity)
             if bybit_changed:
@@ -549,6 +599,22 @@ class PricingSettingsService:
         if "svc_rules" in patch:
             patch["svc_rules"] = self._normalize_svc_rules(patch.get("svc_rules"))
             self._validate_svc_rules_no_overlap(patch["svc_rules"])
+        if "usdt_to_rub_rate" in patch and "usd_to_rub_rate" not in patch:
+            patch["usd_to_rub_rate"] = patch["usdt_to_rub_rate"]
+        if "eur_to_rub_rate" in patch and "eur_to_usd_rate" not in patch:
+            seed = self._seed_pricing_settings()
+            current_usd_to_rub = float(getattr(entity, "usd_to_rub_rate", 0.0) or 0.0)
+            current_usdt_to_rub = float(getattr(entity, "usdt_to_rub_rate", 0.0) or 0.0)
+            next_usd_to_rub = max(
+                0.0001,
+                float(
+                    patch.get("usd_to_rub_rate")
+                    or current_usd_to_rub
+                    or current_usdt_to_rub
+                    or float(seed.usd_to_rub_rate)
+                ),
+            )
+            patch["eur_to_usd_rate"] = max(0.01, float(patch["eur_to_rub_rate"])) / next_usd_to_rub
         if "final_rounding_mode" in patch:
             patch["final_rounding_mode"] = self._normalize_final_rounding_mode(
                 patch.get("final_rounding_mode"),
@@ -556,10 +622,11 @@ class PricingSettingsService:
             )
         for key, value in patch.items():
             setattr(entity, key, value)
+        conversion_changed = self._coerce_conversion_fields(entity)
         self.db.commit()
-        if created or patch:
+        if created or patch or conversion_changed:
             self.db.refresh(entity)
-        if patch:
+        if patch or conversion_changed:
             self._enqueue_site_sort_price_refresh_for_all_products()
         suppliers = self.supplier_repo.list_all_with_rates()
         return self._to_response(entity, suppliers=suppliers)
@@ -594,6 +661,7 @@ class PricingSettingsService:
         bybit_last_error_value = bybit_last_error or str(getattr(entity, "bybit_last_error", "") or "") or None
         if bybit_last_error_value is None and bybit_rate_status == "fallback_stored":
             bybit_last_error_value = "Bybit fetch failed"
+        PricingSettingsService._coerce_conversion_fields(entity)
         effective_usd_to_rub, effective_eur_to_rub = PricingSettingsService._effective_rates_from_entity(entity)
         normalized_svc_rules = PricingSettingsService._normalize_svc_rules(getattr(entity, "svc_rules", None))
         return PricingSettingsResponse(
@@ -601,6 +669,9 @@ class PricingSettingsService:
             weight_tolerance=float(entity.weight_tolerance),
             customs_threshold_eur=float(entity.customs_threshold_eur),
             customs_duty_rate=float(entity.customs_duty_rate),
+            eur_to_usd_rate=float(entity.eur_to_usd_rate),
+            gbp_to_usd_rate=float(entity.gbp_to_usd_rate),
+            jpy_to_usd_rate=float(entity.jpy_to_usd_rate),
             eur_to_rub_rate=float(entity.eur_to_rub_rate),
             usd_to_rub_rate=float(entity.usd_to_rub_rate),
             usdt_to_rub_rate=float(entity.usdt_to_rub_rate),
@@ -1110,9 +1181,9 @@ class PricingSettingsService:
         usdt_extra_rub = max(0.0, float(settings.usdt_extra_rub))
         usd_to_rub_rate = max(0.0001, float(settings.usd_to_rub_rate))
         eur_to_rub_rate = max(0.0001, float(settings.eur_to_rub_rate))
-        eur_to_usd_rate = max(0.0001, eur_to_rub_rate / usd_to_rub_rate)
-        gbp_to_usd_rate = _DEFAULT_GBP_TO_USD_RATE
-        jpy_to_usd_rate = _DEFAULT_JPY_TO_USD_RATE
+        eur_to_usd_rate = max(0.0001, float(settings.eur_to_usd_rate))
+        gbp_to_usd_rate = max(0.0001, float(settings.gbp_to_usd_rate))
+        jpy_to_usd_rate = max(0.000001, float(settings.jpy_to_usd_rate))
         if base_usdt_to_rub <= 0 or usd_to_rub_rate <= 0 or eur_to_rub_rate <= 0:
             return ProductPricingComputation(
                 None,
