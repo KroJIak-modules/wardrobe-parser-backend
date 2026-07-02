@@ -369,6 +369,24 @@ class SiteNotificationSetting(Base):
     )
 
 
+class SiteAccessSetting(Base):
+    __tablename__ = "site_access_settings"
+
+    id = Column(BigInteger, primary_key=True)
+    enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    title = Column(String(255), nullable=False, default="", server_default="")
+    description = Column(Text, nullable=False, default="", server_default="")
+    password_value = Column(String(255), nullable=False, default="", server_default="")
+    password_hash = Column(String(512), nullable=False, default="", server_default="")
+    session_version = Column(Integer, nullable=False, default=1, server_default="1")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("session_version >= 1", name="ck_site_access_settings_session_version_positive"),
+    )
+
+
 class SyncJob(Base):
     __tablename__ = "sync_jobs"
 

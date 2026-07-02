@@ -56,6 +56,28 @@ class SiteHomeNotificationResponse(BaseModel):
     cta_href: str
 
 
+class SiteAccessStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    unlocked: bool
+    title: str
+    description: str
+
+
+class SiteAccessUnlockRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    password: str = ""
+
+
+class SiteAccessUnlockResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    unlocked: bool
+
+
 class SiteNavigationMenuEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

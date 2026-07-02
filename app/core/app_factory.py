@@ -32,6 +32,19 @@ _PUBLIC_OPENAPI_PATHS = {
     "/api/v1/products/images/{image_id}",
     "/api/v1/showcase/state",
     "/api/v1/showcase/media/{asset_id}/file",
+    "/api/v1/site/access/status",
+    "/api/v1/site/access/unlock",
+    "/api/v1/site/home/hero",
+    "/api/v1/site/home/carousel",
+    "/api/v1/site/home/notification",
+    "/api/v1/site/navigation",
+    "/api/v1/site/catalog/experience",
+    "/api/v1/site/catalog/products",
+    "/api/v1/site/designers",
+    "/api/v1/site/products/{product_path}",
+    "/api/v1/site/about",
+    "/api/v1/site/questions",
+    "/api/v1/site/media/{asset_id}/file",
 }
 _PUBLIC_OPENAPI_OPERATIONS = {
     "/health": {"get"},
@@ -39,6 +52,24 @@ _PUBLIC_OPENAPI_OPERATIONS = {
     "/api/v1/products/images/{image_id}": {"get"},
     "/api/v1/showcase/state": {"get"},
     "/api/v1/showcase/media/{asset_id}/file": {"get"},
+    "/api/v1/site/access/status": {"get"},
+    "/api/v1/site/access/unlock": {"post"},
+    "/api/v1/site/home/hero": {"get"},
+    "/api/v1/site/home/carousel": {"get"},
+    "/api/v1/site/home/notification": {"get"},
+    "/api/v1/site/navigation": {"get"},
+    "/api/v1/site/catalog/experience": {"get"},
+    "/api/v1/site/catalog/products": {"get"},
+    "/api/v1/site/designers": {"get"},
+    "/api/v1/site/products/{product_path}": {"get"},
+    "/api/v1/site/about": {"get"},
+    "/api/v1/site/questions": {"get"},
+    "/api/v1/site/media/{asset_id}/file": {"get"},
+}
+_SITE_ACCESS_OPEN_PUBLIC_PATHS = {
+    "/api/v1/site/access/status",
+    "/api/v1/site/access/unlock",
+    "/api/v1/site/home/hero",
 }
 
 
@@ -131,6 +162,18 @@ def _build_public_openapi(app: FastAPI) -> dict[str, Any]:
         components["schemas"] = {name: schemas[name] for name in sorted(resolved) if name in schemas}
     if components:
         schema["components"] = components
+    security_schemes = (schema.setdefault("components", {}).setdefault("securitySchemes", {}))
+    security_schemes["SiteAccessCookie"] = {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "site_access_token",
+        "description": "Cookie, issued by POST /api/v1/site/access/unlock when site password protection is enabled.",
+    }
+    for path, path_item in schema["paths"].items():
+        if not path.startswith("/api/v1/site/") or path in _SITE_ACCESS_OPEN_PUBLIC_PATHS:
+            continue
+        for operation in path_item.values():
+            operation.setdefault("security", [{"SiteAccessCookie": []}])
 
     used_tags = {
         tag

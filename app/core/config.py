@@ -140,8 +140,16 @@ class Settings(BaseSettings):
     admin_refresh_token_ttl_sec: int = Field(default=604_800, ge=3600, le=7_776_000, validation_alias="ADMIN_REFRESH_TOKEN_TTL_SEC")
     admin_token_secret: str = Field(default="", validation_alias="ADMIN_TOKEN_SECRET")
     admin_auth_cookie_secure: bool = Field(default=False, validation_alias="ADMIN_AUTH_COOKIE_SECURE")
+    site_access_token_ttl_sec: int = Field(default=2_592_000, ge=300, le=31_536_000, validation_alias="SITE_ACCESS_TOKEN_TTL_SEC")
+    site_access_token_secret: str = Field(default="", validation_alias="SITE_ACCESS_TOKEN_SECRET")
 
-    @field_validator("admin_access_token_ttl_sec", "admin_refresh_token_ttl_sec", "pricing_bybit_worker_interval_sec", mode="before")
+    @field_validator(
+        "admin_access_token_ttl_sec",
+        "admin_refresh_token_ttl_sec",
+        "pricing_bybit_worker_interval_sec",
+        "site_access_token_ttl_sec",
+        mode="before",
+    )
     @classmethod
     def parse_duration_fields(cls, value: object) -> object:
         return _parse_duration_to_seconds(value)
@@ -160,6 +168,8 @@ class Settings(BaseSettings):
             object.__setattr__(self, "admin_superuser_password", secrets.token_urlsafe(24))
         if not self.admin_token_secret:
             object.__setattr__(self, "admin_token_secret", secrets.token_urlsafe(48))
+        if not self.site_access_token_secret:
+            object.__setattr__(self, "site_access_token_secret", self.admin_token_secret)
         if not str(self.internal_api_token).strip():
             raise ValueError("INTERNAL_API_TOKEN is required")
         return self

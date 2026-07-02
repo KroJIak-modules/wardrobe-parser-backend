@@ -22,6 +22,7 @@ from app.models import (
     ProductListing,
     SiteAboutPhoto,
     SiteAboutSetting,
+    SiteAccessSetting,
     SiteNotificationSetting,
     SiteQuestionItem,
     Source,
@@ -73,6 +74,7 @@ from app.schemas.admin_settings import (
     SettingsTransferTaxonomyState,
     SettingsTransferShowcaseCarouselEntry,
     SettingsTransferShowcaseMedia,
+    SettingsTransferSiteAccess,
     SettingsTransferSiteAbout,
     SettingsTransferSiteContent,
     SettingsTransferSiteNotification,
@@ -81,8 +83,9 @@ from app.schemas.admin_settings import (
 )
 from app.schemas.showcase_media import ShowcaseStateUpdateRequest
 from app.services.catalog.site_content_service import SiteContentService
+from app.services.auth.passwords import hash_password
 
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 _PROJECT_NAME = "wardrobe-parser-platform"
 
 _PRICING_EXPORT_FIELDS = [
@@ -275,6 +278,7 @@ class SettingsTransferService:
 
     def _export_site_content(self) -> SettingsTransferSiteContent:
         about = self.db.query(SiteAboutSetting).order_by(SiteAboutSetting.id.asc()).first()
+        access = self.db.query(SiteAccessSetting).order_by(SiteAccessSetting.id.asc()).first()
         notifications = (
             self.db.query(SiteNotificationSetting)
             .filter(SiteNotificationSetting.deleted_at.is_(None))
@@ -288,6 +292,12 @@ class SettingsTransferService:
             .all()
         )
         return SettingsTransferSiteContent(
+            access=SettingsTransferSiteAccess(
+                enabled=bool(getattr(access, "enabled", False)),
+                title=str(getattr(access, "title", "") or ""),
+                description=str(getattr(access, "description", "") or ""),
+                password=str(getattr(access, "password_value", "") or ""),
+            ),
             about=SettingsTransferSiteAbout(
                 text=str(getattr(about, "body_text", "") or ""),
                 photo_asset_checksums=[
@@ -630,6 +640,7 @@ class SettingsTransferService:
                     "taxonomy_custom_catalogs_replaced": len(taxonomy_state.custom_catalogs),
                     "showcase_categories_replaced": len(taxonomy_state.showcase_categories),
                     "showcase_media_assets_linked": showcase_media_updated,
+                    "site_access_settings_updated": site_content_updated["access"],
                     "site_about_photos_linked": site_content_updated["about_photos"],
                     "site_notifications_replaced": site_content_updated["notifications"],
                     "site_questions_replaced": site_content_updated["questions"],
@@ -698,6 +709,16 @@ class SettingsTransferService:
             self.db.add(about)
         else:
             about.body_text = ""
+        access = self.db.query(SiteAccessSetting).filter(SiteAccessSetting.id == 1).one_or_none()
+        if access is None:
+            access = SiteAccessSetting(id=1)
+            self.db.add(access)
+        access.enabled = False
+        access.title = ""
+        access.description = ""
+        access.password_value = ""
+        access.password_hash = ""
+        access.session_version = int(access.session_version or 1) + 1
 
         self.db.commit()
         return SettingsTransferResponse(
@@ -711,6 +732,7 @@ class SettingsTransferService:
                 "suppliers_upserted": len(suppliers),
                 "sources_upserted": sources_reset,
                 "weight_rules_replaced": weight_rule_count,
+                "site_access_settings_updated": 1,
             },
         )
 
@@ -953,6 +975,19 @@ class SettingsTransferService:
         *,
         asset_map: dict[tuple[str, str], ImageAsset],
     ) -> dict[str, int]:
+        access = self.db.query(SiteAccessSetting).order_by(SiteAccessSetting.id.asc()).first()
+        if access is None:
+            access = SiteAccessSetting(id=1)
+            self.db.add(access)
+            self.db.flush()
+        access_password = str(payload.access.password or "").strip()
+        access.enabled = bool(payload.access.enabled)
+        access.title = str(payload.access.title or "").strip()
+        access.description = str(payload.access.description or "").strip()
+        access.password_value = access_password
+        access.password_hash = hash_password(access_password) if access_password else ""
+        access.session_version = int(access.session_version or 1) + 1
+
         about = self.db.query(SiteAboutSetting).order_by(SiteAboutSetting.id.asc()).first()
         if about is None:
             about = SiteAboutSetting(id=1)
@@ -1019,6 +1054,7 @@ class SettingsTransferService:
             linked_notifications += 1
         self.db.flush()
         return {
+            "access": 1,
             "about_photos": linked_about_photos,
             "notifications": linked_notifications,
             "questions": linked_questions,

@@ -346,14 +346,22 @@ class SettingsTransferSiteNotification(BaseModel):
     position: int = Field(default=1, ge=1, le=1000000)
 
 
+class SettingsTransferSiteAccess(BaseModel):
+    enabled: bool = False
+    title: str = ""
+    description: str = ""
+    password: str = ""
+
+
 class SettingsTransferSiteContent(BaseModel):
+    access: SettingsTransferSiteAccess = Field(default_factory=SettingsTransferSiteAccess)
     about: SettingsTransferSiteAbout = Field(default_factory=SettingsTransferSiteAbout)
     notifications: list[SettingsTransferSiteNotification] = Field(default_factory=list)
     questions: list[SettingsTransferSiteQuestionItem] = Field(default_factory=list)
 
 
 class SettingsTransferPayload(BaseModel):
-    schema_version: int = Field(default=8, ge=1, le=1000)
+    schema_version: int = Field(default=9, ge=1, le=1000)
     exported_at: str | None = None
     project: str | None = None
     pricing_settings: SettingsTransferPricingSettings

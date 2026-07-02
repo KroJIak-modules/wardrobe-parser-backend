@@ -1,14 +1,19 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Cookie, Depends, Query, Request, Response
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.services.catalog.media_asset_service import MediaAssetService
+from app.services.catalog.site_access_service import SITE_ACCESS_COOKIE_NAME, SiteAccessService, require_site_access
 from app.services.catalog.site_query_service import SiteQueryService
 from app.schemas.site import (
     SiteAboutResponse,
+    SiteAccessStatusResponse,
+    SiteAccessUnlockRequest,
+    SiteAccessUnlockResponse,
     SiteCarouselResponse,
     SiteCatalogExperienceResponse,
     SiteCatalogProductsResponse,
@@ -33,7 +38,35 @@ def get_site_home_hero(
     return SiteQueryService(db).home_hero(normalized_viewport)
 
 
-@router.get("/home/carousel", response_model=SiteCarouselResponse)
+@router.get("/access/status", response_model=SiteAccessStatusResponse)
+def get_site_access_status(
+    site_access_token: str | None = Cookie(default=None, alias=SITE_ACCESS_COOKIE_NAME),
+    db: Session = Depends(get_db),
+) -> SiteAccessStatusResponse:
+    return SiteAccessService(db).public_status(site_access_token)
+
+
+@router.post("/access/unlock", response_model=SiteAccessUnlockResponse)
+def unlock_site_access(
+    payload: SiteAccessUnlockRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> SiteAccessUnlockResponse:
+    result = SiteAccessService(db).unlock(payload.password)
+    if result.token:
+        response.set_cookie(
+            key=SITE_ACCESS_COOKIE_NAME,
+            value=result.token,
+            httponly=True,
+            secure=settings.admin_auth_cookie_secure,
+            samesite="lax",
+            max_age=result.max_age,
+            path="/",
+        )
+    return result.response
+
+
+@router.get("/home/carousel", response_model=SiteCarouselResponse, dependencies=[Depends(require_site_access)])
 def get_site_home_carousel(
     viewport: str = Query(default="desktop"),
     db: Session = Depends(get_db),
@@ -42,17 +75,17 @@ def get_site_home_carousel(
     return SiteQueryService(db).home_carousel(normalized_viewport)
 
 
-@router.get("/home/notification", response_model=SiteHomeNotificationResponse)
+@router.get("/home/notification", response_model=SiteHomeNotificationResponse, dependencies=[Depends(require_site_access)])
 def get_site_home_notification(db: Session = Depends(get_db)) -> SiteHomeNotificationResponse:
     return SiteQueryService(db).home_notification()
 
 
-@router.get("/navigation", response_model=SiteNavigationResponse)
+@router.get("/navigation", response_model=SiteNavigationResponse, dependencies=[Depends(require_site_access)])
 def get_site_navigation(db: Session = Depends(get_db)) -> SiteNavigationResponse:
     return SiteQueryService(db).navigation()
 
 
-@router.get("/catalog/experience", response_model=SiteCatalogExperienceResponse)
+@router.get("/catalog/experience", response_model=SiteCatalogExperienceResponse, dependencies=[Depends(require_site_access)])
 def get_site_catalog_experience(
     request: Request,
     view_key: str = Query(default="default"),
@@ -69,7 +102,7 @@ def get_site_catalog_experience(
     return SiteQueryService(db).catalog_experience(view_key=normalized_view_key, search_params=search_params)
 
 
-@router.get("/catalog/products", response_model=SiteCatalogProductsResponse)
+@router.get("/catalog/products", response_model=SiteCatalogProductsResponse, dependencies=[Depends(require_site_access)])
 def get_site_catalog_products(
     q: str = Query(default=""),
     designer: list[str] = Query(default=[]),
@@ -111,28 +144,33 @@ def get_site_catalog_products(
     )
 
 
-@router.get("/designers", response_model=SiteDesignersResponse)
+@router.get("/designers", response_model=SiteDesignersResponse, dependencies=[Depends(require_site_access)])
 def get_site_designers(db: Session = Depends(get_db)) -> SiteDesignersResponse:
     return SiteQueryService(db).designers()
 
 
-@router.get("/products/{product_path}", response_model=SiteProductResponse)
+@router.get("/products/{product_path}", response_model=SiteProductResponse, dependencies=[Depends(require_site_access)])
 def get_site_product(product_path: str, db: Session = Depends(get_db)) -> SiteProductResponse:
     return SiteQueryService(db).product(product_path)
 
 
-@router.get("/about", response_model=SiteAboutResponse)
+@router.get("/about", response_model=SiteAboutResponse, dependencies=[Depends(require_site_access)])
 def get_site_about(db: Session = Depends(get_db)) -> SiteAboutResponse:
     return SiteQueryService(db).about()
 
 
-@router.get("/questions", response_model=SiteQuestionsResponse)
+@router.get("/questions", response_model=SiteQuestionsResponse, dependencies=[Depends(require_site_access)])
 def get_site_questions(db: Session = Depends(get_db)) -> SiteQuestionsResponse:
     return SiteQueryService(db).questions()
 
 
 @router.get("/media/{asset_id}/file")
-def get_site_media_file(asset_id: int, db: Session = Depends(get_db)) -> FileResponse:
+def get_site_media_file(
+    asset_id: int,
+    site_access_token: str | None = Cookie(default=None, alias=SITE_ACCESS_COOKIE_NAME),
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    SiteAccessService(db).require_media_access(asset_id, site_access_token)
     service = SiteQueryService(db)
     asset = service.site_media_asset(asset_id)
     file_path = MediaAssetService(db).resolve_file_path(asset)

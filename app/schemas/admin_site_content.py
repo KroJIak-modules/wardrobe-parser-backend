@@ -87,3 +87,28 @@ class AdminSiteContentMediaUploadResponse(BaseModel):
 
     ok: bool
     asset: SiteMediaAssetResponse
+
+
+class AdminSiteAccessSettingsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    title: str = ""
+    description: str = ""
+    password: str = ""
+    updated_at: str = ""
+
+
+class AdminSiteAccessSettingsUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    title: str = ""
+    description: str = ""
+    password: str = ""
+
+
+class AdminSiteAccessPasswordGenerateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    password: str

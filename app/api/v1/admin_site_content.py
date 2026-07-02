@@ -7,6 +7,9 @@ from app.core.database import get_db
 from app.schemas.admin_site_content import (
     AdminSiteAboutResponse,
     AdminSiteAboutUpdateRequest,
+    AdminSiteAccessPasswordGenerateResponse,
+    AdminSiteAccessSettingsResponse,
+    AdminSiteAccessSettingsUpdateRequest,
     AdminSiteContentMediaUploadResponse,
     AdminSiteNotificationCreateRequest,
     AdminSiteNotificationsResponse,
@@ -14,10 +17,43 @@ from app.schemas.admin_site_content import (
     AdminSiteQuestionsUpdateRequest,
 )
 from app.services.auth.admin_auth_service import require_permission
+from app.services.catalog.site_access_service import SiteAccessService
 from app.services.catalog.site_content_service import SiteContentService
 
 
 router = APIRouter(prefix="/admin/site-content", tags=["admin-site-content"])
+
+
+@router.get(
+    "/access",
+    response_model=AdminSiteAccessSettingsResponse,
+    dependencies=[Depends(require_permission("control.settings"))],
+)
+def get_admin_site_access(db: Session = Depends(get_db)) -> AdminSiteAccessSettingsResponse:
+    return SiteAccessService(db).get_admin_settings()
+
+
+@router.put(
+    "/access",
+    response_model=AdminSiteAccessSettingsResponse,
+    dependencies=[Depends(require_permission("control.settings"))],
+)
+def put_admin_site_access(
+    payload: AdminSiteAccessSettingsUpdateRequest,
+    db: Session = Depends(get_db),
+) -> AdminSiteAccessSettingsResponse:
+    result = SiteAccessService(db).update_admin_settings(payload)
+    db.commit()
+    return result
+
+
+@router.post(
+    "/access/generate-password",
+    response_model=AdminSiteAccessPasswordGenerateResponse,
+    dependencies=[Depends(require_permission("control.settings"))],
+)
+def generate_admin_site_access_password() -> AdminSiteAccessPasswordGenerateResponse:
+    return SiteAccessService.generate_password()
 
 
 @router.get(
