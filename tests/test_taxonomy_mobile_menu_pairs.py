@@ -5,6 +5,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from app.core.database import SessionLocal
+from app.models import FilterAssignmentRuntimeState
 from app.schemas.taxonomy import (
     TaxonomyCustomCatalog,
     TaxonomyFilterNode,
@@ -297,6 +298,104 @@ def test_admin_editor_roundtrips_filter_gender_restriction_flag() -> None:
         assert bool(saved_leaf.get("restrict_by_gender")) is True
     finally:
         taxonomy.replace_state(original_state)
+        db.close()
+
+
+def test_admin_editor_exposes_filter_assignment_rebuild_status() -> None:
+    db = SessionLocal()
+    editor = AdminEditorService(db)
+    previous_target = 0
+    previous_applied = 0
+    previous_started_at = None
+    previous_requested_at = None
+    previous_completed_at = None
+    previous_last_error = None
+    try:
+        state = db.query(FilterAssignmentRuntimeState).filter(FilterAssignmentRuntimeState.id == 1).one_or_none()
+        if state is None:
+            state = FilterAssignmentRuntimeState(id=1)
+            db.add(state)
+        previous_target = int(state.target_revision or 0)
+        previous_applied = int(state.applied_revision or 0)
+        previous_started_at = state.rebuild_started_at
+        previous_requested_at = state.rebuild_requested_at
+        previous_completed_at = state.rebuild_completed_at
+        previous_last_error = state.last_error
+        state.target_revision = 4
+        state.applied_revision = 3
+        state.rebuild_requested_at = None
+        state.rebuild_started_at = None
+        state.rebuild_completed_at = None
+        state.last_error = None
+        db.commit()
+
+        editor_state = editor.list_taxonomy_editor_state()
+        rebuild_status = editor_state["filter_assignment_rebuild"]
+        assert rebuild_status["state"] == "queued"
+        assert int(rebuild_status["target_revision"]) == 4
+        assert int(rebuild_status["applied_revision"]) == 3
+    finally:
+        state = db.query(FilterAssignmentRuntimeState).filter(FilterAssignmentRuntimeState.id == 1).one_or_none()
+        if state is not None:
+            state.target_revision = previous_target
+            state.applied_revision = previous_applied
+            state.rebuild_requested_at = previous_requested_at
+            state.rebuild_started_at = previous_started_at
+            state.rebuild_completed_at = previous_completed_at
+            state.last_error = previous_last_error
+            db.commit()
+        db.close()
+
+
+def test_admin_editor_requests_filter_assignment_rebuild_only_once_while_pending() -> None:
+    db = SessionLocal()
+    editor = AdminEditorService(db)
+    previous_target = 0
+    previous_applied = 0
+    previous_started_at = None
+    previous_requested_at = None
+    previous_completed_at = None
+    previous_last_error = None
+    try:
+        state = db.query(FilterAssignmentRuntimeState).filter(FilterAssignmentRuntimeState.id == 1).one_or_none()
+        if state is None:
+            state = FilterAssignmentRuntimeState(id=1)
+            db.add(state)
+            db.flush()
+        previous_target = int(state.target_revision or 0)
+        previous_applied = int(state.applied_revision or 0)
+        previous_started_at = state.rebuild_started_at
+        previous_requested_at = state.rebuild_requested_at
+        previous_completed_at = state.rebuild_completed_at
+        previous_last_error = state.last_error
+        state.target_revision = max(previous_target, previous_applied)
+        state.applied_revision = max(previous_target, previous_applied)
+        state.rebuild_requested_at = None
+        state.rebuild_started_at = None
+        state.rebuild_completed_at = None
+        state.last_error = None
+        db.commit()
+
+        started_first, status_first = editor.request_filter_assignment_rebuild()
+        db.commit()
+        assert started_first is True
+        assert status_first["state"] == "queued"
+
+        started_second, status_second = editor.request_filter_assignment_rebuild()
+        db.commit()
+        assert started_second is False
+        assert status_second["state"] == "queued"
+        assert int(status_second["target_revision"]) == int(status_first["target_revision"])
+    finally:
+        state = db.query(FilterAssignmentRuntimeState).filter(FilterAssignmentRuntimeState.id == 1).one_or_none()
+        if state is not None:
+            state.target_revision = previous_target
+            state.applied_revision = previous_applied
+            state.rebuild_requested_at = previous_requested_at
+            state.rebuild_started_at = previous_started_at
+            state.rebuild_completed_at = previous_completed_at
+            state.last_error = previous_last_error
+            db.commit()
         db.close()
 
 

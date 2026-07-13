@@ -24,6 +24,7 @@ from app.repositories.catalog_taxonomy import SHOWCASE_CATEGORY_ORDER
 from app.schemas.taxonomy import TaxonomyWriteState
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.designer_support import normalize_designer_text, slugify_designer_name
+from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
 from app.services.catalog.product_query_service import ProductQueryService
 from app.services.catalog.taxonomy_service import TaxonomyService
 
@@ -423,6 +424,7 @@ class AdminEditorService:
 
     def list_taxonomy_editor_state(self) -> dict:
         filters_state = self.taxonomy.get_state()
+        filter_assignment_rebuild = ProductFilterAssignmentService(self.db).get_rebuild_status()
         filter_rows = self.taxonomy.repo.list_filters()
         filter_by_slug = {str(row.slug): row for row in filter_rows}
         product_counts_by_slug = self._filter_product_counts_by_slug()
@@ -586,6 +588,7 @@ class AdminEditorService:
             "categories": categories_payload,
             "custom_catalogs": custom_catalogs_payload,
             "designer_directory": designer_directory,
+            "filter_assignment_rebuild": filter_assignment_rebuild,
             "hidden_product_ids": [
                 int(product_id)
                 for product_id, in (
@@ -597,6 +600,12 @@ class AdminEditorService:
                 )
             ],
         }
+
+    def get_filter_assignment_rebuild_status(self) -> dict:
+        return ProductFilterAssignmentService(self.db).get_rebuild_status()
+
+    def request_filter_assignment_rebuild(self) -> tuple[bool, dict]:
+        return ProductFilterAssignmentService(self.db).request_full_rebuild_once()
 
     @staticmethod
     def _flatten_filter_payload(nodes: list[dict]) -> list[dict]:

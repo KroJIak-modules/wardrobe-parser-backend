@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Literal
 
 from sqlalchemy.orm import Session
 
@@ -56,8 +57,32 @@ class ProductFilterAssignmentService:
     def _utcnow() -> datetime:
         return datetime.now(timezone.utc)
 
+    @staticmethod
+    def _serialize_rebuild_state(state: FilterAssignmentRuntimeState | None) -> dict:
+        target_revision = int(getattr(state, "target_revision", 0) or 0)
+        applied_revision = int(getattr(state, "applied_revision", 0) or 0)
+        rebuild_started_at = getattr(state, "rebuild_started_at", None)
+        status: Literal["idle", "queued", "running"] = "idle"
+        if rebuild_started_at is not None:
+            status = "running"
+        elif target_revision > applied_revision:
+            status = "queued"
+        return {
+            "state": status,
+            "target_revision": target_revision,
+            "applied_revision": applied_revision,
+            "rebuild_requested_at": getattr(state, "rebuild_requested_at", None),
+            "rebuild_started_at": rebuild_started_at,
+            "rebuild_completed_at": getattr(state, "rebuild_completed_at", None),
+            "last_error": str(getattr(state, "last_error", "") or "").strip() or None,
+        }
+
     def get_runtime_state(self) -> FilterAssignmentRuntimeState:
         return self.assignments.get_or_create_runtime_state()
+
+    def get_rebuild_status(self) -> dict:
+        state = self.assignments.get_runtime_state(for_update=False)
+        return self._serialize_rebuild_state(state)
 
     def request_full_rebuild(self) -> int:
         state = self.assignments.get_or_create_runtime_state(for_update=True)
@@ -67,6 +92,15 @@ class ProductFilterAssignmentService:
         state.last_error = None
         self.db.flush()
         return next_revision
+
+    def request_full_rebuild_once(self) -> tuple[bool, dict]:
+        state = self.assignments.get_or_create_runtime_state(for_update=True)
+        target_revision = int(state.target_revision or 0)
+        applied_revision = int(state.applied_revision or 0)
+        if state.rebuild_started_at is not None or target_revision > applied_revision:
+            return False, self._serialize_rebuild_state(state)
+        self.request_full_rebuild()
+        return True, self._serialize_rebuild_state(state)
 
     def enqueue_product_ids_after_commit(self, product_ids: set[int] | list[int] | tuple[int, ...]) -> None:
         self.queue.enqueue_product_ids_after_commit(self.db, product_ids)

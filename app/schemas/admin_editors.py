@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -80,11 +81,39 @@ class AdminDesignerEditorDesigner(BaseModel):
     description: str = ""
 
 
+class AdminDesignerDirectoryItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    label: str = ""
+    product_count: int = Field(default=0, ge=0)
+
+
 class AdminDesignerEditorPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     rows: list[AdminDesignerEditorSourceRow] = Field(default_factory=list)
     designers: list[AdminDesignerEditorDesigner] = Field(default_factory=list)
+
+
+class AdminFilterAssignmentRebuildStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["idle", "queued", "running"] = "idle"
+    target_revision: int = Field(default=0, ge=0)
+    applied_revision: int = Field(default=0, ge=0)
+    rebuild_requested_at: datetime | None = None
+    rebuild_started_at: datetime | None = None
+    rebuild_completed_at: datetime | None = None
+    last_error: str | None = None
+
+
+class AdminFilterAssignmentRebuildStartResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool = True
+    started: bool = False
+    status: AdminFilterAssignmentRebuildStatus
 
 
 class AdminTaxonomyEditorPayload(BaseModel):
