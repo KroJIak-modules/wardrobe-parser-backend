@@ -14,6 +14,7 @@ from app.schemas.taxonomy import (
     TaxonomyState,
 )
 from app.services.catalog.admin_editor_service import AdminEditorService
+from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
 from app.services.catalog.taxonomy_service import TaxonomyService
 
 
@@ -396,6 +397,156 @@ def test_admin_editor_requests_filter_assignment_rebuild_only_once_while_pending
             state.rebuild_completed_at = previous_completed_at
             state.last_error = previous_last_error
             db.commit()
+        db.close()
+
+
+def test_taxonomy_restrict_by_gender_toggle_uses_partial_refresh_instead_of_full_rebuild(monkeypatch) -> None:
+    db = SessionLocal()
+    taxonomy = TaxonomyService(db)
+    editor = AdminEditorService(db)
+    original_state = _clone_state(taxonomy.get_state())
+    suffix = uuid4().hex[:8]
+    rebuild_calls: list[str] = []
+    enqueued_product_ids: list[int] = []
+    try:
+        taxonomy.replace_state(
+            TaxonomyState(
+                filters=[
+                    TaxonomyFilterNode(
+                        slug=f"women-root-{suffix}",
+                        title=f"Women Root {suffix}",
+                        node_kind="multifilter",
+                        children=[
+                            TaxonomyFilterNode(
+                                slug=f"dresses-leaf-{suffix}",
+                                title=f"Dresses Leaf {suffix}",
+                                node_kind="filter",
+                                restrict_by_gender=True,
+                                title_keywords=["dress"],
+                            ),
+                        ],
+                    ),
+                ],
+                custom_catalogs=[],
+                showcase_categories=[
+                    TaxonomyShowcaseCategory(code="new", title="Новинки", attachments=[]),
+                    TaxonomyShowcaseCategory(code="designers", title="Дизайнеры", attachments=[]),
+                    TaxonomyShowcaseCategory(
+                        code="women",
+                        title="Женское",
+                        attachments=[
+                            TaxonomyShowcaseAttachment(
+                                kind="filter",
+                                filter_slug=f"women-root-{suffix}",
+                                hidden_filter_slugs=[],
+                            ),
+                        ],
+                    ),
+                    TaxonomyShowcaseCategory(code="men", title="Мужское", attachments=[]),
+                    TaxonomyShowcaseCategory(code="sale", title="Скидки", attachments=[]),
+                ],
+            )
+        )
+        state = db.query(FilterAssignmentRuntimeState).filter(FilterAssignmentRuntimeState.id == 1).one()
+        state.target_revision = 1
+        state.applied_revision = 1
+        state.rebuild_requested_at = None
+        state.rebuild_started_at = None
+        state.rebuild_completed_at = None
+        state.last_error = None
+        db.commit()
+
+        monkeypatch.setattr(
+            ProductFilterAssignmentService,
+            "request_full_rebuild",
+            lambda self: rebuild_calls.append("full") or 2,
+        )
+        monkeypatch.setattr(
+            ProductFilterAssignmentService,
+            "list_candidate_product_ids_for_filter_slugs",
+            lambda self, filter_slugs, batch_size=1000: [101, 202] if filter_slugs else [],
+        )
+        monkeypatch.setattr(
+            ProductFilterAssignmentService,
+            "enqueue_product_ids_after_commit",
+            lambda self, product_ids: enqueued_product_ids.extend(sorted(int(product_id) for product_id in product_ids)),
+        )
+
+        editor_state = editor.list_taxonomy_editor_state()
+        root_node = next(item for item in editor_state["filters"] if str(item.get("slug") or "") == f"women-root-{suffix}")
+        leaf_node = next(item for item in root_node["children"] if str(item.get("slug") or "") == f"dresses-leaf-{suffix}")
+        leaf_node["restrict_by_gender"] = False
+
+        editor.save_taxonomy_editor_state(editor_state)
+
+        assert rebuild_calls == []
+        assert enqueued_product_ids == [101, 202]
+    finally:
+        taxonomy.replace_state(original_state)
+        db.close()
+
+
+def test_taxonomy_display_only_change_skips_filter_assignment_update(monkeypatch) -> None:
+    db = SessionLocal()
+    taxonomy = TaxonomyService(db)
+    editor = AdminEditorService(db)
+    original_state = _clone_state(taxonomy.get_state())
+    suffix = uuid4().hex[:8]
+    rebuild_calls: list[str] = []
+    enqueue_calls: list[list[int]] = []
+    try:
+        taxonomy.replace_state(
+            TaxonomyState(
+                filters=[
+                    TaxonomyFilterNode(
+                        slug=f"display-root-{suffix}",
+                        title=f"Display Root {suffix}",
+                        node_kind="multifilter",
+                        children=[
+                            TaxonomyFilterNode(
+                                slug=f"display-leaf-{suffix}",
+                                title=f"Display Leaf {suffix}",
+                                node_kind="filter",
+                                title_keywords=["display"],
+                            ),
+                        ],
+                    ),
+                ],
+                custom_catalogs=[],
+                showcase_categories=_blank_showcase_categories(original_state),
+            )
+        )
+        state = db.query(FilterAssignmentRuntimeState).filter(FilterAssignmentRuntimeState.id == 1).one()
+        state.target_revision = 1
+        state.applied_revision = 1
+        state.rebuild_requested_at = None
+        state.rebuild_started_at = None
+        state.rebuild_completed_at = None
+        state.last_error = None
+        db.commit()
+
+        monkeypatch.setattr(
+            ProductFilterAssignmentService,
+            "request_full_rebuild",
+            lambda self: rebuild_calls.append("full") or 2,
+        )
+        monkeypatch.setattr(
+            ProductFilterAssignmentService,
+            "enqueue_product_ids_after_commit",
+            lambda self, product_ids: enqueue_calls.append(sorted(int(product_id) for product_id in product_ids)),
+        )
+
+        editor_state = editor.list_taxonomy_editor_state()
+        root_node = next(item for item in editor_state["filters"] if str(item.get("slug") or "") == f"display-root-{suffix}")
+        leaf_node = next(item for item in root_node["children"] if str(item.get("slug") or "") == f"display-leaf-{suffix}")
+        leaf_node["display_label"] = "Показывать красиво"
+
+        editor.save_taxonomy_editor_state(editor_state)
+
+        assert rebuild_calls == []
+        assert enqueue_calls == []
+    finally:
+        taxonomy.replace_state(original_state)
         db.close()
 
 

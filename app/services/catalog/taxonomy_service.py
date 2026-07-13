@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass
+from typing import Literal
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -34,6 +36,12 @@ from app.schemas.taxonomy import (
     TaxonomyWriteState,
 )
 from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
+
+
+@dataclass(frozen=True, slots=True)
+class _FilterAssignmentUpdatePlan:
+    mode: Literal["none", "partial", "full"]
+    filter_slugs: tuple[str, ...] = ()
 
 
 class TaxonomyService:
@@ -522,8 +530,126 @@ class TaxonomyService:
 
         return filters_by_slug, catalogs_by_slug, mobile_group_code_by_slug
 
+    @staticmethod
+    def _leaf_rule_signatures_by_slug(state: TaxonomyState) -> dict[str, tuple]:
+        result: dict[str, tuple] = {}
+
+        def walk(nodes: list[TaxonomyFilterNode]) -> None:
+            for node in nodes:
+                slug = str(node.slug or "").strip()
+                if not slug:
+                    continue
+                if not node.children:
+                    result[slug] = (
+                        bool(node.is_enabled),
+                        bool(node.restrict_by_gender),
+                        tuple(sorted(TaxonomyService._clean_text_list(node.local_category_keywords))),
+                        tuple(sorted(TaxonomyService._clean_text_list(node.title_keywords))),
+                        tuple(sorted(TaxonomyService._clean_int_list(node.manual_product_ids))),
+                    )
+                    continue
+                walk(node.children)
+
+        walk(list(state.filters))
+        return result
+
+    @staticmethod
+    def _allowed_genders_by_leaf_slug(state: TaxonomyState) -> dict[str, tuple[str, ...]]:
+        roots_by_slug = {
+            str(node.slug or "").strip(): node
+            for node in state.filters
+            if str(node.slug or "").strip()
+        }
+
+        def collect_visible_leaf_slugs(
+            *,
+            node: TaxonomyFilterNode,
+            hidden_slugs: set[str],
+        ) -> list[str]:
+            slug = str(node.slug or "").strip()
+            if not slug or slug in hidden_slugs:
+                return []
+            if not node.children:
+                return [slug]
+            result: list[str] = []
+            for child in node.children:
+                result.extend(collect_visible_leaf_slugs(node=child, hidden_slugs=hidden_slugs))
+            return result
+
+        allowed_by_slug: dict[str, set[str]] = {}
+        for category in state.showcase_categories:
+            code = str(category.code or "").strip().lower()
+            if code == "men":
+                allowed_genders = {"male", "unisex"}
+            elif code == "women":
+                allowed_genders = {"female"}
+            else:
+                continue
+            for attachment in category.attachments:
+                if str(attachment.kind or "").strip() != "filter":
+                    continue
+                root_slug = str(attachment.filter_slug or "").strip()
+                root_node = roots_by_slug.get(root_slug)
+                if root_node is None:
+                    continue
+                hidden_slugs = set(TaxonomyService._clean_text_list(attachment.hidden_filter_slugs))
+                for leaf_slug in collect_visible_leaf_slugs(node=root_node, hidden_slugs=hidden_slugs):
+                    allowed_by_slug.setdefault(leaf_slug, set()).update(allowed_genders)
+        return {
+            slug: tuple(sorted(genders))
+            for slug, genders in allowed_by_slug.items()
+        }
+
+    @classmethod
+    def _build_filter_assignment_update_plan(
+        cls,
+        *,
+        current_state: TaxonomyState,
+        next_state: TaxonomyState,
+    ) -> _FilterAssignmentUpdatePlan:
+        current_leaf_rules = cls._leaf_rule_signatures_by_slug(current_state)
+        next_leaf_rules = cls._leaf_rule_signatures_by_slug(next_state)
+        if set(current_leaf_rules.keys()) != set(next_leaf_rules.keys()):
+            return _FilterAssignmentUpdatePlan(mode="full")
+        if cls._allowed_genders_by_leaf_slug(current_state) != cls._allowed_genders_by_leaf_slug(next_state):
+            return _FilterAssignmentUpdatePlan(mode="full")
+        changed_leaf_slugs = tuple(
+            sorted(
+                slug
+                for slug in next_leaf_rules
+                if current_leaf_rules.get(slug) != next_leaf_rules.get(slug)
+            )
+        )
+        if not changed_leaf_slugs:
+            return _FilterAssignmentUpdatePlan(mode="none")
+        return _FilterAssignmentUpdatePlan(mode="partial", filter_slugs=changed_leaf_slugs)
+
+    def _schedule_filter_assignment_update(self, plan: _FilterAssignmentUpdatePlan) -> None:
+        if plan.mode == "none":
+            return
+        assignments = ProductFilterAssignmentService(self.db)
+        runtime_state = assignments.get_runtime_state()
+        target_revision = int(runtime_state.target_revision or 0)
+        applied_revision = int(runtime_state.applied_revision or 0)
+        if runtime_state.rebuild_started_at is not None:
+            assignments.request_full_rebuild()
+            return
+        if target_revision > applied_revision:
+            return
+        if plan.mode == "full" or applied_revision <= 0:
+            assignments.request_full_rebuild()
+            return
+        candidate_product_ids = assignments.list_candidate_product_ids_for_filter_slugs(set(plan.filter_slugs))
+        if candidate_product_ids:
+            assignments.enqueue_product_ids_after_commit(candidate_product_ids)
+
     def replace_state(self, payload: TaxonomyState) -> TaxonomyState:
+        current_state = self.get_state()
         prepared = self._prepare_payload(payload)
+        filter_assignment_update_plan = self._build_filter_assignment_update_plan(
+            current_state=current_state,
+            next_state=prepared,
+        )
         filters_by_slug, catalogs_by_slug, mobile_group_code_by_slug = self._validate_state(prepared)
         try:
             current_default_weight_rule_id_by_slug = {
@@ -630,7 +756,7 @@ class TaxonomyService:
                         for hidden_slug in self._clean_text_list(attachment.hidden_filter_slugs)
                     )
 
-            ProductFilterAssignmentService(self.db).request_full_rebuild()
+            self._schedule_filter_assignment_update(filter_assignment_update_plan)
             self.db.commit()
         except HTTPException:
             self.db.rollback()
