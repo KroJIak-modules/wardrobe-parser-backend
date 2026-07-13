@@ -99,6 +99,7 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
                 "mobile_pair_slug": None,
                 "node_kind": "multifilter",
                 "is_enabled": True,
+                "restrict_by_gender": True,
                 "local_category_keywords": [],
                 "title_keywords": [],
                 "children": [
@@ -110,6 +111,7 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
                         "default_weight_grams": default_weight_grams,
                         "node_kind": "filter",
                         "is_enabled": True,
+                        "restrict_by_gender": False,
                         "local_category_keywords": ["child"],
                         "title_keywords": ["child"],
                         "children": [],
@@ -197,6 +199,7 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
 
         exported_filter = exported.taxonomy.filters[0].children[0]
         assert exported_filter.default_weight_grams == default_weight_grams
+        assert exported_filter.restrict_by_gender is False
 
         assert exported.showcase_media.desktop_hero_asset_checksum == hero_entry["checksum_sha256"]
         assert exported.showcase_media.mobile_hero_asset_checksum is None

@@ -346,6 +346,82 @@ def test_gender_scoped_filters_prevent_cross_gender_leaf_assignment() -> None:
         db.close()
 
 
+def test_filter_with_gender_restriction_disabled_can_match_outside_showcase_gender_scope() -> None:
+    db = SessionLocal()
+    source_key = f"gender-override-{uuid4().hex[:12]}.example"
+    restricted_slug = f"restricted-dresses-{uuid4().hex[:8]}"
+    unrestricted_slug = f"unrestricted-dresses-{uuid4().hex[:8]}"
+    try:
+        source = _create_source(db, source_key)
+        title_keyword = f"voiddress-{uuid4().hex[:8]}"
+        product = _ingest_product(
+            db,
+            source_id=int(source.id),
+            source_key=source_key,
+            handle="gender-override-dress",
+            title=f"Signal {title_keyword}",
+            category="misc",
+            tags=[],
+        )
+
+        women_root = Filter(title="Женское", slug=f"women-root-{uuid4().hex[:8]}", node_kind="multifilter", is_enabled=True)
+        restricted_filter = Filter(
+            title="Платья restricted",
+            slug=restricted_slug,
+            node_kind="filter",
+            is_enabled=True,
+            restrict_by_gender=True,
+        )
+        unrestricted_filter = Filter(
+            title="Платья unrestricted",
+            slug=unrestricted_slug,
+            node_kind="filter",
+            is_enabled=True,
+            restrict_by_gender=False,
+        )
+        db.add_all([women_root, restricted_filter, unrestricted_filter])
+        db.flush()
+        db.add_all(
+            [
+                FilterTitleKeyword(filter_id=int(restricted_filter.id), keyword=title_keyword),
+                FilterTitleKeyword(filter_id=int(unrestricted_filter.id), keyword=title_keyword),
+            ]
+        )
+        db.flush()
+
+        from app.models import FilterNode, ShowcaseCategory, ShowcaseCategoryAttachment  # local import for test only
+
+        women_root_node = FilterNode(filter_id=int(women_root.id), parent_node_id=None, position=1)
+        db.add(women_root_node)
+        db.flush()
+        db.add_all(
+            [
+                FilterNode(filter_id=int(restricted_filter.id), parent_node_id=int(women_root_node.id), position=1),
+                FilterNode(filter_id=int(unrestricted_filter.id), parent_node_id=int(women_root_node.id), position=2),
+            ]
+        )
+        db.flush()
+
+        women_category = db.query(ShowcaseCategory).filter(ShowcaseCategory.code == "women").one()
+        db.add(
+            ShowcaseCategoryAttachment(
+                showcase_category_id=int(women_category.id),
+                attachment_kind="filter",
+                filter_id=int(women_root.id),
+                position=1000,
+            )
+        )
+        db.flush()
+
+        _refresh_filter_assignments(db, [int(product.id)])
+
+        service = ProductQueryService(db)
+        assert service._matched_filter_slugs(product) == [unrestricted_slug]
+    finally:
+        db.rollback()
+        db.close()
+
+
 def test_title_keywords_outrank_generic_local_category_match() -> None:
     db = SessionLocal()
     source_key = f"title-priority-{uuid4().hex[:12]}.example"

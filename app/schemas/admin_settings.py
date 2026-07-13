@@ -279,6 +279,7 @@ class SettingsTransferTaxonomyFilterNode(BaseModel):
     default_weight_grams: int | None = Field(default=None, ge=1, le=1000000)
     node_kind: Literal["filter", "multifilter"] = "filter"
     is_enabled: bool = True
+    restrict_by_gender: bool = True
     local_category_keywords: list[str] = Field(default_factory=list)
     title_keywords: list[str] = Field(default_factory=list)
     children: list["SettingsTransferTaxonomyFilterNode"] = Field(default_factory=list)

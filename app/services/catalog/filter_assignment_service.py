@@ -25,6 +25,7 @@ class _FilterSpec:
     local_keywords: list[str]
     title_keywords: list[str]
     manual_product_ids: set[int]
+    restrict_by_gender: bool
     allowed_genders: set[str] | None
 
 
@@ -221,6 +222,7 @@ class ProductFilterAssignmentService:
                         if normalized
                     ],
                     manual_product_ids={int(link.product_id) for link in entity.manual_products},
+                    restrict_by_gender=bool(getattr(entity, "restrict_by_gender", True)),
                     allowed_genders=(
                         set(allowed_genders_by_slug.get(slug, set()))
                         if slug in allowed_genders_by_slug
@@ -236,7 +238,7 @@ class ProductFilterAssignmentService:
         best: _AssignmentResult | None = None
         best_filter_id = 0
         for spec in filter_specs:
-            if spec.allowed_genders is not None and product_gender not in spec.allowed_genders:
+            if spec.restrict_by_gender and spec.allowed_genders is not None and product_gender not in spec.allowed_genders:
                 continue
             manual_rank = 1 if int(product.id) in spec.manual_product_ids else 0
             matched_local_keywords = [

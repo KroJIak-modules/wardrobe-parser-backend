@@ -15,6 +15,7 @@ class TaxonomyFilterNode(BaseModel):
     default_weight_rule_id: int | None = Field(default=None, ge=1)
     node_kind: Literal["filter", "multifilter"] = "filter"
     is_enabled: bool = True
+    restrict_by_gender: bool = True
     local_category_keywords: list[str] = Field(default_factory=list)
     title_keywords: list[str] = Field(default_factory=list)
     manual_product_ids: list[int] = Field(default_factory=list)
@@ -57,6 +58,7 @@ class TaxonomyFilterWriteNode(BaseModel):
     default_weight_rule_id: int | None = Field(default=None, ge=1)
     node_kind: Literal["filter", "multifilter"] = "filter"
     is_enabled: bool = True
+    restrict_by_gender: bool = True
     local_category_keywords: list[str] = Field(default_factory=list)
     title_keywords: list[str] = Field(default_factory=list)
     manual_product_ids: list[int] = Field(default_factory=list)

@@ -29,6 +29,7 @@ class Filter(Base):
     mobile_menu_group_code = Column(String(64), nullable=True)
     default_weight_rule_id = Column(BigInteger, ForeignKey("weight_rules.id", ondelete="SET NULL"), nullable=True, index=True)
     is_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    restrict_by_gender = Column(Boolean, nullable=False, default=True, server_default="true")
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 

@@ -255,6 +255,51 @@ def test_admin_editor_preserves_display_label_for_multifilter() -> None:
         db.close()
 
 
+def test_admin_editor_roundtrips_filter_gender_restriction_flag() -> None:
+    db = SessionLocal()
+    taxonomy = TaxonomyService(db)
+    editor = AdminEditorService(db)
+    original_state = _clone_state(taxonomy.get_state())
+    suffix = uuid4().hex[:8]
+    try:
+        taxonomy.replace_state(
+            TaxonomyState(
+                filters=[
+                    TaxonomyFilterNode(
+                        slug=f"gender-flag-root-{suffix}",
+                        title=f"Gender Flag Root {suffix}",
+                        node_kind="multifilter",
+                        children=[
+                            TaxonomyFilterNode(
+                                slug=f"gender-flag-leaf-{suffix}",
+                                title=f"Gender Flag Leaf {suffix}",
+                                node_kind="filter",
+                                restrict_by_gender=False,
+                            ),
+                        ],
+                    ),
+                ],
+                custom_catalogs=[],
+                showcase_categories=_blank_showcase_categories(original_state),
+            )
+        )
+
+        editor_state = editor.list_taxonomy_editor_state()
+        root_node = next(item for item in editor_state["filters"] if str(item.get("slug") or "") == f"gender-flag-root-{suffix}")
+        leaf_node = next(item for item in root_node["children"] if str(item.get("slug") or "") == f"gender-flag-leaf-{suffix}")
+        assert bool(leaf_node.get("restrict_by_gender")) is False
+        leaf_node["restrict_by_gender"] = True
+
+        saved_state = editor.save_taxonomy_editor_state(editor_state)
+        saved_root = next(item for item in saved_state["filters"] if str(item.get("slug") or "") == f"gender-flag-root-{suffix}")
+        saved_leaf = next(item for item in saved_root["children"] if str(item.get("slug") or "") == f"gender-flag-leaf-{suffix}")
+
+        assert bool(saved_leaf.get("restrict_by_gender")) is True
+    finally:
+        taxonomy.replace_state(original_state)
+        db.close()
+
+
 def test_taxonomy_service_strips_match_rules_from_multifilters() -> None:
     db = SessionLocal()
     taxonomy = TaxonomyService(db)

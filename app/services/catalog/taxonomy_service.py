@@ -154,6 +154,7 @@ class TaxonomyService:
                 default_weight_rule_id=(int(entity.default_weight_rule_id) if entity.default_weight_rule_id is not None else None),
                 node_kind=str(entity.node_kind),
                 is_enabled=bool(entity.is_enabled),
+                restrict_by_gender=bool(getattr(entity, "restrict_by_gender", True)),
                 local_category_keywords=[str(item.keyword) for item in sorted(entity.local_category_keywords, key=lambda value: int(value.id))],
                 title_keywords=[str(item.keyword) for item in sorted(entity.title_keywords, key=lambda value: int(value.id))],
                 manual_product_ids=[int(item.product_id) for item in sorted(entity.manual_products, key=lambda value: int(value.product_id))],
@@ -256,6 +257,7 @@ class TaxonomyService:
                         default_weight_rule_id=(int(node.default_weight_rule_id) if node.default_weight_rule_id is not None else None),
                         node_kind="multifilter" if is_multifilter else "filter",
                         is_enabled=node.is_enabled,
+                        restrict_by_gender=node.restrict_by_gender,
                         local_category_keywords=[] if is_multifilter else node.local_category_keywords,
                         title_keywords=[] if is_multifilter else node.title_keywords,
                         manual_product_ids=[] if is_multifilter else node.manual_product_ids,
@@ -281,6 +283,7 @@ class TaxonomyService:
                     default_weight_rule_id=(int(node.default_weight_rule_id) if node.default_weight_rule_id is not None else None),
                     node_kind=node.node_kind,
                     is_enabled=node.is_enabled,
+                    restrict_by_gender=node.restrict_by_gender,
                     local_category_keywords=node.local_category_keywords,
                     title_keywords=node.title_keywords,
                     manual_product_ids=node.manual_product_ids,
@@ -346,6 +349,7 @@ class TaxonomyService:
                     default_weight_rule_id=(int(node.default_weight_rule_id) if node.default_weight_rule_id is not None else None),
                     node_kind=node.node_kind,
                     is_enabled=node.is_enabled,
+                    restrict_by_gender=node.restrict_by_gender,
                     local_category_keywords=node.local_category_keywords,
                     title_keywords=node.title_keywords,
                     manual_product_ids=node.manual_product_ids,
@@ -547,6 +551,7 @@ class TaxonomyService:
                             else current_default_weight_rule_id_by_slug.get(str(node.slug).strip())
                         ),
                         is_enabled=bool(node.is_enabled),
+                        restrict_by_gender=bool(node.restrict_by_gender),
                     )
                     self.repo.add(entity)
                     self.repo.flush()

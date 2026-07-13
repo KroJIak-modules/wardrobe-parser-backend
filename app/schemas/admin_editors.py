@@ -28,6 +28,7 @@ class AdminEditorFilterNode(BaseModel):
     mobile_pair_root_id: int | None = Field(default=None, ge=0)
     node_kind: Literal["filter", "multifilter"] = "filter"
     is_enabled: bool = True
+    restrict_by_gender: bool = True
     rules: AdminEditorRuleSet
     children: list["AdminEditorFilterNode"] = Field(default_factory=list)
 

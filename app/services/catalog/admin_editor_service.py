@@ -463,6 +463,7 @@ class AdminEditorService:
                         ),
                         "node_kind": str(node.node_kind),
                         "is_enabled": bool(node.is_enabled),
+                        "restrict_by_gender": bool(node.restrict_by_gender),
                         "product_count": int(product_counts_by_slug.get(slug, 0)),
                         "rules": {
                             "local_category_keywords": [str(item) for item in node.local_category_keywords],
@@ -672,6 +673,7 @@ class AdminEditorService:
                     )
                 ),
                 "is_enabled": bool(node.get("is_enabled", True)),
+                "restrict_by_gender": bool(node.get("restrict_by_gender", True)),
                 "local_category_keywords": [self._normalize_text(item) for item in local_keywords if self._normalize_text(item)],
                 "title_keywords": [self._normalize_text(item) for item in title_keywords if self._normalize_text(item)],
                 "manual_product_ids": [int(item.get("product_id")) for item in manual_products if int(item.get("product_id") or 0) > 0],
