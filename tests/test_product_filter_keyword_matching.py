@@ -457,6 +457,47 @@ def test_title_keywords_outrank_generic_local_category_match() -> None:
         db.close()
 
 
+def test_title_keyword_closest_to_end_wins_when_scores_are_equal() -> None:
+    db = SessionLocal()
+    source_key = f"title-tail-priority-{uuid4().hex[:12]}.example"
+    belt_slug = f"belt-{uuid4().hex[:8]}"
+    denim_slug = f"denim-{uuid4().hex[:8]}"
+    dress_slug = f"dress-{uuid4().hex[:8]}"
+    try:
+        source = _create_source(db, source_key)
+        product = _ingest_product(
+            db,
+            source_id=int(source.id),
+            source_key=source_key,
+            handle="belt-denim-hood-dress",
+            title="BELT DENIM HOOD DRESS",
+            category="misc",
+            tags=[],
+        )
+
+        belt_filter = Filter(title="Ремни", slug=belt_slug, node_kind="filter", is_enabled=True)
+        denim_filter = Filter(title="Деним", slug=denim_slug, node_kind="filter", is_enabled=True)
+        dress_filter = Filter(title="Платья", slug=dress_slug, node_kind="filter", is_enabled=True)
+        db.add_all([belt_filter, denim_filter, dress_filter])
+        db.flush()
+        db.add_all(
+            [
+                FilterTitleKeyword(filter_id=int(belt_filter.id), keyword="belt"),
+                FilterTitleKeyword(filter_id=int(denim_filter.id), keyword="denim"),
+                FilterTitleKeyword(filter_id=int(dress_filter.id), keyword="dress"),
+            ]
+        )
+        db.flush()
+
+        _refresh_filter_assignments(db, [int(product.id)])
+
+        service = ProductQueryService(db)
+        assert service._matched_filter_slugs(product) == [dress_slug]
+    finally:
+        db.rollback()
+        db.close()
+
+
 def test_rebuild_pending_revision_skips_when_another_rebuild_is_already_marked_running() -> None:
     db = SessionLocal()
     try:

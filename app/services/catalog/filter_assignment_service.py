@@ -11,7 +11,7 @@ from app.repositories.catalog_filter_assignments import CatalogFilterAssignmentR
 from app.repositories.catalog_products import CatalogProductRepository
 from app.repositories.catalog_taxonomy import CatalogTaxonomyRepository
 from app.services.catalog.filter_assignment_queue import ProductFilterAssignmentQueue
-from app.services.settings.weight_rule_matcher import keyword_matches, normalize_haystack, normalize_keyword
+from app.services.settings.weight_rule_matcher import keyword_matches, keyword_pattern, normalize_haystack, normalize_keyword
 
 
 LOGGER = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ class _AssignmentResult:
     filter_label: str
     manual_rank: int
     match_score: int
+    title_tail_distance: int | None
     matched_local_keywords: list[str]
     matched_title_keywords: list[str]
 
@@ -114,6 +115,34 @@ class ProductFilterAssignmentService:
             for text in texts
             if str(text or "").strip()
         )
+
+    @staticmethod
+    def _keyword_tail_distance(*, keyword: str, texts: list[str]) -> int | None:
+        normalized_keyword = normalize_keyword(str(keyword or "").strip())
+        if not normalized_keyword:
+            return None
+        pattern = keyword_pattern(normalized_keyword)
+        best_distance: int | None = None
+        for text in texts:
+            normalized_text = str(text or "").strip()
+            if not normalized_text:
+                continue
+            for match in pattern.finditer(normalized_text):
+                distance = len(normalized_text) - int(match.end())
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+        return best_distance
+
+    @classmethod
+    def _best_title_tail_distance(cls, *, matched_keywords: list[str], texts: list[str]) -> int | None:
+        best_distance: int | None = None
+        for keyword in matched_keywords:
+            distance = cls._keyword_tail_distance(keyword=keyword, texts=texts)
+            if distance is None:
+                continue
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+        return best_distance
 
     @staticmethod
     def _normalized_product_gender(product: Product) -> str:
@@ -257,12 +286,17 @@ class ProductFilterAssignmentService:
             )
             if manual_rank == 0 and match_score == 0:
                 continue
+            title_tail_distance = self._best_title_tail_distance(
+                matched_keywords=matched_title_keywords,
+                texts=title_texts,
+            )
             candidate = _AssignmentResult(
                 product_id=int(product.id),
                 filter_slug=spec.slug,
                 filter_label=spec.label,
                 manual_rank=manual_rank,
                 match_score=match_score,
+                title_tail_distance=title_tail_distance,
                 matched_local_keywords=matched_local_keywords,
                 matched_title_keywords=matched_title_keywords,
             )
@@ -275,6 +309,16 @@ class ProductFilterAssignmentService:
                 best_filter_id = int(spec.id)
                 continue
             if manual_rank == best.manual_rank and match_score > best.match_score:
+                best = candidate
+                best_filter_id = int(spec.id)
+                continue
+            if (
+                manual_rank == best.manual_rank
+                and match_score == best.match_score
+                and candidate.title_tail_distance is not None
+                and best.title_tail_distance is not None
+                and candidate.title_tail_distance < best.title_tail_distance
+            ):
                 best = candidate
                 best_filter_id = int(spec.id)
                 continue
