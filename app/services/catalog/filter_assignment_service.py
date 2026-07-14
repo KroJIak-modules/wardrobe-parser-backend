@@ -58,9 +58,19 @@ class ProductFilterAssignmentService:
         return datetime.now(timezone.utc)
 
     @staticmethod
+    def _progress_percent(*, processed: int, total: int) -> int:
+        normalized_total = max(0, int(total))
+        normalized_processed = max(0, int(processed))
+        if normalized_total <= 0:
+            return 0
+        return max(0, min(100, (normalized_processed * 100) // normalized_total))
+
+    @staticmethod
     def _serialize_rebuild_state(state: FilterAssignmentRuntimeState | None) -> dict:
         target_revision = int(getattr(state, "target_revision", 0) or 0)
         applied_revision = int(getattr(state, "applied_revision", 0) or 0)
+        rebuild_total_products = int(getattr(state, "rebuild_total_products", 0) or 0)
+        rebuild_processed_products = int(getattr(state, "rebuild_processed_products", 0) or 0)
         rebuild_started_at = getattr(state, "rebuild_started_at", None)
         status: Literal["idle", "queued", "running"] = "idle"
         if rebuild_started_at is not None:
@@ -71,6 +81,12 @@ class ProductFilterAssignmentService:
             "state": status,
             "target_revision": target_revision,
             "applied_revision": applied_revision,
+            "rebuild_total_products": rebuild_total_products,
+            "rebuild_processed_products": rebuild_processed_products,
+            "progress_percent": ProductFilterAssignmentService._progress_percent(
+                processed=rebuild_processed_products,
+                total=rebuild_total_products,
+            ),
             "rebuild_requested_at": getattr(state, "rebuild_requested_at", None),
             "rebuild_started_at": rebuild_started_at,
             "rebuild_completed_at": getattr(state, "rebuild_completed_at", None),
@@ -86,6 +102,11 @@ class ProductFilterAssignmentService:
 
     def request_full_rebuild(self) -> int:
         state = self.assignments.get_or_create_runtime_state(for_update=True)
+        target_revision = int(state.target_revision or 0)
+        applied_revision = int(state.applied_revision or 0)
+        if state.rebuild_started_at is None and target_revision <= applied_revision:
+            state.rebuild_total_products = self.products.count_active_products()
+            state.rebuild_processed_products = 0
         next_revision = max(int(state.target_revision or 0), int(state.applied_revision or 0)) + 1
         state.target_revision = next_revision
         state.rebuild_requested_at = self._utcnow()
@@ -456,9 +477,16 @@ class ProductFilterAssignmentService:
             self.assignments.delete_revision(target_revision)
             self.db.commit()
 
+            state = self.assignments.get_or_create_runtime_state(for_update=True)
+            if int(state.rebuild_total_products or 0) <= 0:
+                state.rebuild_total_products = self.products.count_active_products()
+            state.rebuild_processed_products = 0
+            self.db.commit()
+
             filter_specs = self._enabled_filter_specs()
             last_product_id = 0
             safe_batch_size = max(1, int(batch_size))
+            processed_products = 0
             while True:
                 product_ids = self.products.list_active_product_ids_after(
                     last_product_id=last_product_id,
@@ -471,6 +499,12 @@ class ProductFilterAssignmentService:
                     product_ids=product_ids,
                     filter_specs=filter_specs,
                 )
+                processed_products += len(product_ids)
+                state = self.assignments.get_or_create_runtime_state(for_update=True)
+                state.rebuild_processed_products = min(
+                    max(0, int(state.rebuild_total_products or 0)),
+                    processed_products,
+                )
                 self.db.commit()
                 last_product_id = int(product_ids[-1])
 
@@ -478,9 +512,15 @@ class ProductFilterAssignmentService:
             if int(state.target_revision or 0) != target_revision:
                 self.assignments.delete_revision(target_revision)
                 state.rebuild_started_at = None
+                state.rebuild_total_products = self.products.count_active_products()
+                state.rebuild_processed_products = 0
                 self.db.commit()
                 return 0
             state.applied_revision = target_revision
+            state.rebuild_processed_products = max(
+                0,
+                int(state.rebuild_total_products or 0),
+            )
             state.rebuild_completed_at = self._utcnow()
             state.rebuild_started_at = None
             state.last_error = None
@@ -495,6 +535,7 @@ class ProductFilterAssignmentService:
             self.db.rollback()
             state = self.assignments.get_or_create_runtime_state(for_update=True)
             state.rebuild_started_at = None
+            state.rebuild_processed_products = 0
             state.last_error = str(exc)[:2048]
             self.db.commit()
             raise

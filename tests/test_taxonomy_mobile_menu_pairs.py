@@ -307,6 +307,8 @@ def test_admin_editor_exposes_filter_assignment_rebuild_status() -> None:
     editor = AdminEditorService(db)
     previous_target = 0
     previous_applied = 0
+    previous_total = 0
+    previous_processed = 0
     previous_started_at = None
     previous_requested_at = None
     previous_completed_at = None
@@ -318,12 +320,16 @@ def test_admin_editor_exposes_filter_assignment_rebuild_status() -> None:
             db.add(state)
         previous_target = int(state.target_revision or 0)
         previous_applied = int(state.applied_revision or 0)
+        previous_total = int(state.rebuild_total_products or 0)
+        previous_processed = int(state.rebuild_processed_products or 0)
         previous_started_at = state.rebuild_started_at
         previous_requested_at = state.rebuild_requested_at
         previous_completed_at = state.rebuild_completed_at
         previous_last_error = state.last_error
         state.target_revision = 4
         state.applied_revision = 3
+        state.rebuild_total_products = 200
+        state.rebuild_processed_products = 80
         state.rebuild_requested_at = None
         state.rebuild_started_at = None
         state.rebuild_completed_at = None
@@ -335,11 +341,16 @@ def test_admin_editor_exposes_filter_assignment_rebuild_status() -> None:
         assert rebuild_status["state"] == "queued"
         assert int(rebuild_status["target_revision"]) == 4
         assert int(rebuild_status["applied_revision"]) == 3
+        assert int(rebuild_status["rebuild_total_products"]) == 200
+        assert int(rebuild_status["rebuild_processed_products"]) == 80
+        assert int(rebuild_status["progress_percent"]) == 40
     finally:
         state = db.query(FilterAssignmentRuntimeState).filter(FilterAssignmentRuntimeState.id == 1).one_or_none()
         if state is not None:
             state.target_revision = previous_target
             state.applied_revision = previous_applied
+            state.rebuild_total_products = previous_total
+            state.rebuild_processed_products = previous_processed
             state.rebuild_requested_at = previous_requested_at
             state.rebuild_started_at = previous_started_at
             state.rebuild_completed_at = previous_completed_at
@@ -353,6 +364,8 @@ def test_admin_editor_requests_filter_assignment_rebuild_only_once_while_pending
     editor = AdminEditorService(db)
     previous_target = 0
     previous_applied = 0
+    previous_total = 0
+    previous_processed = 0
     previous_started_at = None
     previous_requested_at = None
     previous_completed_at = None
@@ -365,12 +378,16 @@ def test_admin_editor_requests_filter_assignment_rebuild_only_once_while_pending
             db.flush()
         previous_target = int(state.target_revision or 0)
         previous_applied = int(state.applied_revision or 0)
+        previous_total = int(state.rebuild_total_products or 0)
+        previous_processed = int(state.rebuild_processed_products or 0)
         previous_started_at = state.rebuild_started_at
         previous_requested_at = state.rebuild_requested_at
         previous_completed_at = state.rebuild_completed_at
         previous_last_error = state.last_error
         state.target_revision = max(previous_target, previous_applied)
         state.applied_revision = max(previous_target, previous_applied)
+        state.rebuild_total_products = 0
+        state.rebuild_processed_products = 0
         state.rebuild_requested_at = None
         state.rebuild_started_at = None
         state.rebuild_completed_at = None
@@ -381,6 +398,8 @@ def test_admin_editor_requests_filter_assignment_rebuild_only_once_while_pending
         db.commit()
         assert started_first is True
         assert status_first["state"] == "queued"
+        assert int(status_first["rebuild_processed_products"]) == 0
+        assert int(status_first["progress_percent"]) == 0
 
         started_second, status_second = editor.request_filter_assignment_rebuild()
         db.commit()
@@ -392,6 +411,8 @@ def test_admin_editor_requests_filter_assignment_rebuild_only_once_while_pending
         if state is not None:
             state.target_revision = previous_target
             state.applied_revision = previous_applied
+            state.rebuild_total_products = previous_total
+            state.rebuild_processed_products = previous_processed
             state.rebuild_requested_at = previous_requested_at
             state.rebuild_started_at = previous_started_at
             state.rebuild_completed_at = previous_completed_at

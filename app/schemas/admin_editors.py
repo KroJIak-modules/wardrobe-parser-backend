@@ -102,6 +102,9 @@ class AdminFilterAssignmentRebuildStatus(BaseModel):
     state: Literal["idle", "queued", "running"] = "idle"
     target_revision: int = Field(default=0, ge=0)
     applied_revision: int = Field(default=0, ge=0)
+    rebuild_total_products: int = Field(default=0, ge=0)
+    rebuild_processed_products: int = Field(default=0, ge=0)
+    progress_percent: int = Field(default=0, ge=0, le=100)
     rebuild_requested_at: datetime | None = None
     rebuild_started_at: datetime | None = None
     rebuild_completed_at: datetime | None = None

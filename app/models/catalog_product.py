@@ -264,6 +264,8 @@ class FilterAssignmentRuntimeState(Base):
     id = Column(Integer, primary_key=True)
     target_revision = Column(BigInteger, nullable=False, default=0, server_default="0")
     applied_revision = Column(BigInteger, nullable=False, default=0, server_default="0")
+    rebuild_total_products = Column(BigInteger, nullable=False, default=0, server_default="0")
+    rebuild_processed_products = Column(BigInteger, nullable=False, default=0, server_default="0")
     rebuild_requested_at = Column(DateTime(timezone=True), nullable=True)
     rebuild_started_at = Column(DateTime(timezone=True), nullable=True)
     rebuild_completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -274,4 +276,6 @@ class FilterAssignmentRuntimeState(Base):
     __table_args__ = (
         CheckConstraint("target_revision >= 0", name="ck_filter_assignment_runtime_state_target_non_negative"),
         CheckConstraint("applied_revision >= 0", name="ck_filter_assignment_runtime_state_applied_non_negative"),
+        CheckConstraint("rebuild_total_products >= 0", name="ck_filter_assignment_runtime_state_total_non_negative"),
+        CheckConstraint("rebuild_processed_products >= 0", name="ck_filter_assignment_runtime_state_processed_non_negative"),
     )

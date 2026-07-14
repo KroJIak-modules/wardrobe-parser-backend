@@ -517,3 +517,50 @@ def test_rebuild_pending_revision_skips_when_another_rebuild_is_already_marked_r
     finally:
         db.rollback()
         db.close()
+
+
+def test_rebuild_pending_revision_tracks_real_progress(monkeypatch) -> None:
+    db = SessionLocal()
+    try:
+        service = ProductFilterAssignmentService(db)
+        state = service.assignments.get_or_create_runtime_state()
+        state.target_revision = 1
+        state.applied_revision = 0
+        state.rebuild_total_products = 3
+        state.rebuild_processed_products = 0
+        state.rebuild_started_at = None
+        state.rebuild_requested_at = datetime.now(timezone.utc)
+        state.rebuild_completed_at = None
+        state.last_error = None
+        db.commit()
+
+        def fake_list_active_product_ids_after(*, last_product_id: int, limit: int) -> list[int]:
+            if last_product_id <= 0:
+                return [101, 102]
+            if last_product_id == 102:
+                return [103]
+            return []
+
+        monkeypatch.setattr(service.products, "list_active_product_ids_after", fake_list_active_product_ids_after)
+        monkeypatch.setattr(service, "_enabled_filter_specs", lambda: [])
+        monkeypatch.setattr(
+            "app.services.settings.weight_rule_service.WeightRuleService.enqueue_all_active_products",
+            lambda self: 0,
+        )
+
+        assert service.rebuild_pending_revision(batch_size=2) == 1
+
+        refreshed = db.query(FilterAssignmentRuntimeState).filter(FilterAssignmentRuntimeState.id == 1).one()
+        assert int(refreshed.target_revision or 0) == 1
+        assert int(refreshed.applied_revision or 0) == 1
+        assert int(refreshed.rebuild_total_products or 0) == 3
+        assert int(refreshed.rebuild_processed_products or 0) == 3
+        assert refreshed.rebuild_started_at is None
+        assert refreshed.rebuild_completed_at is not None
+
+        status = service.get_rebuild_status()
+        assert status["state"] == "idle"
+        assert int(status["progress_percent"]) == 100
+    finally:
+        db.rollback()
+        db.close()
