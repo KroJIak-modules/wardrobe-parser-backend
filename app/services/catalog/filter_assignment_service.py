@@ -295,48 +295,6 @@ class ProductFilterAssignmentService:
             )
         return specs
 
-    def _filter_specs_for_candidate_scan(self, filter_slugs: set[str]) -> list[_FilterSpec]:
-        normalized_slugs = {
-            str(slug or "").strip()
-            for slug in filter_slugs
-            if str(slug or "").strip()
-        }
-        if not normalized_slugs:
-            return []
-        specs: list[_FilterSpec] = []
-        for entity in self.taxonomy.list_filters():
-            slug = str(entity.slug or "").strip()
-            if slug not in normalized_slugs:
-                continue
-            label = str(entity.display_title or entity.title or "").strip()
-            specs.append(
-                _FilterSpec(
-                    id=int(entity.id),
-                    slug=slug,
-                    label=label or slug,
-                    local_keywords=[
-                        normalized
-                        for normalized in (
-                            normalize_keyword(str(row.keyword or "").strip())
-                            for row in entity.local_category_keywords
-                        )
-                        if normalized
-                    ],
-                    title_keywords=[
-                        normalized
-                        for normalized in (
-                            normalize_keyword(str(row.keyword or "").strip())
-                            for row in entity.title_keywords
-                        )
-                        if normalized
-                    ],
-                    manual_product_ids={int(link.product_id) for link in entity.manual_products},
-                    restrict_by_gender=bool(getattr(entity, "restrict_by_gender", True)),
-                    allowed_genders=None,
-                )
-            )
-        return specs
-
     def _resolve_assignment(self, *, product: Product, filter_specs: list[_FilterSpec]) -> _AssignmentResult | None:
         title_texts, category_and_tag_texts = self._normalized_listing_texts(product)
         product_gender = self._normalized_product_gender(product)
@@ -403,22 +361,28 @@ class ProductFilterAssignmentService:
                 best_filter_id = int(spec.id)
         return best
 
-    def _replace_revision_assignments_for_product_ids(self, *, revision: int, product_ids: list[int]) -> int:
+    def _replace_revision_assignments_for_product_ids(
+        self,
+        *,
+        revision: int,
+        product_ids: list[int],
+        filter_specs: list[_FilterSpec] | None = None,
+    ) -> int:
         normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
         self.assignments.delete_revision_for_product_ids(revision=int(revision), product_ids=normalized_ids)
         if not normalized_ids:
             self.db.flush()
             return 0
 
-        filter_specs = self._enabled_filter_specs()
-        if not filter_specs:
+        resolved_filter_specs = filter_specs if filter_specs is not None else self._enabled_filter_specs()
+        if not resolved_filter_specs:
             self.db.flush()
             return 0
 
         products = self.products.list_products_for_filter_assignment_by_ids(normalized_ids)
         rows: list[dict] = []
         for product in products:
-            assignment = self._resolve_assignment(product=product, filter_specs=filter_specs)
+            assignment = self._resolve_assignment(product=product, filter_specs=resolved_filter_specs)
             if assignment is None:
                 continue
             rows.append(
@@ -438,60 +402,22 @@ class ProductFilterAssignmentService:
         self.db.flush()
         return len(rows)
 
-    def list_candidate_product_ids_for_filter_slugs(
-        self,
-        filter_slugs: set[str] | list[str] | tuple[str, ...],
-        *,
-        batch_size: int = 1000,
-    ) -> list[int]:
-        normalized_slugs = {
-            str(slug or "").strip()
-            for slug in filter_slugs
-            if str(slug or "").strip()
-        }
-        if not normalized_slugs:
-            return []
-
-        candidate_product_ids: set[int] = set()
-        state = self.assignments.get_runtime_state(for_update=False)
-        current_revision = int(getattr(state, "applied_revision", 0) or 0)
-        if current_revision > 0:
-            candidate_product_ids.update(
-                self.assignments.list_product_ids_by_filter_slugs(
-                    revision=current_revision,
-                    filter_slugs=sorted(normalized_slugs),
-                )
-            )
-
-        filter_specs = self._filter_specs_for_candidate_scan(normalized_slugs)
-        if not filter_specs:
-            return sorted(candidate_product_ids)
-
-        total_products = self.products.count_active_products()
+    def enqueue_all_active_product_ids_after_commit(self, *, batch_size: int = 5000) -> int:
+        collected_ids: list[int] = []
         safe_batch_size = max(1, int(batch_size))
-        offset = 0
-        while offset < total_products:
-            product_ids = self.products.list_active_product_ids_page(limit=safe_batch_size, offset=offset)
+        last_product_id = 0
+        while True:
+            product_ids = self.products.list_active_product_ids_after(
+                last_product_id=last_product_id,
+                limit=safe_batch_size,
+            )
             if not product_ids:
                 break
-            for product in self.products.list_products_for_filter_assignment_by_ids(product_ids):
-                title_texts, category_and_tag_texts = self._normalized_listing_texts(product)
-                if any(
-                    int(product.id) in spec.manual_product_ids
-                    or any(
-                        self._keyword_matches_any(keyword=keyword, texts=category_and_tag_texts)
-                        for keyword in spec.local_keywords
-                    )
-                    or any(
-                        self._keyword_matches_any(keyword=keyword, texts=title_texts)
-                        for keyword in spec.title_keywords
-                    )
-                    for spec in filter_specs
-                ):
-                    candidate_product_ids.add(int(product.id))
-            offset += len(product_ids)
-
-        return sorted(candidate_product_ids)
+            collected_ids.extend(product_ids)
+            last_product_id = int(product_ids[-1])
+        if collected_ids:
+            self.enqueue_product_ids_after_commit(collected_ids)
+        return len(collected_ids)
 
     def refresh_current_revision_product_ids(self, product_ids: set[int] | list[int] | tuple[int, ...]) -> int:
         normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
@@ -530,15 +456,23 @@ class ProductFilterAssignmentService:
             self.assignments.delete_revision(target_revision)
             self.db.commit()
 
-            total_products = self.products.count_active_products()
-            offset = 0
-            while offset < total_products:
-                product_ids = self.products.list_active_product_ids_page(limit=batch_size, offset=offset)
+            filter_specs = self._enabled_filter_specs()
+            last_product_id = 0
+            safe_batch_size = max(1, int(batch_size))
+            while True:
+                product_ids = self.products.list_active_product_ids_after(
+                    last_product_id=last_product_id,
+                    limit=safe_batch_size,
+                )
                 if not product_ids:
                     break
-                self._replace_revision_assignments_for_product_ids(revision=target_revision, product_ids=product_ids)
+                self._replace_revision_assignments_for_product_ids(
+                    revision=target_revision,
+                    product_ids=product_ids,
+                    filter_specs=filter_specs,
+                )
                 self.db.commit()
-                offset += len(product_ids)
+                last_product_id = int(product_ids[-1])
 
             state = self.assignments.get_or_create_runtime_state(for_update=True)
             if int(state.target_revision or 0) != target_revision:

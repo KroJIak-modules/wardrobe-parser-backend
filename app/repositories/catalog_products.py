@@ -338,6 +338,21 @@ class CatalogProductRepository:
             )
         ]
 
+    def list_active_product_ids_after(self, *, last_product_id: int, limit: int) -> list[int]:
+        normalized_last_id = max(0, int(last_product_id))
+        normalized_limit = max(1, int(limit))
+        return [
+            int(product_id)
+            for product_id, in (
+                self.session.query(Product.id)
+                .filter(Product.lifecycle_status == "active")
+                .filter(Product.id > normalized_last_id)
+                .order_by(Product.id.asc())
+                .limit(normalized_limit)
+                .all()
+            )
+        ]
+
     def count_active_products(self) -> int:
         return int(
             self.session.query(func.count(Product.id))

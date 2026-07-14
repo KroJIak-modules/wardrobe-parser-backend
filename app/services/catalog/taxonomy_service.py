@@ -639,9 +639,7 @@ class TaxonomyService:
         if plan.mode == "full" or applied_revision <= 0:
             assignments.request_full_rebuild()
             return
-        candidate_product_ids = assignments.list_candidate_product_ids_for_filter_slugs(set(plan.filter_slugs))
-        if candidate_product_ids:
-            assignments.enqueue_product_ids_after_commit(candidate_product_ids)
+        assignments.enqueue_all_active_product_ids_after_commit()
 
     def replace_state(self, payload: TaxonomyState) -> TaxonomyState:
         current_state = self.get_state()

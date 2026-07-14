@@ -407,7 +407,7 @@ def test_taxonomy_restrict_by_gender_toggle_uses_partial_refresh_instead_of_full
     original_state = _clone_state(taxonomy.get_state())
     suffix = uuid4().hex[:8]
     rebuild_calls: list[str] = []
-    enqueued_product_ids: list[int] = []
+    enqueue_all_calls: list[int] = []
     try:
         taxonomy.replace_state(
             TaxonomyState(
@@ -463,13 +463,8 @@ def test_taxonomy_restrict_by_gender_toggle_uses_partial_refresh_instead_of_full
         )
         monkeypatch.setattr(
             ProductFilterAssignmentService,
-            "list_candidate_product_ids_for_filter_slugs",
-            lambda self, filter_slugs, batch_size=1000: [101, 202] if filter_slugs else [],
-        )
-        monkeypatch.setattr(
-            ProductFilterAssignmentService,
-            "enqueue_product_ids_after_commit",
-            lambda self, product_ids: enqueued_product_ids.extend(sorted(int(product_id) for product_id in product_ids)),
+            "enqueue_all_active_product_ids_after_commit",
+            lambda self, batch_size=5000: enqueue_all_calls.append(int(batch_size)) or 2,
         )
 
         editor_state = editor.list_taxonomy_editor_state()
@@ -480,7 +475,7 @@ def test_taxonomy_restrict_by_gender_toggle_uses_partial_refresh_instead_of_full
         editor.save_taxonomy_editor_state(editor_state)
 
         assert rebuild_calls == []
-        assert enqueued_product_ids == [101, 202]
+        assert enqueue_all_calls == [5000]
     finally:
         taxonomy.replace_state(original_state)
         db.close()
