@@ -87,6 +87,8 @@ class SiteQueryService:
         normalized = str(value or "").strip().lower()
         if normalized == "male":
             return "men"
+        if normalized == "unisex":
+            return "men"
         if normalized == "female":
             return "women"
         return None
@@ -709,14 +711,7 @@ class SiteQueryService:
 
     @staticmethod
     def _site_catalog_brand_name(row) -> str:
-        brand_override_name = str(getattr(row, "brand_override_name", "") or "").strip()
-        if brand_override_name:
-            return brand_override_name
-        source_designer_raw = str(getattr(row, "source_designer_raw", "") or "").strip()
-        if source_designer_raw:
-            return source_designer_raw
-        designer_name = str(getattr(row, "designer_name", "") or "").strip()
-        return designer_name
+        return str(getattr(row, "designer_name", "") or "").strip()
 
     @classmethod
     def _site_catalog_title(cls, row) -> str:

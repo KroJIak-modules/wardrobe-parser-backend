@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from uuid import uuid4
 
 from app.core.database import SessionLocal
-from app.models import Designer, ImageAsset, Product
+from app.models import Designer, ImageAsset, Product, ProductListing
+from app.services.catalog.product_query_service import ProductQueryService
 from app.schemas.taxonomy import TaxonomyFilterNode, TaxonomyState
 from app.services.catalog.product_write_service import ProductWriteService
 from app.services.catalog.designer_support import slugify_designer_name
@@ -245,6 +247,37 @@ def test_site_catalog_products_use_lightweight_card_query() -> None:
         assert payload.items[0].status == "in_stock"
         assert payload.items[0].brand.name == f"Site public designer {marker}"
         assert str(payload.items[0].image_url or "").startswith("/api/v1/products/images/")
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_site_catalog_brand_never_uses_source_designer_name() -> None:
+    row = SimpleNamespace(
+        designer_name="Final Designer",
+        source_designer_raw="Source Designer",
+        brand_override_name="Manual Source Label",
+    )
+
+    assert SiteQueryService._site_catalog_brand_name(row) == "Final Designer"
+
+
+def test_public_product_payload_excludes_source_designer_name() -> None:
+    db = SessionLocal()
+    marker = uuid4().hex[:8]
+    try:
+        product_id = _create_manual_public_product(db, marker=marker, slug="designer-contract", price=12000)
+        product = db.query(Product).filter(Product.id == product_id).one()
+        listing = db.query(ProductListing).filter(ProductListing.id == product.primary_listing_id).one()
+        listing.source_designer_raw = "Unpublished Source Designer"
+        db.flush()
+
+        payload = ProductQueryService(db).build_public_product_payload(product)
+
+        assert payload["brand_name"] == f"Site public designer {marker}"
+        assert payload["display_designer_name"] == f"Site public designer {marker}"
+        assert "source_designer_name" not in payload
+        assert "Unpublished Source Designer" not in str(payload)
     finally:
         db.rollback()
         db.close()

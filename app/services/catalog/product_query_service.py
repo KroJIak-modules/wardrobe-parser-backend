@@ -632,11 +632,16 @@ class ProductQueryService:
         }
 
     @staticmethod
-    def _effective_title(product: Product, listing: ProductListing | None) -> str:
+    def _effective_title(
+        product: Product,
+        listing: ProductListing | None,
+        *,
+        designer_name: str | None = None,
+    ) -> str:
         if product.presentation is not None and product.presentation.title_override:
             return str(product.presentation.title_override)
         if listing is not None and listing.source_title:
-            source_brand = ProductQueryService._effective_brand_name(product, listing)
+            source_brand = designer_name if designer_name is not None else ProductQueryService._effective_brand_name(product, listing)
             return (
                 ProductTitleService.display_title(
                     source_title=str(listing.source_title),
@@ -1367,7 +1372,19 @@ class ProductQueryService:
 
     def build_public_product_payload(self, product: Product) -> dict:
         base_payload, _ = self._build_shared_payload(product)
-        return base_payload
+        # Public consumers receive only the resolved product designer. Parser
+        # metadata remains an admin concern and must not leak through this layer.
+        final_designer_name = str(getattr(product.designer, "name", "") or "").strip()
+        public_payload = dict(base_payload)
+        public_payload["brand_name"] = final_designer_name
+        public_payload["display_designer_name"] = final_designer_name
+        public_payload["title"] = self._effective_title(
+            product,
+            self._resolved_primary_listing(product),
+            designer_name=final_designer_name or None,
+        )
+        public_payload.pop("source_designer_name", None)
+        return public_payload
 
     def build_dedup_candidate_payload(self, product: Product) -> dict:
         primary_listing = self._resolved_primary_listing(product)

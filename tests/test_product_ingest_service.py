@@ -153,6 +153,106 @@ def test_product_ingest_service_persists_and_preserves_source_published_at() -> 
         db.close()
 
 
+def test_product_ingest_service_does_not_mark_unseen_listings_removed_without_complete_catalog() -> None:
+    db = SessionLocal()
+    source_key = f"ingest-{uuid4().hex[:12]}.example"
+    try:
+        source = Source(
+            key=source_key,
+            name=source_key,
+            base_url=f"https://{source_key}",
+            base_url_normalized=source_key,
+        )
+        db.add(source)
+        db.flush()
+        db.add(SourceSetting(source_id=int(source.id)))
+        db.flush()
+
+        service = ProductIngestService(db)
+        initial_items = [
+            {
+                "url": f"https://{source_key}/products/{handle}",
+                "handle": handle,
+                "title": handle,
+                "description": "",
+                "designer": "Test Designer",
+                "category": "Outerwear",
+                "gender": "unisex",
+                "source_weight_grams": 500,
+                "orderability_status": "orderable",
+                "variants": [{"title": "Default", "price": 100, "currency": "USD", "available": True}],
+                "images": [],
+            }
+            for handle in ("first", "second")
+        ]
+        service.apply_batch(source_id=int(source.id), items=initial_items, reconcile_missing=True)
+        db.flush()
+
+        service.apply_batch(source_id=int(source.id), items=[initial_items[0]], reconcile_missing=False)
+        db.flush()
+
+        unseen = (
+            db.query(ProductListing)
+            .filter(ProductListing.source_id == int(source.id), ProductListing.handle == "second")
+            .one()
+        )
+        assert unseen.orderability_status == "orderable"
+        assert unseen.status_reason is None
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_product_ingest_service_marks_unseen_listings_removed_after_complete_catalog() -> None:
+    db = SessionLocal()
+    source_key = f"ingest-{uuid4().hex[:12]}.example"
+    try:
+        source = Source(
+            key=source_key,
+            name=source_key,
+            base_url=f"https://{source_key}",
+            base_url_normalized=source_key,
+        )
+        db.add(source)
+        db.flush()
+        db.add(SourceSetting(source_id=int(source.id)))
+        db.flush()
+
+        service = ProductIngestService(db)
+        initial_items = [
+            {
+                "url": f"https://{source_key}/products/{handle}",
+                "handle": handle,
+                "title": handle,
+                "description": "",
+                "designer": "Test Designer",
+                "category": "Outerwear",
+                "gender": "unisex",
+                "source_weight_grams": 500,
+                "orderability_status": "orderable",
+                "variants": [{"title": "Default", "price": 100, "currency": "USD", "available": True}],
+                "images": [],
+            }
+            for handle in ("first", "second")
+        ]
+        service.apply_batch(source_id=int(source.id), items=initial_items, reconcile_missing=True)
+        db.flush()
+
+        service.apply_batch(source_id=int(source.id), items=[initial_items[0]], reconcile_missing=True)
+        db.flush()
+
+        unseen = (
+            db.query(ProductListing)
+            .filter(ProductListing.source_id == int(source.id), ProductListing.handle == "second")
+            .one()
+        )
+        assert unseen.orderability_status == "unavailable"
+        assert unseen.status_reason == "source_removed"
+    finally:
+        db.rollback()
+        db.close()
+
+
 def test_product_ingest_service_matches_weight_rule_from_handle() -> None:
     db = SessionLocal()
     source_key = f"ingest-{uuid4().hex[:12]}.example"

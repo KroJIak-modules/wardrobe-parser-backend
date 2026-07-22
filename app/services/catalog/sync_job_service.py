@@ -192,6 +192,7 @@ class SyncJobService:
         batch_key: str,
         source_key: str,
         stage: str,
+        reconcile_missing: bool,
         items: list[dict],
     ) -> None:
         source = CatalogSourceRepository(db).get_by_key(source_key)
@@ -212,7 +213,7 @@ class SyncJobService:
         applied = ProductIngestService(db).apply_batch(
             source_id=int(source.id),
             items=items,
-            reconcile_missing=(str(stage or "").strip().lower() != "failed"),
+            reconcile_missing=bool(reconcile_missing),
         )
         source_run.products_received = int(source_run.products_received or 0) + int(applied.listings_seen)
         source_run.products_applied = int(source_run.products_applied or 0) + int(applied.listings_applied)
@@ -330,6 +331,7 @@ class SyncJobService:
                     elif event_type == "product_batch" and source_key:
                         batch_key = str(payload.get("batch_id") or "").strip() or f"source:{source_key}:{next_cursor}"
                         stage = str(payload.get("stage") or "").strip().lower()
+                        reconcile_missing = bool(payload.get("reconcile_missing", False))
                         batch_items = payload.get("items") if isinstance(payload.get("items"), list) else []
                         cls._process_product_batch(
                             db,
@@ -337,6 +339,7 @@ class SyncJobService:
                             batch_key=batch_key,
                             source_key=source_key,
                             stage=stage,
+                            reconcile_missing=reconcile_missing,
                             items=[item for item in batch_items if isinstance(item, dict)],
                         )
                     elif event_type == "source_finished" and source_key:
