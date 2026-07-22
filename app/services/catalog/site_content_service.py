@@ -71,6 +71,24 @@ class SiteContentService:
             height_px=(int(asset.height_px) if asset.height_px is not None else None),
         )
 
+    @staticmethod
+    def admin_asset_payload(asset: ImageAsset) -> SiteMediaAssetResponse:
+        return SiteMediaAssetResponse(
+            id=int(asset.id),
+            url=f"/api/v1/admin/site-content/media/{int(asset.id)}/file",
+            media_kind=MediaAssetService.media_kind_for_asset(asset),  # type: ignore[arg-type]
+            mime_type=str(asset.mime_type or "").strip() or "application/octet-stream",
+            byte_size=int(asset.byte_size or 0),
+            width_px=(int(asset.width_px) if asset.width_px is not None else None),
+            height_px=(int(asset.height_px) if asset.height_px is not None else None),
+        )
+
+    def admin_media_asset(self, asset_id: int) -> ImageAsset:
+        asset = self.db.query(ImageAsset).filter(ImageAsset.id == int(asset_id)).one_or_none()
+        if not self.is_site_content_asset(asset):
+            raise NotFoundError("Медиафайл контента не найден")
+        return asset
+
     def get_admin_about(self) -> AdminSiteAboutResponse:
         about = self.ensure_about()
         rows = (
@@ -82,7 +100,7 @@ class SiteContentService:
         return AdminSiteAboutResponse(
             text=str(about.body_text or ""),
             photos=[
-                self.asset_payload(row.image_asset)
+                self.admin_asset_payload(row.image_asset)
                 for row in rows
                 if self.is_site_content_asset(getattr(row, "image_asset", None))
             ],
@@ -110,17 +128,27 @@ class SiteContentService:
         return self.get_admin_about()
 
     def get_public_about(self) -> SiteAboutResponse:
-        admin_state = self.get_admin_about()
+        about = self.ensure_about()
+        rows = (
+            self.db.query(SiteAboutPhoto)
+            .join(ImageAsset, ImageAsset.id == SiteAboutPhoto.image_asset_id)
+            .order_by(SiteAboutPhoto.position.asc(), SiteAboutPhoto.id.asc())
+            .all()
+        )
         return SiteAboutResponse(
-            text=admin_state.text,
-            photos=admin_state.photos,
+            text=str(about.body_text or ""),
+            photos=[
+                self.asset_payload(row.image_asset)
+                for row in rows
+                if self.is_site_content_asset(getattr(row, "image_asset", None))
+            ],
         )
 
     def upload_media(self, upload: UploadFile) -> AdminSiteContentMediaUploadResponse:
         asset = self.media_assets.save_upload(scope=self.ASSET_SCOPE, upload=upload)
         if MediaAssetService.media_kind_for_asset(asset) != "image":
             raise ValidationError("Для контента можно загружать только изображения.")
-        return AdminSiteContentMediaUploadResponse(ok=True, asset=self.asset_payload(asset))
+        return AdminSiteContentMediaUploadResponse(ok=True, asset=self.admin_asset_payload(asset))
 
     def _notification_response(self, entity: SiteNotificationSetting) -> AdminSiteNotificationResponse:
         image_asset = getattr(entity, "image_asset", None)
@@ -131,7 +159,7 @@ class SiteContentService:
             description=str(entity.description or ""),
             button_text=str(entity.button_text or ""),
             button_url=str(entity.button_url or ""),
-            image=self.asset_payload(image_asset) if self.is_site_content_asset(image_asset) else None,
+            image=self.admin_asset_payload(image_asset) if self.is_site_content_asset(image_asset) else None,
             created_at=entity.created_at.isoformat() if entity.created_at is not None else "",
             updated_at=entity.updated_at.isoformat() if entity.updated_at is not None else "",
         )

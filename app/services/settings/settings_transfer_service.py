@@ -462,6 +462,7 @@ class SettingsTransferService:
                     hide_auto_added_products=bool(getattr(setting, "hide_auto_added_products", False)),
                     description_mode=str(getattr(setting, "description_mode", "text") or "text"),
                     show_images=bool(getattr(setting, "show_images", True)),
+                    clean_public_titles=bool(getattr(setting, "clean_public_titles", False)),
                     supplier_key=(
                         str(supplier_by_id[int(setting.supplier_id)].key)
                         if getattr(setting, "supplier_id", None) is not None and int(setting.supplier_id) in supplier_by_id
@@ -687,6 +688,7 @@ class SettingsTransferService:
             setting.hide_auto_added_products = bool(source_defaults.hide_auto_added_products)
             setting.description_mode = str(source_defaults.description_mode)
             setting.show_images = bool(source_defaults.show_images)
+            setting.clean_public_titles = bool(source_defaults.clean_public_titles)
             setting.promo_factor = float(source_defaults.promo_factor)
             setting.promo_only_no_discount = bool(source_defaults.promo_only_no_discount)
             setting.buyout_surcharge_value = source_defaults.buyout_surcharge_value
@@ -1357,6 +1359,7 @@ class SettingsTransferService:
             setting.hide_auto_added_products = bool(item.hide_auto_added_products)
             setting.description_mode = str(item.description_mode)
             setting.show_images = bool(item.show_images)
+            setting.clean_public_titles = bool(item.clean_public_titles)
             setting.sort_priority = int(item.sort_priority)
             setting.supplier_id = supplier_id
             setting.promo_factor = float(item.promo_factor)

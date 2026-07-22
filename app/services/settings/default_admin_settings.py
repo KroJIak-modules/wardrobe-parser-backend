@@ -21,6 +21,7 @@ class DefaultSourceSettingSeed(BaseModel):
     hide_auto_added_products: bool = False
     description_mode: str = "text"
     show_images: bool = True
+    clean_public_titles: bool = True
     promo_factor: float = Field(default=1.0, ge=0.0, le=10.0)
     promo_only_no_discount: bool = False
     buyout_surcharge_value: float | None = Field(default=None, ge=0.0, le=100000000.0)

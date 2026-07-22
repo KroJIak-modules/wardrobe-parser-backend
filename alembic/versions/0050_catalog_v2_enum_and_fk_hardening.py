@@ -92,7 +92,7 @@ def upgrade() -> None:
         bind,
         "source_settings",
         "ck_source_settings_description_mode",
-        "description_mode IN ('hidden', 'text', 'html')",
+        "description_mode IN ('hidden', 'text')",
     )
     _create_check_if_missing(
         bind,

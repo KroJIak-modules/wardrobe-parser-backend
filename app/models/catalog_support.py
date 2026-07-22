@@ -97,6 +97,7 @@ class SourceSetting(Base):
     hide_auto_added_products = Column(Boolean, nullable=False, default=False, server_default="false")
     description_mode = Column(String(16), nullable=False, default="text", server_default="text")
     show_images = Column(Boolean, nullable=False, default=True, server_default="true")
+    clean_public_titles = Column(Boolean, nullable=False, default=True, server_default="true")
     promo_factor = Column(Numeric(10, 4), nullable=False, default=1, server_default="1")
     promo_only_no_discount = Column(Boolean, nullable=False, default=False, server_default="false")
     buyout_surcharge_value = Column(Numeric(12, 2), nullable=True)
@@ -107,7 +108,7 @@ class SourceSetting(Base):
     supplier = relationship("Supplier")
 
     __table_args__ = (
-        CheckConstraint("description_mode IN ('hidden', 'text', 'html')", name="ck_source_settings_description_mode"),
+        CheckConstraint("description_mode IN ('hidden', 'text')", name="ck_source_settings_description_mode"),
     )
 
 

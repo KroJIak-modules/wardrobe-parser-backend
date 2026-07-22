@@ -721,10 +721,11 @@ class SiteQueryService:
         source_title = str(getattr(row, "source_title", "") or "").strip()
         if source_title:
             return (
-                ProductTitleService.display_title(
+                ProductTitleService.public_title(
                     source_title=source_title,
                     source_designer_name=cls._site_catalog_brand_name(row),
                     source_category_name=str(getattr(row, "source_category_raw", "") or "").strip() or None,
+                    clean=bool(getattr(row, "clean_public_titles", False)),
                 )
                 or source_title
             )
@@ -807,16 +808,16 @@ class SiteQueryService:
             orderability_status=public_payload.get("orderability_status"),
         )
         description_content = str(public_payload.get("description") or "").strip()
-        description_mode = str(public_payload.get("description_mode") or "text").strip().lower()
+        description_mode = "hidden" if str(public_payload.get("description_mode") or "text").strip().lower() == "hidden" else "text"
         description = None
-        if description_content and description_mode in {"text", "html"}:
+        if description_content and description_mode == "text":
             description = SiteProductDescriptionResponse(
-                format=description_mode,  # type: ignore[arg-type]
+                format="text",
                 content=description_content,
             )
         variants: list[SiteProductVariantResponse] = []
         for variant in public_payload.get("variants") or []:
-            if not isinstance(variant, dict):
+            if not isinstance(variant, dict) or not bool(variant.get("available")):
                 continue
             source_id = int(variant.get("source_id")) if variant.get("source_id") is not None else 0
             listing = listing_by_id.get(int(variant.get("listing_id") or 0))

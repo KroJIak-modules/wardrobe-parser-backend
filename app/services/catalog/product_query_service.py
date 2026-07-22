@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from html import unescape
+from html.parser import HTMLParser
 from typing import Any
 
 from sqlalchemy import String, and_, case, cast, func, literal, not_, or_
@@ -33,6 +35,43 @@ from app.services.settings.pricing_service import PricingSettingsService
 
 UNMATCHED_FILTER_SLUG = "__none__"
 UNMATCHED_FILTER_LABEL = "Без фильтров"
+
+
+class _DescriptionTextExtractor(HTMLParser):
+    _BLOCK_TAGS = {"address", "article", "br", "div", "li", "p", "section", "tr"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in self._BLOCK_TAGS:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self._BLOCK_TAGS:
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self._parts.append(data)
+
+    def text(self) -> str:
+        return "\n".join(
+            " ".join(line.split())
+            for line in "".join(self._parts).splitlines()
+            if line.strip()
+        )
+
+
+def _html_to_text(value: str | None) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    parser = _DescriptionTextExtractor()
+    parser.feed(raw)
+    parser.close()
+    text = unescape(parser.text()).strip()
+    return text or None
 
 
 class ProductQueryService:
@@ -608,8 +647,9 @@ class ProductQueryService:
             if presentation is not None and presentation.description_html
             else (str(listing.source_description_html) if listing is not None and listing.source_description_html else None)
         )
-        description_mode = str(getattr(source_setting, "description_mode", "text") or "text")
-        description_mode = description_mode.strip().lower() or "text"
+        source_description_mode = str(getattr(source_setting, "description_mode", "text") or "text")
+        source_description_mode = source_description_mode.strip().lower() or "text"
+        description_mode = "hidden" if source_description_mode == "hidden" else "text"
         visibility_override = presentation.description_visibility if presentation is not None else None
 
         public_description: str | None = None
@@ -617,10 +657,7 @@ class ProductQueryService:
         if description_mode == "hidden":
             is_public_visible = False
         elif is_public_visible:
-            if description_mode == "html":
-                public_description = effective_html or effective_text
-            else:
-                public_description = effective_text or effective_html
+            public_description = effective_text or _html_to_text(effective_html)
 
         return {
             "description_mode": description_mode,
@@ -651,6 +688,11 @@ class ProductQueryService:
                 or str(listing.source_title)
             )
         return f"Product {int(product.id)}"
+
+    @staticmethod
+    def _uses_public_title_cleaning(listing: ProductListing | None) -> bool:
+        setting = getattr(getattr(listing, "source", None), "setting", None) if listing is not None else None
+        return bool(getattr(setting, "clean_public_titles", False))
 
     @staticmethod
     def _effective_brand_name(product: Product, listing: ProductListing | None) -> str | None:
@@ -1378,11 +1420,24 @@ class ProductQueryService:
         public_payload = dict(base_payload)
         public_payload["brand_name"] = final_designer_name
         public_payload["display_designer_name"] = final_designer_name
-        public_payload["title"] = self._effective_title(
-            product,
-            self._resolved_primary_listing(product),
-            designer_name=final_designer_name or None,
+        primary_listing = self._resolved_primary_listing(product)
+        public_payload["title"] = ProductTitleService.public_title(
+            source_title=(
+                None
+                if product.presentation is not None and str(getattr(product.presentation, "title_override", "") or "").strip()
+                else getattr(primary_listing, "source_title", None)
+            ),
+            source_designer_name=final_designer_name or None,
+            source_category_name=str(getattr(primary_listing, "source_category_raw", "") or "") or None,
+            clean=self._uses_public_title_cleaning(primary_listing),
         )
+        if product.presentation is not None and str(getattr(product.presentation, "title_override", "") or "").strip():
+            public_payload["title"] = str(product.presentation.title_override)
+        public_payload["variants"] = [
+            variant
+            for variant in public_payload.get("variants") or []
+            if isinstance(variant, dict) and bool(variant.get("available"))
+        ]
         public_payload.pop("source_designer_name", None)
         return public_payload
 

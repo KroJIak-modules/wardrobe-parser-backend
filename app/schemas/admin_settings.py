@@ -240,8 +240,9 @@ class SettingsTransferSourceEntry(BaseModel):
     sync_enabled: bool = True
     dedup_enabled: bool = True
     hide_auto_added_products: bool = False
-    description_mode: Literal["hidden", "text", "html"] = "text"
+    description_mode: Literal["hidden", "text"] = "text"
     show_images: bool = True
+    clean_public_titles: bool = True
     supplier_key: str | None = Field(default=None, min_length=1, max_length=64)
     promo_factor: float = Field(default=1.0, ge=0.0, le=10.0)
     promo_only_no_discount: bool = False

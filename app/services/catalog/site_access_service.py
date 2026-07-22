@@ -111,9 +111,9 @@ class SiteAccessService:
     def update_admin_settings(self, payload: AdminSiteAccessSettingsUpdateRequest) -> AdminSiteAccessSettingsResponse:
         entity = self.ensure_settings()
         next_enabled = bool(payload.enabled)
-        next_title = str(payload.title or "").strip()
-        next_description = str(payload.description or "").strip()
-        next_password = str(payload.password or "").strip()
+        next_title = str(payload.title or "")
+        next_description = str(payload.description or "")
+        next_password = str(payload.password or "")
         if next_enabled and not next_password:
             raise ValidationError("Укажите пароль для защиты сайта")
 

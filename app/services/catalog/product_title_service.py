@@ -5,6 +5,10 @@ import unicodedata
 
 
 class ProductTitleService:
+    _MACHINE_CODE_TOKEN_RE = re.compile(r"^[A-Z0-9]+(?:[-_][A-Z0-9]+)+$", flags=re.IGNORECASE)
+    _MACHINE_CODE_PREFIX_RE = re.compile(r"^[A-Z]{1,4}\d{1,4}[A-Z0-9_-]*$", flags=re.IGNORECASE)
+    _TRAILING_PARENS_RE = re.compile(r"^(?P<title>.+?)\s*\((?P<value>[^()]*)\)\s*$", flags=re.DOTALL)
+
     @classmethod
     def display_title(
         cls,
@@ -31,7 +35,7 @@ class ProductTitleService:
         if match is None:
             return title
 
-        remainder = cls._collapse_spaces(re.sub(r"^[\s\-\|:/\\,.;_]+", "", title[match.end() :]))
+        remainder = cls._collapse_spaces(re.sub(r"^[\s\W_]+", "", title[match.end() :]))
         if not remainder:
             return title
         if not re.search(r"\w", remainder, flags=re.UNICODE):
@@ -39,6 +43,68 @@ class ProductTitleService:
         if cls._normalize_compare(remainder) == cls._normalize_compare(designer):
             return title
         return remainder
+
+    @classmethod
+    def public_title(
+        cls,
+        *,
+        source_title: str | None,
+        source_designer_name: str | None,
+        source_category_name: str | None,
+        clean: bool,
+    ) -> str | None:
+        title = cls.display_title(
+            source_title=source_title,
+            source_designer_name=source_designer_name,
+            source_category_name=source_category_name,
+        )
+        if not clean:
+            return title
+        return cls._clean_public_title(title) or title
+
+    @classmethod
+    def _clean_public_title(cls, value: str | None) -> str | None:
+        title = cls._collapse_spaces(value)
+        if not title:
+            return None
+        split_title = cls._remove_machine_code_segment(title)
+        without_sku = cls._remove_trailing_sku_parentheses(split_title)
+        return cls._collapse_spaces(without_sku) or title
+
+    @classmethod
+    def _remove_machine_code_segment(cls, title: str) -> str:
+        if title.count("|") != 1:
+            return title
+        left, right = (cls._collapse_spaces(part) for part in title.split("|", maxsplit=1))
+        if cls._is_machine_code(left) and right:
+            return right
+        if cls._is_machine_code(right) and left:
+            return left
+        return title
+
+    @classmethod
+    def _remove_trailing_sku_parentheses(cls, title: str) -> str:
+        match = cls._TRAILING_PARENS_RE.match(title)
+        if match is None:
+            return title
+        candidate = cls._collapse_spaces(match.group("value"))
+        remainder = cls._collapse_spaces(match.group("title"))
+        if not remainder or not cls._is_machine_code(candidate):
+            return title
+        return remainder
+
+    @classmethod
+    def _is_machine_code(cls, value: str) -> bool:
+        normalized = cls._collapse_spaces(value)
+        if not normalized or " " in normalized:
+            return False
+        if cls._MACHINE_CODE_TOKEN_RE.fullmatch(normalized) is not None:
+            return any(character.isdigit() for character in normalized)
+        return bool(
+            cls._MACHINE_CODE_PREFIX_RE.fullmatch(normalized)
+            and any(character.isdigit() for character in normalized)
+            and any(character.isalpha() for character in normalized)
+        )
 
     @staticmethod
     def _collapse_spaces(value: str | None) -> str:

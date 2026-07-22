@@ -235,6 +235,7 @@ class CatalogProductRepository:
                 Designer.name.label("designer_name"),
                 Designer.slug.label("designer_slug"),
                 SourceSetting.show_images.label("show_images"),
+                SourceSetting.clean_public_titles.label("clean_public_titles"),
                 first_listing_image_sq.c.image_url.label("source_image_url"),
                 first_visible_gallery_image_sq.c.image_url.label("gallery_image_url"),
                 gallery_scope_sq.c.product_id.label("gallery_scope_product_id"),

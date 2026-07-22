@@ -255,7 +255,7 @@ class SiteDesignersResponse(BaseModel):
 class SiteProductDescriptionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    format: Literal["text", "html"]
+    format: Literal["text"]
     content: str
 
 

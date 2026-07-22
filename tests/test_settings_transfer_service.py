@@ -302,8 +302,9 @@ def test_settings_transfer_roundtrip_restores_pricing_ui_supplier_source_and_wei
         source_entry["sync_enabled"] = False
         source_entry["dedup_enabled"] = False
         source_entry["hide_auto_added_products"] = True
-        source_entry["description_mode"] = "html"
+        source_entry["description_mode"] = "hidden"
         source_entry["show_images"] = False
+        source_entry["clean_public_titles"] = True
         source_entry["supplier_key"] = secondary_supplier["key"]
         source_entry["promo_factor"] = 1.35
         source_entry["promo_only_no_discount"] = True
@@ -349,8 +350,9 @@ def test_settings_transfer_roundtrip_restores_pricing_ui_supplier_source_and_wei
         assert exported_source.sync_enabled is False
         assert exported_source.dedup_enabled is False
         assert exported_source.hide_auto_added_products is True
-        assert exported_source.description_mode == "html"
+        assert exported_source.description_mode == "hidden"
         assert exported_source.show_images is False
+        assert exported_source.clean_public_titles is True
         assert exported_source.supplier_key == secondary_supplier["key"]
         assert exported_source.promo_factor == 1.35
         assert exported_source.promo_only_no_discount is True

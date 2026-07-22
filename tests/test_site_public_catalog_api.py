@@ -36,6 +36,7 @@ def _create_manual_public_product(
     compare_at_price: int | None = None,
     available: bool = True,
     gender: str = "unisex",
+    variants: list[dict] | None = None,
 ) -> int:
     image_asset_id = _create_image_asset_id(db, marker, slug)
     return ProductWriteService(db).create_manual_product(
@@ -49,7 +50,9 @@ def _create_manual_public_product(
             "visibility_status": "visible",
             "orderability_status": "orderable" if available else "sold_out",
             "manual_weight_grams": 500,
-            "variants": [
+            "variants": variants
+            if variants is not None
+            else [
                 {
                     "title": "Default",
                     "price": price,
@@ -201,6 +204,90 @@ def test_site_catalog_gender_mapping_excludes_unisex_from_women() -> None:
 
         assert {item.id for item in men_payload.items} == {male_id, unisex_id}
         assert {item.id for item in women_payload.items} == {female_id}
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_public_product_excludes_non_orderable_variants() -> None:
+    db = SessionLocal()
+    marker = uuid4().hex[:8]
+    try:
+        product_id = _create_manual_public_product(
+            db,
+            marker=marker,
+            slug="variants",
+            price=12000,
+            variants=[
+                {"title": "S", "price": 12000, "currency": "RUB", "available": True},
+                {"title": "M", "price": 13000, "currency": "RUB", "available": False},
+            ],
+        )
+
+        payload = SiteQueryService(db).product(f"{product_id}-public-variants")
+
+        assert [variant.size for variant in payload.variants] == ["S"]
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_public_product_converts_html_description_field_to_text() -> None:
+    db = SessionLocal()
+    marker = uuid4().hex[:8]
+    try:
+        product_id = _create_manual_public_product(db, marker=marker, slug="legacy-html", price=12000)
+        product = db.query(Product).filter(Product.id == int(product_id)).one()
+        listing = db.query(ProductListing).filter(ProductListing.id == int(product.primary_listing_id or 0)).one()
+        listing.source_description_text = None
+        listing.source_description_html = "<p>Первый <strong>абзац</strong></p><p>Второй&nbsp;абзац</p>"
+        db.flush()
+
+        payload = SiteQueryService(db).product(f"{product_id}-legacy-html")
+
+        assert payload.description is not None
+        assert payload.description.format == "text"
+        assert payload.description.content == "Первый абзац\nВторой абзац"
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_public_title_cleaning_is_source_scoped_and_keeps_original_title_searchable() -> None:
+    db = SessionLocal()
+    marker = uuid4().hex[:8]
+    try:
+        product_id = _create_manual_public_product(db, marker=marker, slug="title-cleaning", price=12000)
+        product = db.query(Product).filter(Product.id == int(product_id)).one()
+        listing = db.query(ProductListing).filter(ProductListing.id == int(product.primary_listing_id or 0)).one()
+        listing.source_title = "DS01F4726_DWB_06 | KUNST JKT"
+        listing.source.setting.clean_public_titles = True
+        db.flush()
+
+        service = SiteQueryService(db)
+        public_product = service.product(f"{product_id}-title-cleaning")
+        search_result = service.catalog_products(
+            limit=10,
+            offset=0,
+            query="DS01F4726_DWB_06",
+            designer_slugs=[],
+            gender_values=[],
+            filter_slugs=[],
+            custom_catalog_slug=None,
+            availability_mode=None,
+            orderability_status=None,
+            discounted_only=False,
+        )
+
+        assert public_product.name == "KUNST JKT"
+        assert [item.id for item in search_result.items] == [product_id]
+        assert search_result.items[0].name == "KUNST JKT"
+
+        listing.source.setting.clean_public_titles = False
+        db.flush()
+
+        uncleaned_product = service.product(f"{product_id}-title-cleaning")
+        assert uncleaned_product.name == "DS01F4726_DWB_06 | KUNST JKT"
     finally:
         db.rollback()
         db.close()

@@ -39,9 +39,10 @@ class AutoHidePatch(BaseModel):
     hide_auto_added_products: bool
 
 
-class AttributeVisibilityPatch(BaseModel):
+class SourceDisplaySettingsPatch(BaseModel):
     description_mode: str | None = None
     show_images: bool | None = None
+    clean_public_titles: bool | None = None
 
 
 class SupplierPatch(BaseModel):
@@ -133,6 +134,7 @@ def _source_payload(source: Source, counts_by_source_id: dict[int, dict[str, int
         "hide_auto_added_products": bool(getattr(setting, "hide_auto_added_products", False)),
         "description_mode": str(getattr(setting, "description_mode", "text") or "text"),
         "show_images": bool(getattr(setting, "show_images", True)),
+        "clean_public_titles": bool(getattr(setting, "clean_public_titles", False)),
         "products_count": int(counts.get("products_count", 0)),
         "manual_products_count": int(counts.get("manual_products_count", 0)),
         "bound_sync_products_count": int(counts.get("bound_sync_products_count", 0)),
@@ -245,8 +247,8 @@ def patch_hide_auto_added(source_key: str, payload: AutoHidePatch, db: Session =
     return _source_payload(entity, _source_counts_by_id(db))
 
 
-@router.patch("/sources/{source_key}/attribute-visibility", dependencies=[Depends(require_permission("control.sources.edit"))])
-def patch_attribute_visibility(source_key: str, payload: AttributeVisibilityPatch, db: Session = Depends(get_db)) -> dict:
+@router.patch("/sources/{source_key}/display-settings", dependencies=[Depends(require_permission("control.sources.edit"))])
+def patch_display_settings(source_key: str, payload: SourceDisplaySettingsPatch, db: Session = Depends(get_db)) -> dict:
     repo = SourceRegistryService(db).repo
     entity = repo.get_by_key(source_key)
     if entity is None:
@@ -254,11 +256,13 @@ def patch_attribute_visibility(source_key: str, payload: AttributeVisibilityPatc
     setting = repo.ensure_setting(entity)
     if payload.description_mode is not None:
         description_mode = str(payload.description_mode or "").strip().lower()
-        if description_mode not in {"hidden", "text", "html"}:
+        if description_mode not in {"hidden", "text"}:
             raise ValidationError("Некорректный description_mode")
         setting.description_mode = description_mode
     if payload.show_images is not None:
         setting.show_images = bool(payload.show_images)
+    if payload.clean_public_titles is not None:
+        setting.clean_public_titles = bool(payload.clean_public_titles)
     db.commit()
     return _source_payload(entity, _source_counts_by_id(db))
 

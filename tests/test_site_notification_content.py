@@ -69,6 +69,9 @@ def test_site_notification_create_public_reset_and_delete_roundtrip(monkeypatch,
         notification_id = int(created["id"])
         assert created["title"] == f"TITLE {marker}"
         assert created["image"]["id"] == asset_id
+        assert created["image"]["url"] == f"/api/v1/admin/site-content/media/{asset_id}/file"
+        media_response = client.get(created["image"]["url"])
+        assert media_response.status_code == 200
         assert int(created["version"]) == 1
 
         public_response = client.get("/api/v1/site/home/notification")

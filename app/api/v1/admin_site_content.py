@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -17,11 +18,21 @@ from app.schemas.admin_site_content import (
     AdminSiteQuestionsUpdateRequest,
 )
 from app.services.auth.admin_auth_service import require_permission
+from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.site_access_service import SiteAccessService
 from app.services.catalog.site_content_service import SiteContentService
 
 
 router = APIRouter(prefix="/admin/site-content", tags=["admin-site-content"])
+
+
+@router.get(
+    "/media/{asset_id}/file",
+    dependencies=[Depends(require_permission("showcase.read"))],
+)
+def get_admin_site_content_media(asset_id: int, db: Session = Depends(get_db)) -> FileResponse:
+    asset = SiteContentService(db).admin_media_asset(asset_id)
+    return FileResponse(MediaAssetService(db).resolve_file_path(asset), media_type=asset.mime_type)
 
 
 @router.get(
