@@ -402,6 +402,11 @@ class SyncJob(Base):
     processed_sources = Column(Integer, nullable=False, default=0, server_default="0")
     products_seen = Column(Integer, nullable=False, default=0, server_default="0")
     products_applied = Column(Integer, nullable=False, default=0, server_default="0")
+    current_stage_code = Column(String(64), nullable=True)
+    current_stage_label = Column(String(255), nullable=True)
+    current_stage_detail = Column(String(512), nullable=True)
+    current_stage_updated_at = Column(DateTime(timezone=True), nullable=True)
+    last_source_name = Column(String(255), nullable=True)
     error_message = Column(Text, nullable=True)
 
     triggered_by_admin_user = relationship("AdminUser")
@@ -427,6 +432,7 @@ class SyncJobSourceRun(Base):
     products_received = Column(Integer, nullable=False, default=0, server_default="0")
     products_applied = Column(Integer, nullable=False, default=0, server_default="0")
     failed_products = Column(Integer, nullable=False, default=0, server_default="0")
+    issue_counts = Column(JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb"))
     error_code = Column(String(255), nullable=True)
     error_message = Column(Text, nullable=True)
 

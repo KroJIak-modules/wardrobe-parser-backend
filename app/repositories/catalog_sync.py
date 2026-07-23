@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.models import SyncAppliedBatch, SyncJob, SyncJobSourceRun
 
@@ -39,6 +39,15 @@ class CatalogSyncRepository:
 
     def get_source_run_by_id(self, source_run_id: int) -> SyncJobSourceRun | None:
         return self.session.query(SyncJobSourceRun).filter(SyncJobSourceRun.id == int(source_run_id)).one_or_none()
+
+    def list_source_runs(self, *, sync_job_id: int) -> list[SyncJobSourceRun]:
+        return (
+            self.session.query(SyncJobSourceRun)
+            .options(joinedload(SyncJobSourceRun.source))
+            .filter(SyncJobSourceRun.sync_job_id == int(sync_job_id))
+            .order_by(SyncJobSourceRun.id.asc())
+            .all()
+        )
 
     def has_applied_batch(self, *, source_run_id: int, batch_key: str) -> bool:
         return (
