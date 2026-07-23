@@ -232,6 +232,29 @@ def test_public_product_excludes_non_orderable_variants() -> None:
         db.close()
 
 
+def test_public_product_replaces_only_technical_default_title_variant() -> None:
+    db = SessionLocal()
+    marker = uuid4().hex[:8]
+    try:
+        product_id = _create_manual_public_product(
+            db,
+            marker=marker,
+            slug="default-title",
+            price=12000,
+            variants=[
+                {"title": "Default Title", "price": 12000, "currency": "RUB", "available": True},
+                {"title": "Default", "price": 13000, "currency": "RUB", "available": True},
+            ],
+        )
+
+        payload = SiteQueryService(db).product(f"{product_id}-default-title")
+
+        assert [variant.size for variant in payload.variants] == ["Базовый вариант", "Default"]
+    finally:
+        db.rollback()
+        db.close()
+
+
 def test_public_product_converts_html_description_field_to_text() -> None:
     db = SessionLocal()
     marker = uuid4().hex[:8]

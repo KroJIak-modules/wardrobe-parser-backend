@@ -27,6 +27,7 @@ class ShowcaseNavigationMenuGroup(BaseModel):
 
     id: str
     title: str
+    titleTarget: ShowcaseRouteTarget | None = None
     items: list[ShowcaseNavigationMenuItem] = Field(default_factory=list)
 
 
@@ -140,6 +141,7 @@ class ShowcaseDesignersDirectoryEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
+    slug: str
     label: str
     letter: str
 

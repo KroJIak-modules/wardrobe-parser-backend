@@ -121,6 +121,13 @@ class SiteQueryService:
         return "preorder"
 
     @staticmethod
+    def _public_variant_title(value: object | None) -> str:
+        title = str(value or "").strip()
+        if title.casefold() == "default title":
+            return "Базовый вариант"
+        return title or "ONE SIZE"
+
+    @staticmethod
     def _normalize_catalog_sort(value: object | None) -> str:
         normalized = str(value or "").strip().lower()
         if normalized in {"price_asc", "price-asc"}:
@@ -828,7 +835,7 @@ class SiteQueryService:
             variants.append(
                 SiteProductVariantResponse(
                     id=int(variant.get("id") or 0),
-                    size=str(variant.get("title") or "").strip() or "ONE SIZE",
+                    size=self._public_variant_title(variant.get("title")),
                     price_rub=(
                         int(round(float(variant.get("final_price"))))
                         if variant.get("final_price") is not None

@@ -34,6 +34,16 @@ def test_admin_showcase_navigation_preview_available(monkeypatch) -> None:
     payload = response.json()
     assert isinstance(payload.get("sections"), list)
     assert {section["key"] for section in payload["sections"]} == {"new", "designers", "men", "women", "sale"}
+    for section in payload["sections"]:
+        menu = section.get("menu")
+        if not menu:
+            continue
+        for block in menu.get("blocks") or []:
+            for group in block.get("groups") or []:
+                assert "title" in group
+                if group.get("titleTarget") is not None:
+                    assert isinstance(group["titleTarget"], dict)
+                    assert "pathname" in group["titleTarget"]
 
 
 def test_admin_showcase_catalog_experience_preview_available(monkeypatch) -> None:
@@ -51,6 +61,25 @@ def test_admin_showcase_catalog_experience_preview_available(monkeypatch) -> Non
     assert group_keys[:2] == ["sort", "availability"]
     assert group_keys[-1] == "gender"
     assert set(group_keys).issubset({"sort", "availability", "section", "designer", "gender"})
+
+
+def test_admin_showcase_catalog_products_available(monkeypatch) -> None:
+    client = _authorized_client(monkeypatch)
+
+    response = client.get("/api/v1/admin/showcase/catalog-products?limit=12&offset=0")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert isinstance(payload.get("items"), list)
+    assert isinstance(payload.get("total"), int)
+    assert payload.get("limit") == 12
+    assert payload.get("offset") == 0
+    for item in payload["items"]:
+        assert isinstance(item.get("id"), int)
+        assert isinstance(item.get("path"), str)
+        assert isinstance(item.get("name"), str)
+        assert isinstance(item.get("brand"), dict)
+        assert item.get("status") in {"in_stock", "preorder", "sold_out"}
 
 
 def test_admin_showcase_designers_directory_preview_available(monkeypatch) -> None:
