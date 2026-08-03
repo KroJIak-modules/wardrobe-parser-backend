@@ -311,3 +311,56 @@ class SiteQuestionsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     items: list[SiteQuestionResponse] = Field(default_factory=list)
+
+
+class SiteCartQuoteItemRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    variant_id: int = Field(gt=0)
+    quantity: int = Field(gt=0, le=100)
+
+
+class SiteCartQuoteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[SiteCartQuoteItemRequest] = Field(min_length=1, max_length=100)
+
+
+class SiteCartQuoteItemResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    variant_id: int
+    quantity: int
+    availability: Literal["in_stock", "preorder"]
+    original_line_total_rub: float
+    final_line_total_rub: float
+
+
+class SiteCartQuoteSvcTierResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    min_rub: float
+    max_rub: float | None = None
+    mode: Literal["fixed_rub", "percent"]
+    value: float
+    amount_rub: float | None = None
+    is_applied: bool = False
+
+
+class SiteCartQuoteSvcProgressResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preorder_subtotal_rub: float
+    applied_amount_rub: float
+    next_threshold_rub: float | None = None
+
+
+class SiteCartQuoteResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[SiteCartQuoteItemResponse] = Field(default_factory=list)
+    original_total_rub: float
+    final_total_rub: float
+    total_rub: float
+    svc_tiers: list[SiteCartQuoteSvcTierResponse] = Field(default_factory=list)
+    svc_progress: SiteCartQuoteSvcProgressResponse

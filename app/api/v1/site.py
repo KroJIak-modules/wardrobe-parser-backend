@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.services.catalog.cart_pricing_service import CartPricingService
 from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.site_access_service import SITE_ACCESS_COOKIE_NAME, SiteAccessService, require_site_access
 from app.services.catalog.site_query_service import SiteQueryService
@@ -15,6 +16,8 @@ from app.schemas.site import (
     SiteAccessUnlockRequest,
     SiteAccessUnlockResponse,
     SiteCarouselResponse,
+    SiteCartQuoteRequest,
+    SiteCartQuoteResponse,
     SiteCatalogExperienceResponse,
     SiteCatalogProductsResponse,
     SiteDesignersResponse,
@@ -142,6 +145,14 @@ def get_site_catalog_products(
         discounted_only=discounted_only,
         sort=sort,
     )
+
+
+@router.post("/cart/quote", response_model=SiteCartQuoteResponse, dependencies=[Depends(require_site_access)])
+def quote_site_cart(
+    payload: SiteCartQuoteRequest,
+    db: Session = Depends(get_db),
+) -> SiteCartQuoteResponse:
+    return CartPricingService(db).quote(payload.items)
 
 
 @router.get("/designers", response_model=SiteDesignersResponse, dependencies=[Depends(require_site_access)])

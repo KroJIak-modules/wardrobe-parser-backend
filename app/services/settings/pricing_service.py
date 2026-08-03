@@ -472,6 +472,26 @@ class PricingSettingsService:
         amount = float(base_value) * value if mode == "percent" else value
         return max(0.0, float(amount)), {"mode": mode, "value": value}
 
+    @classmethod
+    def calculate_service_fee(
+        cls,
+        *,
+        subtotal_rub: float,
+        rules: list[Any] | None,
+    ) -> tuple[float, dict[str, Any]]:
+        rule = cls._pick_range_rule(
+            value=max(0.0, float(subtotal_rub)),
+            rules=rules or [],
+            min_key="min_rub",
+            max_key="max_rub",
+        )
+        amount, meta = cls._compute_rule_amount(max(0.0, float(subtotal_rub)), rule)
+        return amount, {
+            **meta,
+            "min_rub": cls._safe_float(cls._read_row_value(rule, "min_rub")),
+            "max_rub": cls._safe_float(cls._read_row_value(rule, "max_rub")),
+        }
+
     @staticmethod
     def _normalize_image_asset_ids(raw: Any, *, limit: int) -> list[int]:
         if not isinstance(raw, list):
@@ -1297,13 +1317,10 @@ class PricingSettingsService:
         delivery_rub = supplier_shipping_rub
 
         subtotal_rub = buyout_rub + payment_fee_rub + insurance_rub + customs_rub + delivery_rub
-        svc_rule = PricingSettingsService._pick_range_rule(
-            value=subtotal_rub,
+        service_fee_rub, service_fee_meta = PricingSettingsService.calculate_service_fee(
+            subtotal_rub=subtotal_rub,
             rules=getattr(settings, "svc_rules", []) or [],
-            min_key="min_rub",
-            max_key="max_rub",
         )
-        service_fee_rub, service_fee_meta = PricingSettingsService._compute_rule_amount(subtotal_rub, svc_rule)
         markup_multiplier = max(0.0, float(settings.markup_multiplier))
         subtotal_after_markup_rub = (subtotal_rub * markup_multiplier) + service_fee_rub
         tax_rub = subtotal_after_markup_rub * max(0.0, float(settings.tax_rate))
@@ -1314,8 +1331,6 @@ class PricingSettingsService:
             default="unit",
         )
         final_price_rub = PricingSettingsService._apply_final_rounding(raw_final_price_rub, final_rounding_mode)
-        margin_rub = final_price_rub - sp_rub
-
         return ProductPricingComputation(
             final_price_rub=final_price_rub,
             manual_required=False,
@@ -1366,7 +1381,6 @@ class PricingSettingsService:
                 "subtotal_rub": round(subtotal_rub, 4),
                 "subtotal_after_markup_rub": round(subtotal_after_markup_rub, 4),
                 "pass_through_costs_rub": round(pass_through_costs_rub, 4),
-                "margin_rub": round(margin_rub, 4),
                 "tp_rub": round(subtotal_rub, 4),
                 "markup_multiplier": round(markup_multiplier, 6),
                 "markup_rate": round(max(0.0, markup_multiplier - 1.0), 6),
