@@ -6,7 +6,6 @@ from uuid import uuid4
 from app.core.database import SessionLocal
 from app.models import Designer, ImageAsset, Product, ProductListing
 from app.services.catalog.product_query_service import ProductQueryService
-from app.schemas.taxonomy import TaxonomyFilterNode, TaxonomyState
 from app.services.catalog.product_write_service import ProductWriteService
 from app.services.catalog.designer_support import slugify_designer_name
 from app.services.catalog.site_query_service import SiteQueryService
@@ -388,68 +387,6 @@ def test_public_product_payload_excludes_source_designer_name() -> None:
         assert payload["display_designer_name"] == f"Site public designer {marker}"
         assert "source_designer_name" not in payload
         assert "Unpublished Source Designer" not in str(payload)
-    finally:
-        db.rollback()
-        db.close()
-
-
-def test_site_navigation_mobile_menu_uses_filter_title_not_display_title() -> None:
-    db = SessionLocal()
-    try:
-        service = SiteQueryService(db)
-        service.taxonomy.get_state = lambda: TaxonomyState(  # type: ignore[method-assign]
-            filters=[
-                TaxonomyFilterNode(
-                    slug="clothes",
-                    title="Одежда",
-                    display_title="Коротко одежда",
-                    node_kind="multifilter",
-                    mobile_pair_slug="shoes",
-                    children=[
-                        TaxonomyFilterNode(
-                            slug="tops",
-                            title="Верх",
-                            display_title="Коротко верх",
-                            node_kind="multifilter",
-                            children=[
-                                TaxonomyFilterNode(
-                                    slug="shirts",
-                                    title="Рубашки",
-                                    display_title="Рубашки и блузы",
-                                    node_kind="filter",
-                                )
-                            ],
-                        )
-                    ],
-                ),
-                TaxonomyFilterNode(
-                    slug="shoes",
-                    title="Обувь",
-                    display_title="Коротко обувь",
-                    node_kind="multifilter",
-                    mobile_pair_slug="clothes",
-                    children=[
-                        TaxonomyFilterNode(
-                            slug="boots",
-                            title="Ботинки",
-                            display_title="Коротко ботинки",
-                            node_kind="filter",
-                        )
-                    ],
-                ),
-            ],
-            custom_catalogs=[],
-            showcase_categories=[],
-        )
-
-        payload = service.navigation()
-        group = payload.mobile_menu.root_groups[0]
-
-        assert group.label == "Одежда и Обувь"
-        assert [item.label for item in group.root_multi_filters] == ["Одежда", "Обувь"]
-        assert group.children[0].multi_filter.label == "Верх"
-        assert group.children[0].sections[0].label == "Рубашки"
-        assert group.children[1].multi_filter.label == "Ботинки"
     finally:
         db.rollback()
         db.close()

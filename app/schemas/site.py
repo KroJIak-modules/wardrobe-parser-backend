@@ -120,33 +120,22 @@ class SiteNavigationTopSection(BaseModel):
     target: SiteRouteTarget | None = None
 
 
-class SiteMobileMenuGroupFilter(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    label: str
-
-
-class SiteMobileMenuGroupChild(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    multi_filter: SiteMobileMenuGroupFilter
-    sections: list[SiteMobileMenuGroupFilter] = Field(default_factory=list)
-
-
 class SiteMobileMenuRootGroup(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
     label: str
-    root_multi_filters: list[SiteMobileMenuGroupFilter] = Field(default_factory=list)
-    children: list[SiteMobileMenuGroupChild] = Field(default_factory=list)
+    # Entries retain the exact labels, targets, ordering and gender scope from
+    # the same admin-configured desktop menu columns.
+    entries: list[SiteNavigationMenuEntry] = Field(default_factory=list)
 
 
 class SiteNavigationMobileMenu(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    root_groups: list[SiteMobileMenuRootGroup] = Field(default_factory=list)
+    # Mobile navigation is derived from the same gender-scoped showcase
+    # attachments as the desktop men/women menus.
+    groups_by_gender: dict[str, list[SiteMobileMenuRootGroup]] = Field(default_factory=dict)
 
 
 class SiteNavigationCatalogContextEntry(BaseModel):

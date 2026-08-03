@@ -33,8 +33,6 @@ from app.schemas.site import (
     SiteDesignersResponse,
     SiteHeroResponse,
     SiteMediaAssetResponse,
-    SiteMobileMenuGroupChild,
-    SiteMobileMenuGroupFilter,
     SiteMobileMenuRootGroup,
     SiteNavigationMenu,
     SiteNavigationMenuColumn,
@@ -51,7 +49,6 @@ from app.schemas.site import (
     SiteQuestionsResponse,
     SiteRouteTarget,
 )
-from app.schemas.taxonomy import TaxonomyFilterNode
 from app.services.catalog.admin_showcase_preview_service import AdminShowcasePreviewService
 from app.services.catalog.designer_support import slugify_designer_name
 from app.services.catalog.product_query_service import ProductQueryService
@@ -381,100 +378,80 @@ class SiteQueryService:
         return SiteNavigationResponse(
             top_sections=top_sections,
             desktop_menus=desktop_menus,
-            mobile_menu=self._mobile_menu_payload(),
+            mobile_menu=self._mobile_menu_payload(desktop_menus),
             catalog_contexts=self._catalog_contexts_payload(),
         )
 
-    @staticmethod
-    def _find_root_multifilters(nodes: list[TaxonomyFilterNode]) -> list[TaxonomyFilterNode]:
-        return [
-            node
-            for node in nodes
-            if str(node.node_kind).strip() == "multifilter" and bool(node.is_enabled)
-        ]
-
-    @staticmethod
-    def _visible_children(node: TaxonomyFilterNode) -> list[TaxonomyFilterNode]:
-        return [child for child in node.children if bool(child.is_enabled)]
-
-    @staticmethod
-    def _taxonomy_menu_label(node: TaxonomyFilterNode) -> str:
-        return str(node.title or "").strip()
-
-    def _mobile_menu_payload(self) -> SiteNavigationMobileMenu:
-        state = self.taxonomy.get_state()
-        roots = self._find_root_multifilters(state.filters)
-        root_by_slug = {
-            str(node.slug or "").strip(): node
-            for node in roots
-            if str(node.slug or "").strip()
-        }
-        used: set[str] = set()
-        groups: list[SiteMobileMenuRootGroup] = []
-
-        for root in roots:
-            root_slug = str(root.slug or "").strip()
-            if not root_slug or root_slug in used:
+    def _mobile_menu_payload(self, desktop_menus: dict[str, SiteNavigationMenu]) -> SiteNavigationMobileMenu:
+        # Desktop category menus already embody the admin-configured showcase
+        # attachments, visibility, ordering and gender scope. The mobile-only
+        # pair setting only changes presentation: it joins two configured root
+        # columns without rebuilding entries from taxonomy.
+        filters_by_id = self._flatten_admin_filter_nodes(
+            self.preview.taxonomy_state.get("filters") if isinstance(self.preview.taxonomy_state.get("filters"), list) else []
+        )
+        paired_root_ids: dict[int, int] = {}
+        for root_id, node in filters_by_id.items():
+            try:
+                pair_id = int(node.get("mobile_pair_root_id") or 0)
+            except (TypeError, ValueError):
                 continue
-            pair_slug = str(root.mobile_pair_slug or "").strip()
-            members = [root]
-            if pair_slug and pair_slug in root_by_slug and pair_slug not in used:
-                pair = root_by_slug[pair_slug]
-                if str(pair.mobile_pair_slug or "").strip() == root_slug:
-                    members.append(pair)
-            for member in members:
-                used.add(str(member.slug or "").strip())
-            group_label = " и ".join(label for member in members if (label := self._taxonomy_menu_label(member)))
-            children: list[SiteMobileMenuGroupChild] = []
-            for member in members:
-                member_slug = str(member.slug or "").strip()
-                for child in self._visible_children(member):
-                    child_slug = str(child.slug or "").strip()
-                    if not child_slug:
-                        continue
-                    leaf_sections = self._visible_children(child) or [child]
-                    children.append(
-                        SiteMobileMenuGroupChild(
-                            multi_filter=SiteMobileMenuGroupFilter(
-                                id=child_slug,
-                                label=self._taxonomy_menu_label(child),
-                            ),
-                            sections=[
-                                SiteMobileMenuGroupFilter(
-                                    id=str(section.slug or ""),
-                                    label=self._taxonomy_menu_label(section),
-                                )
-                                for section in leaf_sections
-                                if str(section.slug or "").strip()
-                            ],
+            paired_node = filters_by_id.get(pair_id)
+            try:
+                reciprocal_pair_id = int(paired_node.get("mobile_pair_root_id") or 0) if paired_node is not None else 0
+            except (TypeError, ValueError):
+                reciprocal_pair_id = 0
+            if pair_id > 0 and reciprocal_pair_id == root_id:
+                paired_root_ids[root_id] = pair_id
+
+        grouped_menus: dict[str, list[SiteMobileMenuRootGroup]] = {}
+        for gender in ("men", "women"):
+            menu = desktop_menus.get(gender)
+            if menu is None:
+                continue
+            columns_by_root_id = {
+                root_id: column
+                for column in menu.columns
+                if (root_id := self._filter_node_id_from_entry_id(column.id, "filter-")) is not None
+            }
+            used_column_ids: set[str] = set()
+            groups: list[SiteMobileMenuRootGroup] = []
+            for column in menu.columns:
+                if column.id in used_column_ids:
+                    continue
+                entries = list(column.entries)
+                if not entries and column.title is None:
+                    continue
+                root_id = self._filter_node_id_from_entry_id(column.id, "filter-")
+                pair_id = paired_root_ids.get(root_id) if root_id is not None else None
+                paired_column = columns_by_root_id.get(pair_id) if pair_id is not None else None
+                if paired_column is not None and paired_column.id not in used_column_ids:
+                    pair_entries = list(paired_column.entries)
+                    labels = [
+                        item.title.label if item.title is not None else (item.entries[0].label if item.entries else item.id)
+                        for item in (column, paired_column)
+                    ]
+                    groups.append(
+                        SiteMobileMenuRootGroup(
+                            id=f"mobile-pair:{column.id}:{paired_column.id}",
+                            label=" и ".join(labels),
+                            entries=[*entries, *pair_entries],
                         )
                     )
-                if not self._visible_children(member):
-                    children.append(
-                        SiteMobileMenuGroupChild(
-                            multi_filter=SiteMobileMenuGroupFilter(
-                                id=member_slug,
-                                label=self._taxonomy_menu_label(member),
-                            ),
-                            sections=[],
-                        )
+                    used_column_ids.add(paired_column.id)
+                    used_column_ids.add(column.id)
+                    continue
+                groups.append(
+                    SiteMobileMenuRootGroup(
+                        id=column.id,
+                        label=column.title.label if column.title is not None else (entries[0].label if entries else column.id),
+                        entries=entries,
                     )
-            groups.append(
-                SiteMobileMenuRootGroup(
-                    id="-".join(sorted(str(member.slug or "").strip() for member in members if str(member.slug or "").strip())),
-                    label=group_label,
-                    root_multi_filters=[
-                        SiteMobileMenuGroupFilter(
-                            id=str(member.slug or ""),
-                            label=self._taxonomy_menu_label(member),
-                        )
-                        for member in members
-                        if str(member.slug or "").strip()
-                    ],
-                    children=children,
                 )
-            )
-        return SiteNavigationMobileMenu(root_groups=groups)
+                used_column_ids.add(column.id)
+            if groups:
+                grouped_menus[gender] = groups
+        return SiteNavigationMobileMenu(groups_by_gender=grouped_menus)
 
     def home_hero(self, viewport: str) -> SiteHeroResponse:
         state = self.showcase.state()
