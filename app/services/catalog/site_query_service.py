@@ -685,12 +685,16 @@ class SiteQueryService:
         ]
         product_rows = self.products.products.list_site_catalog_card_rows_by_ids(product_ids)
         row_by_product_id = {int(row.product_id): row for row in product_rows}
+        products_by_id = {
+            int(product.id): product
+            for product in self.products.products.list_products_by_ids(product_ids, include_merged=False)
+        }
         items = []
         for product_id in product_ids:
             row = row_by_product_id.get(product_id)
             if row is None:
                 continue
-            items.append(self._site_catalog_product_response(row))
+            items.append(self._site_catalog_product_response(row, product=products_by_id.get(product_id)))
         return SiteCatalogProductsResponse(items=items, total=total, limit=int(limit), offset=int(offset))
 
     @staticmethod
@@ -727,8 +731,7 @@ class SiteQueryService:
         source_image_url = str(getattr(row, "source_image_url", "") or "").strip()
         return source_image_url or None
 
-    @staticmethod
-    def _site_catalog_old_price_rub(row) -> int | None:
+    def _site_catalog_old_price_rub(self, row, *, product: Product | None) -> int | None:
         compare_at_price = getattr(row, "compare_at_price_amount", None)
         price = getattr(row, "price_amount", None)
         display_price = getattr(row, "site_sort_price_rub", None)
@@ -740,11 +743,28 @@ class SiteQueryService:
             or float(compare_at_price) <= float(price)
         ):
             return None
-        # The card already displays the final calculated price. Preserve the
-        # source discount ratio for the prior price without another query per card.
-        return int(round(float(display_price) * float(compare_at_price) / float(price)))
 
-    def _site_catalog_product_response(self, row) -> SiteCatalogProductResponse:
+        # The current price is cached for catalogue sorting. Recalculate the
+        # prior source price through the same pricing service so both public
+        # prices share every rule, including configured final rounding.
+        listing_id = getattr(row, "representative_listing_id", None)
+        listing = next(
+            (membership.listing for membership in (product.memberships if product is not None else []) if membership.listing_id == listing_id),
+            None,
+        )
+        if product is None or listing is None:
+            return None
+        old_price_rub, _ = self.products._compute_variant_pricing(
+            listing,
+            source_price=float(compare_at_price),
+            source_currency=str(getattr(row, "currency_code", "") or "").upper() or None,
+            compare_at_price=None,
+            weight_grams=self.products._effective_weight_grams(product, listing),
+            pricing_mode=str(getattr(row, "pricing_mode", "") or "source"),
+        )
+        return int(round(old_price_rub)) if old_price_rub is not None and old_price_rub > float(display_price) else None
+
+    def _site_catalog_product_response(self, row, *, product: Product | None) -> SiteCatalogProductResponse:
         title = self._site_catalog_title(row)
         effective_orderability_status = (
             "unavailable"
@@ -768,7 +788,7 @@ class SiteQueryService:
                 if getattr(row, "site_sort_price_rub", None) is not None
                 else None
             ),
-            old_price_rub=self._site_catalog_old_price_rub(row),
+            old_price_rub=self._site_catalog_old_price_rub(row, product=product),
             status=status,  # type: ignore[arg-type]
             image_url=self._site_catalog_image_url(row),
         )

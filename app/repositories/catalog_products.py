@@ -180,6 +180,8 @@ class CatalogProductRepository:
                 ProductListingVariant.listing_id.label("listing_id"),
                 ProductListingVariant.price_amount.label("price_amount"),
                 ProductListingVariant.compare_at_price_amount.label("compare_at_price_amount"),
+                ProductListingVariant.currency_code.label("currency_code"),
+                ProductListingVariant.pricing_mode.label("pricing_mode"),
                 func.row_number()
                 .over(
                     partition_by=ProductListingVariant.listing_id,
@@ -239,8 +241,11 @@ class CatalogProductRepository:
             self.session.query(
                 Product.id.label("product_id"),
                 Product.site_sort_price_rub.label("site_sort_price_rub"),
+                representative_variant_sq.c.listing_id.label("representative_listing_id"),
                 representative_variant_sq.c.compare_at_price_amount.label("compare_at_price_amount"),
                 representative_variant_sq.c.price_amount.label("price_amount"),
+                representative_variant_sq.c.currency_code.label("currency_code"),
+                representative_variant_sq.c.pricing_mode.label("pricing_mode"),
                 Product.availability_mode.label("availability_mode"),
                 Product.dedup_status.label("dedup_status"),
                 ProductListing.orderability_status.label("orderability_status"),
