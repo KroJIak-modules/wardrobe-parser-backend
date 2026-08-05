@@ -727,6 +727,23 @@ class SiteQueryService:
         source_image_url = str(getattr(row, "source_image_url", "") or "").strip()
         return source_image_url or None
 
+    @staticmethod
+    def _site_catalog_old_price_rub(row) -> int | None:
+        compare_at_price = getattr(row, "compare_at_price_amount", None)
+        price = getattr(row, "price_amount", None)
+        display_price = getattr(row, "site_sort_price_rub", None)
+        if (
+            compare_at_price is None
+            or price is None
+            or display_price is None
+            or float(price) <= 0
+            or float(compare_at_price) <= float(price)
+        ):
+            return None
+        # The card already displays the final calculated price. Preserve the
+        # source discount ratio for the prior price without another query per card.
+        return int(round(float(display_price) * float(compare_at_price) / float(price)))
+
     def _site_catalog_product_response(self, row) -> SiteCatalogProductResponse:
         title = self._site_catalog_title(row)
         effective_orderability_status = (
@@ -751,6 +768,7 @@ class SiteQueryService:
                 if getattr(row, "site_sort_price_rub", None) is not None
                 else None
             ),
+            old_price_rub=self._site_catalog_old_price_rub(row),
             status=status,  # type: ignore[arg-type]
             image_url=self._site_catalog_image_url(row),
         )

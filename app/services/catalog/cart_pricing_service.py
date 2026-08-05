@@ -56,20 +56,29 @@ class CartPricingService:
     @staticmethod
     def _variant_quantity_by_id(
         items: Iterable[SiteCartQuoteItemRequest],
-    ) -> tuple[list[int], dict[int, int]]:
+    ) -> tuple[list[int], dict[int, int], dict[int, int]]:
         variant_ids: list[int] = []
         quantities: dict[int, int] = {}
+        product_ids: dict[int, int] = {}
         for item in items:
             variant_id = int(item.variant_id)
+            product_id = int(item.product_id)
             if variant_id not in quantities:
                 variant_ids.append(variant_id)
                 quantities[variant_id] = 0
+                product_ids[variant_id] = product_id
+            elif product_ids[variant_id] != product_id:
+                raise ValidationError(f"Вариант {variant_id} указан для разных товаров")
             quantities[variant_id] += int(item.quantity)
-        return variant_ids, quantities
+        return variant_ids, quantities, product_ids
 
     def _find_variants(
-        self, *, variant_ids: list[int], quantities: dict[int, int]
-    ) -> dict[int, _CartVariant]:
+        self,
+        *,
+        variant_ids: list[int],
+        quantities: dict[int, int],
+        product_ids: dict[int, int],
+    ) -> tuple[dict[int, _CartVariant], list[int]]:
         rows = (
             self.db.query(
                 Product, ProductListing, ProductListingVariant, Source, SourceSetting
@@ -103,12 +112,50 @@ class CartPricingService:
                     source_setting=source_setting,
                     quantity=quantities[variant_id],
                 )
-        missing = [
-            str(variant_id) for variant_id in variant_ids if variant_id not in found
+        mismatched = [
+            str(variant_id)
+            for variant_id, item in found.items()
+            if int(item.product.id) != product_ids[variant_id]
         ]
-        if missing:
-            raise ValidationError(f"Недоступные варианты: {', '.join(missing)}")
-        return found
+        missing_ids = [variant_id for variant_id in variant_ids if variant_id not in found]
+        if missing_ids:
+            replacement_rows = (
+                self.db.query(Product, ProductListing, ProductListingVariant, Source, SourceSetting)
+                .join(ProductListingMember, ProductListingMember.product_id == Product.id)
+                .join(ProductListing, ProductListing.id == ProductListingMember.listing_id)
+                .join(ProductListingVariant, ProductListingVariant.listing_id == ProductListing.id)
+                .join(Source, Source.id == ProductListing.source_id)
+                .outerjoin(SourceSetting, SourceSetting.source_id == Source.id)
+                .filter(Product.id.in_([product_ids[variant_id] for variant_id in missing_ids]))
+                .filter(Product.lifecycle_status == "active")
+                .filter(Product.visibility_status == "visible")
+                .filter(Product.dedup_status == "independent")
+                .filter(ProductListing.orderability_status == "orderable")
+                .filter(ProductListingVariant.is_orderable.is_(True))
+                .all()
+            )
+            replacements_by_product: dict[int, list[tuple]] = {}
+            for row in replacement_rows:
+                replacements_by_product.setdefault(int(row[0].id), []).append(row)
+            for requested_variant_id in missing_ids:
+                candidates = replacements_by_product.get(product_ids[requested_variant_id], [])
+                # A one-variant product keeps the customer's selection valid after source sync replaces its row ID.
+                if len(candidates) == 1:
+                    product, listing, variant, source, source_setting = candidates[0]
+                    found[requested_variant_id] = _CartVariant(
+                        product=product,
+                        listing=listing,
+                        variant=variant,
+                        source=source,
+                        source_setting=source_setting,
+                        quantity=quantities[requested_variant_id],
+                    )
+
+        unavailable_variant_ids = [
+            *[variant_id for variant_id in variant_ids if variant_id not in found],
+            *[int(variant_id) for variant_id in mismatched],
+        ]
+        return found, unavailable_variant_ids
 
     def _calculate_source_price(
         self,
@@ -116,12 +163,23 @@ class CartPricingService:
         item: _CartVariant,
         settings,
         buyout_surcharge: bool,
+        source_price: float | None = None,
+        compare_at_price: float | None = None,
     ):
         source_setting = item.source_setting
+        use_variant_price = source_price is None
+        effective_source_price = (
+            float(item.variant.price_amount)
+            if use_variant_price and item.variant.price_amount is not None
+            else source_price
+        )
+        effective_compare_at_price = (
+            float(item.variant.compare_at_price_amount)
+            if use_variant_price and item.variant.compare_at_price_amount is not None
+            else compare_at_price
+        )
         return self.pricing.calculate_for_product(
-            source_price=float(item.variant.price_amount)
-            if item.variant.price_amount is not None
-            else None,
+            source_price=effective_source_price,
             source_currency=str(item.variant.currency_code or "").upper() or None,
             weight_grams=(
                 int(item.product.manual_weight_grams)
@@ -165,27 +223,96 @@ class CartPricingService:
             ),
             variants=[
                 {
-                    "price": float(item.variant.price_amount)
-                    if item.variant.price_amount is not None
-                    else None,
+                    "price": effective_source_price,
                     "currency": str(item.variant.currency_code or "").upper() or None,
-                    "compare_at_price": (
-                        float(item.variant.compare_at_price_amount)
-                        if item.variant.compare_at_price_amount is not None
-                        else None
-                    ),
+                    "compare_at_price": effective_compare_at_price,
                     "available": True,
                 }
             ],
             settings=settings,
         )
 
-    def quote(self, items: list[SiteCartQuoteItemRequest]) -> SiteCartQuoteResponse:
-        variant_ids, quantities = self._variant_quantity_by_id(items)
-        variants_by_id = self._find_variants(
-            variant_ids=variant_ids, quantities=quantities
+    def _old_line_total_rub(
+        self,
+        *,
+        item: _CartVariant,
+        settings,
+        buyout_surcharge: bool,
+        current_line_total_rub: float,
+    ) -> float | None:
+        source_price = item.variant.price_amount
+        compare_at_price = item.variant.compare_at_price_amount
+        if (
+            source_price is None
+            or compare_at_price is None
+            or float(compare_at_price) <= float(source_price)
+        ):
+            return None
+        if self._is_fixed_final(item.variant):
+            old_line_total_rub = float(compare_at_price) * item.quantity
+        else:
+            old_price = self._calculate_source_price(
+                item=item,
+                settings=settings,
+                buyout_surcharge=buyout_surcharge,
+                source_price=float(compare_at_price),
+                compare_at_price=None,
+            )
+            if old_price.manual_required or old_price.final_price_rub is None:
+                return None
+            old_line_total_rub = float(old_price.final_price_rub) * item.quantity
+        return self._money(old_line_total_rub) if old_line_total_rub > current_line_total_rub else None
+
+    def _build_svc_tiers(self, *, settings, service_fee_rub: float, service_fee_meta: dict) -> list[SiteCartQuoteSvcTierResponse]:
+        normalized_rules = self.pricing._normalize_svc_rules(
+            [rule.model_dump() if hasattr(rule, "model_dump") else rule for rule in settings.svc_rules]
         )
+        return [
+            SiteCartQuoteSvcTierResponse(
+                min_rub=float(rule["min_rub"]),
+                max_rub=(float(rule["max_rub"]) if rule.get("max_rub") is not None else None),
+                mode=str(rule["mode"]),
+                value=float(rule["value"]),
+                amount_rub=(self._money(service_fee_rub) if service_fee_meta.get("min_rub") == rule.get("min_rub") and service_fee_meta.get("max_rub") == rule.get("max_rub") else None),
+                is_applied=(service_fee_meta.get("min_rub") == rule.get("min_rub") and service_fee_meta.get("max_rub") == rule.get("max_rub")),
+            )
+            for rule in normalized_rules
+        ]
+
+    def quote(self, items: list[SiteCartQuoteItemRequest]) -> SiteCartQuoteResponse:
         settings = self.pricing.get_settings(refresh_bybit=False)
+        variant_ids, quantities, product_ids = self._variant_quantity_by_id(items)
+        variants_by_id, unavailable_variant_ids = self._find_variants(
+            variant_ids=variant_ids,
+            quantities=quantities,
+            product_ids=product_ids,
+        )
+        if not variants_by_id:
+            # An empty basket has no applicable SVC charge, but still exposes all configured tiers for the UI.
+            service_fee_rub, service_fee_meta = 0.0, {}
+            normalized_rules = self.pricing._normalize_svc_rules(
+                [rule.model_dump() if hasattr(rule, "model_dump") else rule for rule in settings.svc_rules]
+            )
+            return SiteCartQuoteResponse(
+                items=[],
+                unavailable_variant_ids=unavailable_variant_ids,
+                original_total_rub=0.0,
+                final_total_rub=0.0,
+                total_rub=0.0,
+                svc_tiers=self._build_svc_tiers(
+                    settings=settings,
+                    service_fee_rub=service_fee_rub,
+                    service_fee_meta=service_fee_meta,
+                ),
+                svc_progress=SiteCartQuoteSvcProgressResponse(
+                    preorder_subtotal_rub=0.0,
+                    applied_amount_rub=0.0,
+                    next_threshold_rub=next(
+                        (float(rule["min_rub"]) for rule in normalized_rules if float(rule["min_rub"]) > 0),
+                        None,
+                    ),
+                ),
+            )
         settings_without_svc = settings.model_copy(update={"svc_rules": []})
 
         source_surcharge_applied: set[int] = set()
@@ -205,13 +332,20 @@ class CartPricingService:
                         f"Вариант {variant_id} не имеет финальной цены"
                     )
                 line_total = float(item.variant.price_amount) * quantity
+                current_line_total_rub = self._money(line_total)
                 quote_items.append(
                     SiteCartQuoteItemResponse(
                         variant_id=variant_id,
                         quantity=quantity,
                         availability="preorder" if is_preorder else "in_stock",
-                        original_line_total_rub=self._money(line_total),
-                        final_line_total_rub=self._money(line_total),
+                        original_line_total_rub=current_line_total_rub,
+                        old_line_total_rub=self._old_line_total_rub(
+                            item=item,
+                            settings=settings,
+                            buyout_surcharge=True,
+                            current_line_total_rub=current_line_total_rub,
+                        ),
+                        final_line_total_rub=current_line_total_rub,
                     )
                 )
                 continue
@@ -222,6 +356,13 @@ class CartPricingService:
             if current.manual_required or current.final_price_rub is None:
                 raise ValidationError(f"Вариант {variant_id} недоступен для расчета")
             original_line_total = float(current.final_price_rub) * quantity
+            current_line_total_rub = self._money(original_line_total)
+            old_line_total_rub = self._old_line_total_rub(
+                item=item,
+                settings=settings,
+                buyout_surcharge=True,
+                current_line_total_rub=current_line_total_rub,
+            )
 
             if not is_preorder:
                 quote_items.append(
@@ -229,8 +370,9 @@ class CartPricingService:
                         variant_id=variant_id,
                         quantity=quantity,
                         availability="in_stock",
-                        original_line_total_rub=self._money(original_line_total),
-                        final_line_total_rub=self._money(original_line_total),
+                        original_line_total_rub=current_line_total_rub,
+                        old_line_total_rub=old_line_total_rub,
+                        final_line_total_rub=current_line_total_rub,
                     )
                 )
                 continue
@@ -277,7 +419,8 @@ class CartPricingService:
                     variant_id=variant_id,
                     quantity=quantity,
                     availability="preorder",
-                    original_line_total_rub=self._money(original_line_total),
+                    original_line_total_rub=current_line_total_rub,
+                    old_line_total_rub=old_line_total_rub,
                     final_line_total_rub=self._money(final_line_total),
                 )
             )
@@ -303,25 +446,11 @@ class CartPricingService:
         normalized_rules = self.pricing._normalize_svc_rules(
             [rule.model_dump() if hasattr(rule, "model_dump") else rule for rule in settings.svc_rules]
         )
-        svc_tiers = []
-        for rule in normalized_rules:
-            is_applied = service_fee_meta.get("min_rub") == rule.get(
-                "min_rub"
-            ) and service_fee_meta.get("max_rub") == rule.get("max_rub")
-            svc_tiers.append(
-                SiteCartQuoteSvcTierResponse(
-                    min_rub=float(rule["min_rub"]),
-                    max_rub=(
-                        float(rule["max_rub"])
-                        if rule.get("max_rub") is not None
-                        else None
-                    ),
-                    mode=str(rule["mode"]),
-                    value=float(rule["value"]),
-                    amount_rub=(self._money(service_fee_rub) if is_applied else None),
-                    is_applied=is_applied,
-                )
-            )
+        svc_tiers = self._build_svc_tiers(
+            settings=settings,
+            service_fee_rub=service_fee_rub,
+            service_fee_meta=service_fee_meta,
+        )
         next_threshold_rub = next(
             (
                 float(rule["min_rub"])
@@ -330,12 +459,16 @@ class CartPricingService:
             ),
             None,
         )
-        original_total_rub = sum(item.original_line_total_rub for item in quote_items)
-        final_total_rub = sum(item.final_line_total_rub for item in quote_items)
+        # These totals compare equivalent cart calculations. `original_total_rub` is
+        # the per-line calculation before consolidating SVC and “Выкуп +” across the
+        # basket; it must never be derived from item compare-at prices.
+        original_total_rub = self._money(sum(item.original_line_total_rub for item in quote_items))
+        final_total_rub = self._money(sum(item.final_line_total_rub for item in quote_items))
         return SiteCartQuoteResponse(
             items=quote_items,
-            original_total_rub=self._money(original_total_rub),
-            final_total_rub=self._money(final_total_rub),
+            unavailable_variant_ids=unavailable_variant_ids,
+            original_total_rub=original_total_rub,
+            final_total_rub=final_total_rub,
             total_rub=self._money(final_total_rub),
             svc_tiers=svc_tiers,
             svc_progress=SiteCartQuoteSvcProgressResponse(

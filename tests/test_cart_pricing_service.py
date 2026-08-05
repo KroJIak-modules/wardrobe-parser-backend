@@ -23,7 +23,7 @@ from app.services.catalog.site_access_service import SiteAccessService
 from app.services.settings.pricing_service import PricingSettingsService
 
 
-def _create_quote_variants(db) -> tuple[int, int, int]:
+def _create_quote_variants(db) -> tuple[int, int, int, int, int]:
     marker = uuid4().hex[:8]
     supplier = Supplier(
         key=f"cart-supplier-{marker}",
@@ -97,6 +97,7 @@ def _create_quote_variants(db) -> tuple[int, int, int]:
         position=1,
         title="Preorder one",
         price_amount=100.0,
+        compare_at_price_amount=200.0,
         currency_code="USD",
         pricing_mode="source",
         is_orderable=True,
@@ -106,6 +107,7 @@ def _create_quote_variants(db) -> tuple[int, int, int]:
         position=2,
         title="Preorder two",
         price_amount=100.0,
+        compare_at_price_amount=200.0,
         currency_code="USD",
         pricing_mode="source",
         is_orderable=True,
@@ -152,7 +154,13 @@ def _create_quote_variants(db) -> tuple[int, int, int]:
     )
     db.add(fixed)
     db.flush()
-    return int(first.id), int(second.id), int(fixed.id)
+    return (
+        int(preorder_product.id),
+        int(in_stock_product.id),
+        int(first.id),
+        int(second.id),
+        int(fixed.id),
+    )
 
 
 def test_cart_quote_applies_preorder_source_surcharge_and_svc_once() -> None:
@@ -176,14 +184,14 @@ def test_cart_quote_applies_preorder_source_surcharge_and_svc_once() -> None:
         pricing.svc_rules = [
             {"min_rub": 0.0, "max_rub": None, "mode": "fixed_rub", "value": 500.0}
         ]
-        first_id, second_id, fixed_id = _create_quote_variants(db)
+        preorder_product_id, in_stock_product_id, first_id, second_id, fixed_id = _create_quote_variants(db)
         db.flush()
 
         quote = CartPricingService(db).quote(
             [
-                SiteCartQuoteItemRequest(variant_id=first_id, quantity=1),
-                SiteCartQuoteItemRequest(variant_id=second_id, quantity=1),
-                SiteCartQuoteItemRequest(variant_id=fixed_id, quantity=1),
+                SiteCartQuoteItemRequest(product_id=preorder_product_id, variant_id=first_id, quantity=1),
+                SiteCartQuoteItemRequest(product_id=preorder_product_id, variant_id=second_id, quantity=1),
+                SiteCartQuoteItemRequest(product_id=in_stock_product_id, variant_id=fixed_id, quantity=1),
             ]
         )
 
@@ -197,12 +205,82 @@ def test_cart_quote_applies_preorder_source_surcharge_and_svc_once() -> None:
             11500.0,
             5000.0,
         ]
+        assert quote.items[0].old_line_total_rub is not None
+        assert quote.items[0].old_line_total_rub > quote.items[0].original_line_total_rub
+        assert quote.items[1].old_line_total_rub is not None
+        assert quote.items[1].old_line_total_rub > quote.items[1].original_line_total_rub
+        assert quote.items[2].old_line_total_rub is None
+        # This baseline represents only cart-level SVC and “Выкуп +” consolidation,
+        # not product compare-at prices.
         assert quote.svc_progress.preorder_subtotal_rub == 21000.0
         assert quote.svc_progress.applied_amount_rub == 500.0
         assert quote.final_total_rub == quote.total_rub == 26500.0
         assert quote.original_total_rub == 28000.0
+        assert quote.original_total_rub > quote.final_total_rub
         assert quote.svc_tiers[0].is_applied is True
         assert quote.svc_tiers[0].amount_rub == 500.0
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_cart_quote_total_baseline_ignores_product_compare_at_without_cart_benefit() -> None:
+    db = SessionLocal()
+    try:
+        pricing, _ = PricingSettingsService(db)._get_or_create_pricing_entity()
+        pricing.markup_multiplier = 1.0
+        pricing.weight_tolerance = 1.0
+        pricing.customs_threshold_eur = 1_000_000.0
+        pricing.customs_duty_rate = 0.0
+        pricing.payment_fee_rate = 0.0
+        pricing.customs_processing_rate = 0.0
+        pricing.customs_fixed_rub = 0.0
+        pricing.tax_rate = 0.0
+        pricing.usdt_to_rub_rate = 100.0
+        pricing.usd_to_rub_rate = 100.0
+        pricing.eur_to_usd_rate = 1.0
+        pricing.eur_to_rub_rate = 100.0
+        pricing.usdt_extra_rub = 0.0
+        pricing.final_rounding_mode = "none"
+        pricing.svc_rules = []
+        preorder_product_id, _, first_id, _, _ = _create_quote_variants(db)
+        db.flush()
+
+        quote = CartPricingService(db).quote([
+            SiteCartQuoteItemRequest(product_id=preorder_product_id, variant_id=first_id, quantity=1),
+        ])
+
+        assert quote.items[0].final_line_total_rub == quote.final_total_rub
+        assert quote.items[0].old_line_total_rub is not None
+        assert quote.items[0].old_line_total_rub > quote.final_total_rub
+        # The product is discounted, but that must not create a total discount.
+        assert quote.original_total_rub == quote.final_total_rub
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_empty_cart_quote_exposes_configured_svc_tiers() -> None:
+    db = SessionLocal()
+    try:
+        pricing, _ = PricingSettingsService(db)._get_or_create_pricing_entity()
+        pricing.svc_rules = [
+            {"min_rub": 0.0, "max_rub": 10_000.0, "mode": "fixed_rub", "value": 900.0},
+            {"min_rub": 10_000.0, "max_rub": None, "mode": "fixed_rub", "value": 500.0},
+        ]
+        db.flush()
+
+        quote = CartPricingService(db).quote([])
+
+        assert quote.items == []
+        assert quote.original_total_rub == quote.final_total_rub == quote.total_rub == 0.0
+        assert [(tier.min_rub, tier.max_rub) for tier in quote.svc_tiers] == [
+            (0.0, 10_000.0),
+            (10_000.0, None),
+        ]
+        assert not any(tier.is_applied for tier in quote.svc_tiers)
+        assert quote.svc_progress.preorder_subtotal_rub == 0.0
+        assert quote.svc_progress.next_threshold_rub == 10_000.0
     finally:
         db.rollback()
         db.close()

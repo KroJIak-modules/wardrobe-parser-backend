@@ -213,6 +213,7 @@ class SiteCatalogProductResponse(BaseModel):
     brand: SiteCatalogProductBrand
     name: str
     price_rub: int | None = None
+    old_price_rub: int | None = None
     status: Literal["in_stock", "preorder", "sold_out"]
     image_url: str | None = None
 
@@ -316,6 +317,7 @@ class SiteQuestionsResponse(BaseModel):
 class SiteCartQuoteItemRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    product_id: int = Field(gt=0)
     variant_id: int = Field(gt=0)
     quantity: int = Field(gt=0, le=100)
 
@@ -323,7 +325,7 @@ class SiteCartQuoteItemRequest(BaseModel):
 class SiteCartQuoteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    items: list[SiteCartQuoteItemRequest] = Field(min_length=1, max_length=100)
+    items: list[SiteCartQuoteItemRequest] = Field(default_factory=list, max_length=100)
 
 
 class SiteCartQuoteItemResponse(BaseModel):
@@ -333,6 +335,7 @@ class SiteCartQuoteItemResponse(BaseModel):
     quantity: int
     availability: Literal["in_stock", "preorder"]
     original_line_total_rub: float
+    old_line_total_rub: float | None = None
     final_line_total_rub: float
 
 
@@ -359,6 +362,9 @@ class SiteCartQuoteResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     items: list[SiteCartQuoteItemResponse] = Field(default_factory=list)
+    unavailable_variant_ids: list[int] = Field(default_factory=list)
+    # The price before cart-wide SVC/source-surcharge consolidation. It deliberately
+    # excludes each product's compare-at price, which belongs to the line item only.
     original_total_rub: float
     final_total_rub: float
     total_rub: float

@@ -175,6 +175,21 @@ class CatalogProductRepository:
             )
             .subquery("site_catalog_first_listing_image")
         )
+        representative_variant_sq = (
+            self.session.query(
+                ProductListingVariant.listing_id.label("listing_id"),
+                ProductListingVariant.price_amount.label("price_amount"),
+                ProductListingVariant.compare_at_price_amount.label("compare_at_price_amount"),
+                func.row_number()
+                .over(
+                    partition_by=ProductListingVariant.listing_id,
+                    order_by=(ProductListingVariant.position.asc(), ProductListingVariant.id.asc()),
+                )
+                .label("rn"),
+            )
+            .filter(ProductListingVariant.is_orderable.is_(True))
+            .subquery("site_catalog_representative_variant")
+        )
         gallery_scope_sq = (
             self.session.query(
                 ProductListingGalleryImage.product_id.label("product_id"),
@@ -224,6 +239,8 @@ class CatalogProductRepository:
             self.session.query(
                 Product.id.label("product_id"),
                 Product.site_sort_price_rub.label("site_sort_price_rub"),
+                representative_variant_sq.c.compare_at_price_amount.label("compare_at_price_amount"),
+                representative_variant_sq.c.price_amount.label("price_amount"),
                 Product.availability_mode.label("availability_mode"),
                 Product.dedup_status.label("dedup_status"),
                 ProductListing.orderability_status.label("orderability_status"),
@@ -241,6 +258,13 @@ class CatalogProductRepository:
                 gallery_scope_sq.c.product_id.label("gallery_scope_product_id"),
             )
             .join(ProductListing, ProductListing.id == Product.primary_listing_id)
+            .outerjoin(
+                representative_variant_sq,
+                and_(
+                    representative_variant_sq.c.listing_id == ProductListing.id,
+                    representative_variant_sq.c.rn == 1,
+                ),
+            )
             .outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
             .outerjoin(Designer, Designer.id == Product.designer_id)
             .outerjoin(SourceSetting, SourceSetting.source_id == ProductListing.source_id)
