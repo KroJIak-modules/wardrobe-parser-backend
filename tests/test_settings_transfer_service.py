@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from app.core.database import SessionLocal
 from app.core.source_identity import normalize_base_url
-from app.models import Designer, DesignerSourceName, ImageAsset, ProductListing, ShowcaseCarouselImage, ShowcaseSetting, Source, SourceSetting, Supplier
+from app.models import AdminRole, Designer, DesignerSourceName, ImageAsset, ProductListing, ShowcaseCarouselImage, ShowcaseSetting, Source, SourceSetting, Supplier
 from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.source_registry_service import SourceRegistryService
 from app.services.settings.settings_transfer_service import SettingsTransferService
@@ -230,6 +230,38 @@ def test_settings_transfer_roundtrip_covers_manual_source_designers_taxonomy_and
                 if file_path.exists():
                     file_path.unlink()
                 db.delete(asset)
+        db.commit()
+        db.close()
+
+
+def test_settings_transfer_roundtrip_restores_roles_without_exporting_admin_users() -> None:
+    db = SessionLocal()
+    marker = uuid4().hex[:10]
+    role_name = f"Transfer role {marker}"
+    original_payload = SettingsTransferService(db).export_payload()
+    restore_payload = original_payload.model_copy(deep=True)
+    try:
+        payload_data = original_payload.model_dump()
+        payload_data["roles"] = [
+            *payload_data["roles"],
+            {
+                "name": role_name,
+                "description": f"Description {marker}",
+                "permissions": ["control.settings.read", "control.sources.edit", "control.settings.read"],
+            },
+        ]
+        payload = original_payload.__class__.model_validate(payload_data)
+        result = SettingsTransferService(db).import_payload(payload)
+        assert result.ok is True
+        assert result.imported_counts["roles_upserted"] == len(payload.roles)
+
+        exported = SettingsTransferService(db).export_payload()
+        imported_role = next(item for item in exported.roles if item.name == role_name)
+        assert imported_role.description == f"Description {marker}"
+        assert imported_role.permissions == ["control.settings.read", "control.sources.edit"]
+    finally:
+        SettingsTransferService(db).import_payload(restore_payload)
+        db.query(AdminRole).filter(AdminRole.name == role_name).delete(synchronize_session=False)
         db.commit()
         db.close()
 

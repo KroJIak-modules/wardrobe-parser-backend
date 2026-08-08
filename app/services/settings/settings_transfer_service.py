@@ -13,6 +13,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import (
+    AdminRole,
     AdminUiSettings,
     Designer,
     DesignerSourceName,
@@ -65,6 +66,7 @@ from app.schemas.admin_settings import (
     SettingsTransferPayload,
     SettingsTransferPricingSettings,
     SettingsTransferResponse,
+    SettingsTransferRoleEntry,
     SettingsTransferSourceEntry,
     SettingsTransferSupplierEntry,
     SettingsTransferTaxonomyCustomCatalog,
@@ -84,8 +86,9 @@ from app.schemas.admin_settings import (
 from app.schemas.showcase_media import ShowcaseStateUpdateRequest
 from app.services.catalog.site_content_service import SiteContentService
 from app.services.auth.passwords import hash_password
+from app.services.auth.permissions import normalize_permission_list
 
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 _PROJECT_NAME = "wardrobe-parser-platform"
 
 _PRICING_EXPORT_FIELDS = [
@@ -390,6 +393,7 @@ class SettingsTransferService:
         showcase_setting = self.db.query(ShowcaseSetting).order_by(ShowcaseSetting.id.asc()).first()
 
         supplier_by_id = {int(supplier.id): supplier for supplier in suppliers}
+        role_rows = self.db.query(AdminRole).order_by(AdminRole.name.asc(), AdminRole.id.asc()).all()
         designer_rows = (
             self.db.query(Designer)
             .order_by(Designer.name.asc(), Designer.id.asc())
@@ -536,6 +540,15 @@ class SettingsTransferService:
             project=_PROJECT_NAME,
             pricing_settings=pricing,
             admin_ui_settings=admin_ui,
+            roles=[
+                SettingsTransferRoleEntry(
+                    name=str(role.name),
+                    description=(str(role.description) if role.description is not None else None),
+                    permissions=normalize_permission_list(role.permissions),
+                )
+                for role in role_rows
+                if str(role.name or "").strip()
+            ],
             suppliers=supplier_entries,
             sources=source_entries,
             weight_rules=weight_entries,
@@ -609,6 +622,7 @@ class SettingsTransferService:
             supplier_map = self._import_suppliers(payload.suppliers)
             pricing_updated = self._import_pricing(payload.pricing_settings)
             admin_ui_updated = self._import_admin_ui(payload.admin_ui_settings)
+            roles_updated = self._import_roles(payload.roles)
             designer_count = self._import_designers(payload.designers)
             designer_source_names_updated = self._import_designer_source_names(payload.designer_source_names)
             source_count = self._import_sources(payload.sources, supplier_map=supplier_map, asset_map=asset_map)
@@ -630,6 +644,7 @@ class SettingsTransferService:
                 imported_counts={
                     "pricing_settings_updated": pricing_updated,
                     "admin_ui_settings_updated": admin_ui_updated,
+                    "roles_upserted": roles_updated,
                     "suppliers_upserted": len(supplier_map),
                     "image_assets_upserted": len(asset_map),
                     "sources_upserted": source_count,
@@ -889,7 +904,7 @@ class SettingsTransferService:
                 for category in payload.showcase_categories
             ],
         )
-        return self.taxonomy.replace_state(state)
+        return self.taxonomy.replace_state(state, commit=False)
 
     def _import_showcase_media(
         self,
@@ -1258,6 +1273,29 @@ class SettingsTransferService:
                 setattr(row, key, raw_value)
                 updated_fields += 1
         return updated_fields
+
+    def _import_roles(self, roles: list[SettingsTransferRoleEntry]) -> int:
+        """Upsert portable authorization policies without copying user identities."""
+        existing_by_name = {
+            str(role.name or "").strip(): role
+            for role in self.db.query(AdminRole).order_by(AdminRole.id.asc()).all()
+            if str(role.name or "").strip()
+        }
+        imported = 0
+        for item in roles:
+            name = str(item.name or "").strip()
+            if not name:
+                continue
+            role = existing_by_name.get(name)
+            if role is None:
+                role = AdminRole(name=name)
+                self.db.add(role)
+                existing_by_name[name] = role
+            role.description = (str(item.description) if item.description is not None else None)
+            role.permissions = normalize_permission_list(item.permissions)
+            imported += 1
+        self.db.flush()
+        return imported
 
     def _import_suppliers(self, suppliers: list[SettingsTransferSupplierEntry]) -> dict[str, Supplier]:
         existing = {str(item.key): item for item in self.supplier_repo.list_all_with_rates()}

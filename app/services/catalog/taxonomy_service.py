@@ -641,7 +641,8 @@ class TaxonomyService:
             return
         assignments.enqueue_all_active_product_ids_after_commit()
 
-    def replace_state(self, payload: TaxonomyState) -> TaxonomyState:
+    def replace_state(self, payload: TaxonomyState, *, commit: bool = True) -> TaxonomyState:
+        """Replace editable taxonomy state within the caller's transaction."""
         current_state = self.get_state()
         prepared = self._prepare_payload(payload)
         filter_assignment_update_plan = self._build_filter_assignment_update_plan(
@@ -755,12 +756,15 @@ class TaxonomyService:
                     )
 
             self._schedule_filter_assignment_update(filter_assignment_update_plan)
-            self.db.commit()
+            if commit:
+                self.db.commit()
         except HTTPException:
-            self.db.rollback()
+            if commit:
+                self.db.rollback()
             raise
         except Exception:
-            self.db.rollback()
+            if commit:
+                self.db.rollback()
             raise
         return self.get_state()
 

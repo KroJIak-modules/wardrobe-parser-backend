@@ -213,6 +213,12 @@ class SettingsTransferAdminUiSettings(BaseModel):
     auto_sync_period_minutes: int = Field(ge=60, le=1_000_000, default=60)
 
 
+class SettingsTransferRoleEntry(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = None
+    permissions: list[str] = Field(default_factory=list)
+
+
 class SettingsTransferSupplierRateEntry(BaseModel):
     min_kg: float = Field(ge=0.0, le=100000.0)
     max_kg: float | None = Field(default=None, ge=0.0, le=100000.0)
@@ -368,6 +374,7 @@ class SettingsTransferPayload(BaseModel):
     project: str | None = None
     pricing_settings: SettingsTransferPricingSettings
     admin_ui_settings: SettingsTransferAdminUiSettings
+    roles: list[SettingsTransferRoleEntry] = Field(default_factory=list)
     suppliers: list[SettingsTransferSupplierEntry] = Field(default_factory=list)
     sources: list[SettingsTransferSourceEntry] = Field(default_factory=list)
     weight_rules: list[SettingsTransferWeightRuleEntry] = Field(default_factory=list)
