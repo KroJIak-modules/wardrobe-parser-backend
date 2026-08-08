@@ -685,9 +685,19 @@ class SiteQueryService:
         ]
         product_rows = self.products.products.list_site_catalog_card_rows_by_ids(product_ids)
         row_by_product_id = {int(row.product_id): row for row in product_rows}
+        discounted_product_ids = [
+            int(row.product_id)
+            for row in product_rows
+            if getattr(row, "representative_listing_id", None) is not None
+            and getattr(row, "site_sort_price_rub", None) is not None
+            and getattr(row, "price_amount", None) is not None
+            and getattr(row, "compare_at_price_amount", None) is not None
+            and float(getattr(row, "price_amount")) > 0
+            and float(getattr(row, "compare_at_price_amount")) > float(getattr(row, "price_amount"))
+        ]
         products_by_id = {
             int(product.id): product
-            for product in self.products.products.list_products_by_ids(product_ids, include_merged=False)
+            for product in self.products.products.list_products_for_site_catalog_old_price_by_ids(discounted_product_ids)
         }
         items = []
         for product_id in product_ids:

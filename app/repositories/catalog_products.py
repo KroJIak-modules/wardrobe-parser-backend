@@ -136,6 +136,45 @@ class CatalogProductRepository:
             .all()
         )
 
+    def list_products_for_site_catalog_old_price_by_ids(self, product_ids: Iterable[int]) -> list[Product]:
+        """Load only the relations needed to recalculate a discounted card's old price.
+
+        Catalogue cards already receive their display fields in one projection query.
+        The only relation-backed calculation left is old-price recalculation through
+        the shared pricing pipeline.  Do not reuse the detail loader here: loading
+        variants, images, galleries, and presentations makes SQLAlchemy hydrate a
+        large cartesian result for every first catalogue page.
+        """
+        normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
+        if not normalized_ids:
+            return []
+        return (
+            self.session.query(Product)
+            .options(
+                load_only(Product.id, Product.manual_weight_grams),
+                joinedload(Product.weight_rule).load_only(WeightRule.id, WeightRule.weight_grams),
+                selectinload(Product.memberships)
+                .load_only(ProductListingMember.product_id, ProductListingMember.listing_id)
+                .selectinload(ProductListingMember.listing)
+                .load_only(ProductListing.id, ProductListing.source_id, ProductListing.source_weight_grams)
+                .selectinload(ProductListing.source)
+                .load_only(Source.id)
+                .selectinload(Source.setting)
+                .load_only(
+                    SourceSetting.source_id,
+                    SourceSetting.supplier_id,
+                    SourceSetting.promo_factor,
+                    SourceSetting.promo_only_no_discount,
+                    SourceSetting.buyout_surcharge_value,
+                    SourceSetting.buyout_surcharge_currency,
+                ),
+            )
+            .filter(Product.id.in_(normalized_ids))
+            .filter(Product.lifecycle_status == "active")
+            .order_by(Product.id.asc())
+            .all()
+        )
+
     def list_products_for_site_price_sort_by_ids(self, product_ids: Iterable[int]) -> list[Product]:
         normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
         if not normalized_ids:

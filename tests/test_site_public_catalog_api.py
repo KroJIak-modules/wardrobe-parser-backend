@@ -335,7 +335,11 @@ def test_site_catalog_products_use_lightweight_card_query() -> None:
         def _fail_build_public_payload(*args, **kwargs):
             raise AssertionError("catalog_products should not build full public payloads for catalog cards")
 
+        def _fail_detail_loader(*args, **kwargs):
+            raise AssertionError("catalog_products should not hydrate the full product detail graph for cards")
+
         service.products.build_public_product_payload = _fail_build_public_payload  # type: ignore[method-assign]
+        service.products.products.list_products_by_ids = _fail_detail_loader  # type: ignore[method-assign]
 
         payload = service.catalog_products(
             limit=10,
@@ -353,6 +357,7 @@ def test_site_catalog_products_use_lightweight_card_query() -> None:
         assert payload.total == 1
         assert payload.items[0].id == product_id
         assert payload.items[0].price_rub == 16500
+        assert payload.items[0].old_price_rub == 22000
         assert payload.items[0].status == "in_stock"
         assert payload.items[0].brand.name == f"Site public designer {marker}"
         assert str(payload.items[0].image_url or "").startswith("/api/v1/products/images/")
