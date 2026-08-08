@@ -7,17 +7,6 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class SettingsTransferImageAssetEntry(BaseModel):
-    checksum_sha256: str = Field(min_length=64, max_length=64)
-    scope: str = Field(min_length=1, max_length=255)
-    file_name: str = Field(min_length=1, max_length=255)
-    mime_type: str = Field(min_length=1, max_length=255)
-    byte_size: int = Field(ge=0)
-    width_px: int | None = Field(default=None, ge=1, le=20000)
-    height_px: int | None = Field(default=None, ge=1, le=20000)
-    content_base64: str = Field(min_length=1)
-
-
 class WeightRuleKeywordRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=255)
 
@@ -254,7 +243,6 @@ class SettingsTransferSourceEntry(BaseModel):
     promo_only_no_discount: bool = False
     buyout_surcharge_value: float | None = Field(default=None, ge=0.0, le=100000000.0)
     buyout_surcharge_currency: str | None = Field(default=None, min_length=3, max_length=3)
-    logo_asset_checksum: str | None = Field(default=None, min_length=64, max_length=64)
 
 
 class SettingsTransferWeightRuleEntry(BaseModel):
@@ -318,22 +306,8 @@ class SettingsTransferTaxonomyState(BaseModel):
     showcase_categories: list[SettingsTransferTaxonomyShowcaseCategory] = Field(default_factory=list)
 
 
-class SettingsTransferShowcaseCarouselEntry(BaseModel):
-    asset_checksum: str = Field(min_length=64, max_length=64)
-    viewport: Literal["desktop", "mobile"]
-    position: int = Field(ge=1, le=1000)
-
-
-class SettingsTransferShowcaseMedia(BaseModel):
-    desktop_hero_asset_checksum: str | None = Field(default=None, min_length=64, max_length=64)
-    mobile_hero_asset_checksum: str | None = Field(default=None, min_length=64, max_length=64)
-    desktop_carousel: list[SettingsTransferShowcaseCarouselEntry] = Field(default_factory=list)
-    mobile_carousel: list[SettingsTransferShowcaseCarouselEntry] = Field(default_factory=list)
-
-
 class SettingsTransferSiteAbout(BaseModel):
     text: str = ""
-    photo_asset_checksums: list[str] = Field(default_factory=list)
 
 
 class SettingsTransferSiteQuestionItem(BaseModel):
@@ -349,7 +323,6 @@ class SettingsTransferSiteNotification(BaseModel):
     description: str = ""
     button_text: str = ""
     button_url: str = ""
-    image_asset_checksum: str | None = Field(default=None, min_length=64, max_length=64)
     version: int = Field(default=1, ge=1, le=1000000)
     position: int = Field(default=1, ge=1, le=1000000)
 
@@ -381,9 +354,7 @@ class SettingsTransferPayload(BaseModel):
     designers: list[SettingsTransferDesignerEntry] = Field(default_factory=list)
     designer_source_names: list[SettingsTransferDesignerSourceNameEntry] = Field(default_factory=list)
     taxonomy: SettingsTransferTaxonomyState = Field(default_factory=SettingsTransferTaxonomyState)
-    showcase_media: SettingsTransferShowcaseMedia = Field(default_factory=SettingsTransferShowcaseMedia)
     site_content: SettingsTransferSiteContent = Field(default_factory=SettingsTransferSiteContent)
-    image_assets: list[SettingsTransferImageAssetEntry] = Field(default_factory=list)
 
 
 class SettingsTransferResponse(BaseModel):

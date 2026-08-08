@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import base64
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from hashlib import sha256
 import re
 
 from fastapi import HTTPException, status
@@ -17,19 +15,15 @@ from app.models import (
     AdminUiSettings,
     Designer,
     DesignerSourceName,
-    ImageAsset,
     PricingSetting,
     Product,
     ProductListing,
-    SiteAboutPhoto,
     SiteAboutSetting,
     SiteAccessSetting,
     SiteNotificationSetting,
     SiteQuestionItem,
     Source,
     SourceSetting,
-    ShowcaseCarouselImage,
-    ShowcaseSetting,
     Supplier,
     SupplierShippingRate,
     WeightRule,
@@ -44,8 +38,6 @@ from app.repositories import (
 from app.services.catalog.designer_support import slugify_designer_name
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.catalog_defaults_service import CatalogDefaultsService
-from app.services.catalog.media_asset_service import MediaAssetService
-from app.services.catalog.showcase_service import ShowcaseService
 from app.services.catalog.source_registry_service import SourceRegistryService
 from app.services.catalog.taxonomy_service import TaxonomyService
 from app.core.source_identity import normalize_base_url
@@ -62,7 +54,6 @@ from app.schemas.admin_settings import (
     SettingsTransferAdminUiSettings,
     SettingsTransferDesignerEntry,
     SettingsTransferDesignerSourceNameEntry,
-    SettingsTransferImageAssetEntry,
     SettingsTransferPayload,
     SettingsTransferPricingSettings,
     SettingsTransferResponse,
@@ -74,8 +65,6 @@ from app.schemas.admin_settings import (
     SettingsTransferTaxonomyShowcaseAttachment,
     SettingsTransferTaxonomyShowcaseCategory,
     SettingsTransferTaxonomyState,
-    SettingsTransferShowcaseCarouselEntry,
-    SettingsTransferShowcaseMedia,
     SettingsTransferSiteAccess,
     SettingsTransferSiteAbout,
     SettingsTransferSiteContent,
@@ -83,8 +72,6 @@ from app.schemas.admin_settings import (
     SettingsTransferSiteQuestionItem,
     SettingsTransferWeightRuleEntry,
 )
-from app.schemas.showcase_media import ShowcaseStateUpdateRequest
-from app.services.catalog.site_content_service import SiteContentService
 from app.services.auth.passwords import hash_password
 from app.services.auth.permissions import normalize_permission_list
 
@@ -151,62 +138,11 @@ class SettingsTransferService:
         self.supplier_repo = CatalogSupplierRepository(db)
         self.source_repo = CatalogSourceRepository(db)
         self.weight_rule_repo = CatalogWeightRuleRepository(db)
-        self.media_assets = MediaAssetService(db)
         self.taxonomy = TaxonomyService(db)
 
     @staticmethod
     def _normalize_designer_key(raw: str | None) -> str:
         return " ".join(str(raw or "").strip().split()).lower()
-
-    @staticmethod
-    def _asset_scope_for_export(asset: ImageAsset, *, fallback: str) -> str:
-        explicit_scope = str(getattr(asset, "scope", "") or "").strip()
-        if explicit_scope:
-            return explicit_scope
-        raw = str(getattr(asset, "storage_key", "") or "").strip()
-        if not raw or "/" not in raw:
-            return fallback
-        prefix = raw.split("/", 1)[0].strip()
-        return prefix or fallback
-
-    @staticmethod
-    def _asset_file_name(storage_key: str | None, *, fallback: str) -> str:
-        raw = str(storage_key or "").strip()
-        if not raw or "/" not in raw:
-            return fallback
-        file_name = raw.rsplit("/", 1)[-1].strip()
-        return file_name or fallback
-
-    def _export_image_assets(self, assets: list[tuple[ImageAsset, str]]) -> list[SettingsTransferImageAssetEntry]:
-        seen_asset_keys: set[tuple[str, str]] = set()
-        entries: list[SettingsTransferImageAssetEntry] = []
-        for asset, default_scope in assets:
-            checksum = str(getattr(asset, "checksum_sha256", "") or "").strip()
-            scope = self._asset_scope_for_export(asset, fallback=default_scope)
-            asset_key = (scope, checksum)
-            if not checksum or asset_key in seen_asset_keys:
-                continue
-            file_path = self.media_assets.resolve_file_path(asset)
-            if not file_path.exists():
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Медиафайл не найден: {asset.storage_key}",
-                )
-            content = file_path.read_bytes()
-            seen_asset_keys.add(asset_key)
-            entries.append(
-                SettingsTransferImageAssetEntry(
-                    checksum_sha256=checksum,
-                    scope=scope,
-                    file_name=self._asset_file_name(getattr(asset, "storage_key", None), fallback=f"{checksum}.bin"),
-                    mime_type=str(getattr(asset, "mime_type", "") or "application/octet-stream"),
-                    byte_size=int(getattr(asset, "byte_size", 0) or 0),
-                    width_px=(int(asset.width_px) if getattr(asset, "width_px", None) is not None else None),
-                    height_px=(int(asset.height_px) if getattr(asset, "height_px", None) is not None else None),
-                    content_base64=base64.b64encode(content).decode("ascii"),
-                )
-            )
-        return entries
 
     @classmethod
     def _serialize_taxonomy_filters(cls, nodes: list[TaxonomyFilterNode]) -> list[SettingsTransferTaxonomyFilterNode]:
@@ -289,12 +225,6 @@ class SettingsTransferService:
             .order_by(SiteNotificationSetting.created_at.asc(), SiteNotificationSetting.id.asc())
             .all()
         )
-        about_rows = (
-            self.db.query(SiteAboutPhoto)
-            .join(ImageAsset, ImageAsset.id == SiteAboutPhoto.image_asset_id)
-            .order_by(SiteAboutPhoto.position.asc(), SiteAboutPhoto.id.asc())
-            .all()
-        )
         return SettingsTransferSiteContent(
             access=SettingsTransferSiteAccess(
                 enabled=bool(getattr(access, "enabled", False)),
@@ -302,27 +232,13 @@ class SettingsTransferService:
                 description=str(getattr(access, "description", "") or ""),
                 password=str(getattr(access, "password_value", "") or ""),
             ),
-            about=SettingsTransferSiteAbout(
-                text=str(getattr(about, "body_text", "") or ""),
-                photo_asset_checksums=[
-                    str(row.image_asset.checksum_sha256)
-                    for row in about_rows
-                    if getattr(row, "image_asset", None) is not None
-                    and str(getattr(row.image_asset, "checksum_sha256", "") or "").strip()
-                ],
-            ),
+            about=SettingsTransferSiteAbout(text=str(getattr(about, "body_text", "") or "")),
             notifications=[
                 SettingsTransferSiteNotification(
                     title=str(getattr(notification, "title", "") or ""),
                     description=str(getattr(notification, "description", "") or ""),
                     button_text=str(getattr(notification, "button_text", "") or ""),
                     button_url=str(getattr(notification, "button_url", "") or ""),
-                    image_asset_checksum=(
-                        str(notification.image_asset.checksum_sha256)
-                        if getattr(notification, "image_asset", None) is not None
-                        and str(getattr(notification.image_asset, "checksum_sha256", "") or "").strip()
-                        else None
-                    ),
                     version=int(getattr(notification, "version", 1) or 1),
                     position=index,
                 )
@@ -330,17 +246,11 @@ class SettingsTransferService:
             ],
             questions=[
                 SettingsTransferSiteQuestionItem(
-                    question=str(item.question or ""),
-                    answer=str(item.answer or ""),
+                    question=str(item.question or ""), answer=str(item.answer or ""),
                     is_enabled=bool(item.is_enabled),
-                    is_expanded_by_default=bool(item.is_expanded_by_default),
-                    position=int(item.position),
+                    is_expanded_by_default=bool(item.is_expanded_by_default), position=int(item.position),
                 )
-                for item in (
-                    self.db.query(SiteQuestionItem)
-                    .order_by(SiteQuestionItem.position.asc(), SiteQuestionItem.id.asc())
-                    .all()
-                )
+                for item in self.db.query(SiteQuestionItem).order_by(SiteQuestionItem.position.asc(), SiteQuestionItem.id.asc()).all()
             ],
         )
 
@@ -385,13 +295,6 @@ class SettingsTransferService:
         suppliers = self.supplier_repo.list_all_with_rates()
         sources = SourceRegistryService(self.db).list_all()
         weight_rules = self.weight_rule_repo.list_active()
-        showcase_media_settings = (
-            self.db.query(ShowcaseCarouselImage)
-            .order_by(ShowcaseCarouselImage.viewport.asc(), ShowcaseCarouselImage.position.asc(), ShowcaseCarouselImage.id.asc())
-            .all()
-        )
-        showcase_setting = self.db.query(ShowcaseSetting).order_by(ShowcaseSetting.id.asc()).first()
-
         supplier_by_id = {int(supplier.id): supplier for supplier in suppliers}
         role_rows = self.db.query(AdminRole).order_by(AdminRole.name.asc(), AdminRole.id.asc()).all()
         designer_rows = (
@@ -447,11 +350,8 @@ class SettingsTransferService:
         ]
 
         source_entries: list[SettingsTransferSourceEntry] = []
-        export_assets: list[tuple[ImageAsset, str]] = []
         for source in sources:
             setting = self.source_repo.ensure_setting(source)
-            if getattr(source, "logo_image_asset", None) is not None:
-                export_assets.append((source.logo_image_asset, "sources"))
             source_entries.append(
                 SettingsTransferSourceEntry(
                     key=str(source.key),
@@ -484,11 +384,6 @@ class SettingsTransferService:
                         if getattr(setting, "buyout_surcharge_currency", None)
                         else None
                     ),
-                    logo_asset_checksum=(
-                        str(source.logo_image_asset.checksum_sha256)
-                        if getattr(source, "logo_image_asset", None) is not None
-                        else None
-                    ),
                 )
             )
 
@@ -502,38 +397,6 @@ class SettingsTransferService:
             )
             for rule in weight_rules
         ]
-        if getattr(showcase_setting, "desktop_hero_image_asset", None) is not None:
-            export_assets.append((showcase_setting.desktop_hero_image_asset, "showcase"))
-        if getattr(showcase_setting, "mobile_hero_image_asset", None) is not None:
-            export_assets.append((showcase_setting.mobile_hero_image_asset, "showcase"))
-        for row in showcase_media_settings:
-            if getattr(row, "image_asset", None) is not None:
-                export_assets.append((row.image_asset, "showcase"))
-        site_content = self._export_site_content()
-        for checksum in site_content.about.photo_asset_checksums:
-            asset = (
-                self.db.query(ImageAsset)
-                .filter(
-                    ImageAsset.scope == SiteContentService.ASSET_SCOPE,
-                    ImageAsset.checksum_sha256 == str(checksum or "").strip(),
-                )
-                .one_or_none()
-            )
-            if asset is not None:
-                export_assets.append((asset, SiteContentService.ASSET_SCOPE))
-        for notification in site_content.notifications:
-            if notification.image_asset_checksum:
-                asset = (
-                    self.db.query(ImageAsset)
-                    .filter(
-                        ImageAsset.scope == SiteContentService.ASSET_SCOPE,
-                        ImageAsset.checksum_sha256 == str(notification.image_asset_checksum or "").strip(),
-                    )
-                    .one_or_none()
-                )
-                if asset is not None:
-                    export_assets.append((asset, SiteContentService.ASSET_SCOPE))
-
         return SettingsTransferPayload(
             schema_version=_SCHEMA_VERSION,
             exported_at=datetime.now(timezone.utc).isoformat(),
@@ -574,38 +437,7 @@ class SettingsTransferService:
                 for row in mapping_rows
             ],
             taxonomy=self._export_taxonomy(),
-            showcase_media=SettingsTransferShowcaseMedia(
-                desktop_hero_asset_checksum=(
-                    str(showcase_setting.desktop_hero_image_asset.checksum_sha256)
-                    if getattr(showcase_setting, "desktop_hero_image_asset", None) is not None
-                    else None
-                ),
-                mobile_hero_asset_checksum=(
-                    str(showcase_setting.mobile_hero_image_asset.checksum_sha256)
-                    if getattr(showcase_setting, "mobile_hero_image_asset", None) is not None
-                    else None
-                ),
-                desktop_carousel=[
-                    SettingsTransferShowcaseCarouselEntry(
-                        asset_checksum=str(row.image_asset.checksum_sha256),
-                        viewport="desktop",
-                        position=int(row.position),
-                    )
-                    for row in showcase_media_settings
-                    if getattr(row, "image_asset", None) is not None and str(getattr(row, "viewport", "") or "") == "desktop"
-                ],
-                mobile_carousel=[
-                    SettingsTransferShowcaseCarouselEntry(
-                        asset_checksum=str(row.image_asset.checksum_sha256),
-                        viewport="mobile",
-                        position=int(row.position),
-                    )
-                    for row in showcase_media_settings
-                    if getattr(row, "image_asset", None) is not None and str(getattr(row, "viewport", "") or "") == "mobile"
-                ],
-            ),
-            site_content=site_content,
-            image_assets=self._export_image_assets(export_assets),
+            site_content=self._export_site_content(),
         )
 
     def import_payload(self, payload: SettingsTransferPayload) -> SettingsTransferResponse:
@@ -615,27 +447,26 @@ class SettingsTransferService:
                 detail=f"Unsupported schema_version: {payload.schema_version}",
             )
 
-        asset_map: dict[tuple[str, str], ImageAsset] = {}
-        created_assets: list[ImageAsset] = []
         try:
-            asset_map, created_assets = self._import_image_assets(payload.image_assets)
             supplier_map = self._import_suppliers(payload.suppliers)
             pricing_updated = self._import_pricing(payload.pricing_settings)
             admin_ui_updated = self._import_admin_ui(payload.admin_ui_settings)
             roles_updated = self._import_roles(payload.roles)
             designer_count = self._import_designers(payload.designers)
             designer_source_names_updated = self._import_designer_source_names(payload.designer_source_names)
-            source_count = self._import_sources(payload.sources, supplier_map=supplier_map, asset_map=asset_map)
+            source_count = self._import_sources(payload.sources, supplier_map=supplier_map)
             weight_count = self._import_weight_rules(payload.weight_rules)
             taxonomy_state = self._import_taxonomy(payload.taxonomy)
-            showcase_media_updated = self._import_showcase_media(payload.showcase_media, asset_map=asset_map)
-            site_content_updated = self._import_site_content(payload.site_content, asset_map=asset_map)
+            site_content_updated = self._import_site_content(payload.site_content)
             DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
             pruned_source_count = self._prune_sources(payload.sources)
             pruned_supplier_count = self._prune_suppliers(payload.suppliers)
             pruned_designer_count = self._prune_designers(payload.designers)
 
             self.db.commit()
+            # A transfer replaces several singleton rows; expire the identity map
+            # so callers immediately read their committed state.
+            self.db.expire_all()
             return SettingsTransferResponse(
                 ok=True,
                 message="Настройки импортированы",
@@ -646,7 +477,6 @@ class SettingsTransferService:
                     "admin_ui_settings_updated": admin_ui_updated,
                     "roles_upserted": roles_updated,
                     "suppliers_upserted": len(supplier_map),
-                    "image_assets_upserted": len(asset_map),
                     "sources_upserted": source_count,
                     "sources_deleted": pruned_source_count,
                     "weight_rules_replaced": weight_count,
@@ -657,20 +487,16 @@ class SettingsTransferService:
                     "taxonomy_filters_replaced": len(taxonomy_state.filters),
                     "taxonomy_custom_catalogs_replaced": len(taxonomy_state.custom_catalogs),
                     "showcase_categories_replaced": len(taxonomy_state.showcase_categories),
-                    "showcase_media_assets_linked": showcase_media_updated,
                     "site_access_settings_updated": site_content_updated["access"],
-                    "site_about_photos_linked": site_content_updated["about_photos"],
                     "site_notifications_replaced": site_content_updated["notifications"],
                     "site_questions_replaced": site_content_updated["questions"],
                 },
             )
         except HTTPException:
             self.db.rollback()
-            self._cleanup_created_assets(created_assets)
             raise
         except Exception:
             self.db.rollback()
-            self._cleanup_created_assets(created_assets)
             raise
 
     def reset_all(self) -> SettingsTransferResponse:
@@ -720,7 +546,6 @@ class SettingsTransferService:
 
         # 4) Reset designer source names.
         self.db.query(DesignerSourceName).delete(synchronize_session=False)
-        self.db.query(SiteAboutPhoto).delete(synchronize_session=False)
         self.db.query(SiteQuestionItem).delete(synchronize_session=False)
         about = self.db.query(SiteAboutSetting).filter(SiteAboutSetting.id == 1).one_or_none()
         if about is None:
@@ -754,74 +579,6 @@ class SettingsTransferService:
                 "site_access_settings_updated": 1,
             },
         )
-
-    def _import_image_assets(self, assets: list[SettingsTransferImageAssetEntry]) -> tuple[dict[tuple[str, str], ImageAsset], list[ImageAsset]]:
-        result: dict[tuple[str, str], ImageAsset] = {}
-        created_assets: list[ImageAsset] = []
-        seen_asset_keys: set[tuple[str, str]] = set()
-        for item in assets:
-            scope = self.media_assets.normalize_scope(item.scope)
-            checksum = str(item.checksum_sha256 or "").strip()
-            asset_key = (scope, checksum)
-            if not checksum or asset_key in seen_asset_keys:
-                continue
-            seen_asset_keys.add(asset_key)
-            existing = (
-                self.db.query(ImageAsset)
-                .filter(
-                    ImageAsset.scope == scope,
-                    ImageAsset.checksum_sha256 == checksum,
-                )
-                .one_or_none()
-            )
-            if existing is not None:
-                result[asset_key] = existing
-                continue
-            try:
-                content = base64.b64decode(item.content_base64.encode("ascii"), validate=True)
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Не удалось прочитать медиафайл {checksum}: {exc}",
-                ) from exc
-            actual_checksum = sha256(content).hexdigest()
-            if actual_checksum != checksum:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Контрольная сумма медиафайла не совпадает для {checksum}.",
-                )
-            asset = self.media_assets.save_bytes(
-                scope=scope,
-                file_name=str(item.file_name or "").strip() or f"{checksum}.bin",
-                content=content,
-            )
-            result[asset_key] = asset
-            created_assets.append(asset)
-        return result, created_assets
-
-    def _cleanup_created_assets(self, assets: list[ImageAsset]) -> None:
-        for asset in assets:
-            file_path = self.media_assets.resolve_file_path(asset)
-            if file_path.exists():
-                file_path.unlink()
-
-    @staticmethod
-    def _require_asset_checksum(
-        *,
-        asset_map: dict[tuple[str, str], ImageAsset],
-        checksum: str,
-        expected_scope: str,
-        field_label: str,
-    ) -> ImageAsset:
-        scope = MediaAssetService.normalize_scope(expected_scope)
-        normalized = str(checksum or "").strip()
-        asset = asset_map.get((scope, normalized))
-        if asset is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"В файле отсутствует изображение для поля '{field_label}'.",
-            )
-        return asset
 
     def _import_designers(self, rows: list[SettingsTransferDesignerEntry]) -> int:
         existing_by_slug = {
@@ -906,94 +663,7 @@ class SettingsTransferService:
         )
         return self.taxonomy.replace_state(state, commit=False)
 
-    def _import_showcase_media(
-        self,
-        payload: SettingsTransferShowcaseMedia,
-        *,
-        asset_map: dict[tuple[str, str], ImageAsset],
-    ) -> int:
-        settings = self.db.query(ShowcaseSetting).order_by(ShowcaseSetting.id.asc()).first()
-        if settings is None:
-            settings = ShowcaseSetting(id=1)
-            self.db.add(settings)
-            self.db.flush()
-        desktop_hero_checksum = str(payload.desktop_hero_asset_checksum or "").strip()
-        mobile_hero_checksum = str(payload.mobile_hero_asset_checksum or "").strip()
-        desktop_carousel = sorted(payload.desktop_carousel, key=lambda row: int(row.position))
-        mobile_carousel = sorted(payload.mobile_carousel, key=lambda row: int(row.position))
-
-        linked = 0
-        if desktop_hero_checksum:
-            linked += 1
-        if mobile_hero_checksum:
-            linked += 1
-        linked += len({str(item.asset_checksum or "").strip() for item in desktop_carousel if str(item.asset_checksum or "").strip()})
-        linked += len({str(item.asset_checksum or "").strip() for item in mobile_carousel if str(item.asset_checksum or "").strip()})
-
-        state = ShowcaseService(self.db).replace_state(
-            ShowcaseStateUpdateRequest(
-                desktop={
-                    "hero_asset_id": (
-                        int(self._require_asset_checksum(
-                            asset_map=asset_map,
-                            checksum=desktop_hero_checksum,
-                            expected_scope="showcase",
-                            field_label="Компьютерная заставка",
-                        ).id)
-                        if desktop_hero_checksum else None
-                    ),
-                    "carousel_asset_ids": [
-                        int(
-                            self._require_asset_checksum(
-                                asset_map=asset_map,
-                                checksum=str(item.asset_checksum or "").strip(),
-                                expected_scope="showcase",
-                                field_label=f"Компьютерная карусель #{index}",
-                            ).id
-                        )
-                        for index, item in enumerate(desktop_carousel, start=1)
-                        if str(item.asset_checksum or "").strip()
-                    ],
-                },
-                mobile={
-                    "hero_asset_id": (
-                        int(self._require_asset_checksum(
-                            asset_map=asset_map,
-                            checksum=mobile_hero_checksum,
-                            expected_scope="showcase",
-                            field_label="Мобильная заставка",
-                        ).id)
-                        if mobile_hero_checksum else None
-                    ),
-                    "carousel_asset_ids": [
-                        int(
-                            self._require_asset_checksum(
-                                asset_map=asset_map,
-                                checksum=str(item.asset_checksum or "").strip(),
-                                expected_scope="showcase",
-                                field_label=f"Мобильная карусель #{index}",
-                            ).id
-                        )
-                        for index, item in enumerate(mobile_carousel, start=1)
-                        if str(item.asset_checksum or "").strip()
-                    ],
-                },
-            )
-        )
-        self.db.flush()
-        return (
-            (1 if state.desktop.hero_asset is not None else 0)
-            + (1 if state.mobile.hero_asset is not None else 0)
-            + len(state.desktop.carousel_assets)
-            + len(state.mobile.carousel_assets)
-        )
-
-    def _import_site_content(
-        self,
-        payload: SettingsTransferSiteContent,
-        *,
-        asset_map: dict[tuple[str, str], ImageAsset],
-    ) -> dict[str, int]:
+    def _import_site_content(self, payload: SettingsTransferSiteContent) -> dict[str, int]:
         access = self.db.query(SiteAccessSetting).order_by(SiteAccessSetting.id.asc()).first()
         if access is None:
             access = SiteAccessSetting(id=1)
@@ -1014,70 +684,25 @@ class SettingsTransferService:
             self.db.flush()
         about.body_text = str(payload.about.text or "")
 
-        self.db.query(SiteAboutPhoto).delete(synchronize_session=False)
-        self.db.flush()
-        linked_about_photos = 0
-        seen_checksums: set[str] = set()
-        for position, checksum in enumerate(payload.about.photo_asset_checksums, start=1):
-            normalized_checksum = str(checksum or "").strip()
-            if not normalized_checksum or normalized_checksum in seen_checksums:
-                continue
-            seen_checksums.add(normalized_checksum)
-            asset = self._require_asset_checksum(
-                asset_map=asset_map,
-                checksum=normalized_checksum,
-                expected_scope=SiteContentService.ASSET_SCOPE,
-                field_label=f"Фото 'Обо мне' #{position}",
-            )
-            self.db.add(SiteAboutPhoto(image_asset_id=int(asset.id), position=linked_about_photos + 1))
-            linked_about_photos += 1
-
         self.db.query(SiteQuestionItem).delete(synchronize_session=False)
         self.db.flush()
-        linked_questions = 0
-        for item in sorted(payload.questions, key=lambda row: int(row.position)):
-            self.db.add(
-                SiteQuestionItem(
-                    question=str(item.question or ""),
-                    answer=str(item.answer or ""),
-                    is_enabled=bool(item.is_enabled),
-                    is_expanded_by_default=bool(item.is_expanded_by_default),
-                    position=linked_questions + 1,
-                )
-            )
-            linked_questions += 1
+        for position, item in enumerate(sorted(payload.questions, key=lambda row: int(row.position)), start=1):
+            self.db.add(SiteQuestionItem(
+                question=str(item.question or ""), answer=str(item.answer or ""),
+                is_enabled=bool(item.is_enabled), is_expanded_by_default=bool(item.is_expanded_by_default),
+                position=position,
+            ))
         self.db.flush()
         self.db.query(SiteNotificationSetting).delete(synchronize_session=False)
         self.db.flush()
-        linked_notifications = 0
         for item in sorted(payload.notifications, key=lambda row: int(row.position)):
-            image_asset_id = None
-            if item.image_asset_checksum:
-                notification_asset = self._require_asset_checksum(
-                    asset_map=asset_map,
-                    checksum=str(item.image_asset_checksum or "").strip(),
-                    expected_scope=SiteContentService.ASSET_SCOPE,
-                    field_label=f"Фото уведомления #{linked_notifications + 1}",
-                )
-                image_asset_id = int(notification_asset.id)
-            self.db.add(
-                SiteNotificationSetting(
-                    title=str(item.title or ""),
-                    description=str(item.description or ""),
-                    button_text=str(item.button_text or ""),
-                    button_url=str(item.button_url or ""),
-                    version=max(1, int(item.version or 1)),
-                    image_asset_id=image_asset_id,
-                )
-            )
-            linked_notifications += 1
+            self.db.add(SiteNotificationSetting(
+                title=str(item.title or ""), description=str(item.description or ""),
+                button_text=str(item.button_text or ""), button_url=str(item.button_url or ""),
+                version=max(1, int(item.version or 1)),
+            ))
         self.db.flush()
-        return {
-            "access": 1,
-            "about_photos": linked_about_photos,
-            "notifications": linked_notifications,
-            "questions": linked_questions,
-        }
+        return {"access": 1, "notifications": len(payload.notifications), "questions": len(payload.questions)}
 
     def _prune_sources(self, rows: list[SettingsTransferSourceEntry]) -> int:
         desired_keys = {
@@ -1353,7 +978,6 @@ class SettingsTransferService:
         sources: list[SettingsTransferSourceEntry],
         *,
         supplier_map: dict[str, Supplier],
-        asset_map: dict[tuple[str, str], ImageAsset],
     ) -> int:
         if not supplier_map:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет тарифов для назначения источникам")
@@ -1410,12 +1034,6 @@ class SettingsTransferService:
             setting.buyout_surcharge_currency = (
                 _normalize_currency(item.buyout_surcharge_currency, default="RUB")
                 if item.buyout_surcharge_currency is not None
-                else None
-            )
-            logo_checksum = str(item.logo_asset_checksum or "").strip()
-            existing.logo_image_asset_id = (
-                int(self._require_asset_checksum(asset_map=asset_map, checksum=logo_checksum, expected_scope="sources", field_label=f"Логотип источника '{item.name}'").id)
-                if logo_checksum
                 else None
             )
             updated += 1
