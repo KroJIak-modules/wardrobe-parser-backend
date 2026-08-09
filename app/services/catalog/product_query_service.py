@@ -5,7 +5,7 @@ from html import unescape
 from html.parser import HTMLParser
 from typing import Any
 
-from sqlalchemy import String, and_, case, cast, func, literal, not_, or_
+from sqlalchemy import String, and_, case, cast, func, literal, not_, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.models import (
@@ -1580,60 +1580,30 @@ class ProductQueryService:
             base_query = base_query.filter(Product.availability_mode == str(availability_mode).strip().lower())
         if orderability_status:
             normalized_orderability_status = str(orderability_status).strip().lower()
-            gallery_visibility_sq = (
-                self.db.query(
-                    ProductListingGalleryImage.product_id.label("product_id"),
-                    ProductListingGalleryImage.listing_id.label("listing_id"),
-                    func.bool_or(
-                        and_(
-                            ProductListingGalleryImage.is_hidden.is_(False),
-                            or_(
-                                ProductListingGalleryImage.image_asset_id.is_not(None),
-                                and_(
-                                    ProductListingGalleryImage.listing_image_id.is_not(None),
-                                    func.coalesce(SourceSetting.show_images, True).is_(True),
-                                ),
-                            ),
-                        )
-                    ).label("has_visible_gallery_image"),
-                    func.count(ProductListingGalleryImage.id).label("scope_count"),
-                )
-                .select_from(ProductListingGalleryImage)
-                .join(ProductListing, ProductListing.id == ProductListingGalleryImage.listing_id)
-                .outerjoin(SourceSetting, SourceSetting.source_id == ProductListing.source_id)
-                .group_by(ProductListingGalleryImage.product_id, ProductListingGalleryImage.listing_id)
-                .subquery("product_gallery_visibility")
-            )
-            source_image_counts_sq = (
-                self.db.query(
-                    ProductListingImage.listing_id.label("listing_id"),
-                    func.count(ProductListingImage.id).label("image_count"),
-                )
-                .group_by(ProductListingImage.listing_id)
-                .subquery("product_source_image_counts")
-            )
-            base_query = (
-                base_query
-                .outerjoin(
-                    gallery_visibility_sq,
+            primary_listing_has_gallery_scope = select(ProductListingGalleryImage.id).where(
+                ProductListingGalleryImage.product_id == Product.id,
+                ProductListingGalleryImage.listing_id == Product.primary_listing_id,
+            ).exists()
+            primary_listing_has_visible_gallery_image = select(ProductListingGalleryImage.id).where(
+                ProductListingGalleryImage.product_id == Product.id,
+                ProductListingGalleryImage.listing_id == Product.primary_listing_id,
+                ProductListingGalleryImage.is_hidden.is_(False),
+                or_(
+                    ProductListingGalleryImage.image_asset_id.is_not(None),
                     and_(
-                        gallery_visibility_sq.c.product_id == Product.id,
-                        gallery_visibility_sq.c.listing_id == Product.primary_listing_id,
+                        ProductListingGalleryImage.listing_image_id.is_not(None),
+                        func.coalesce(SourceSetting.show_images, True).is_(True),
                     ),
-                )
-                .outerjoin(
-                    source_image_counts_sq,
-                    source_image_counts_sq.c.listing_id == Product.primary_listing_id,
-                )
-            )
-            has_visible_images_expr = case(
-                (
-                    func.coalesce(gallery_visibility_sq.c.scope_count, 0) > 0,
-                    func.coalesce(gallery_visibility_sq.c.has_visible_gallery_image, False),
                 ),
+            ).exists()
+            primary_listing_has_source_image = select(ProductListingImage.id).where(
+                ProductListingImage.listing_id == Product.primary_listing_id,
+            ).exists()
+            has_visible_images_expr = case(
+                (primary_listing_has_gallery_scope, primary_listing_has_visible_gallery_image),
                 else_=and_(
                     func.coalesce(SourceSetting.show_images, True).is_(True),
-                    func.coalesce(source_image_counts_sq.c.image_count, 0) > 0,
+                    primary_listing_has_source_image,
                 ),
             )
             effective_orderability_expr = case(

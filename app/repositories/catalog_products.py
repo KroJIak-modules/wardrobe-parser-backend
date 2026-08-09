@@ -201,6 +201,11 @@ class CatalogProductRepository:
         normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
         if not normalized_ids:
             return []
+        selected_primary_listing_ids = (
+            self.session.query(Product.primary_listing_id)
+            .filter(Product.id.in_(normalized_ids))
+            .filter(Product.primary_listing_id.is_not(None))
+        )
         first_listing_image_sq = (
             self.session.query(
                 ProductListingImage.listing_id.label("listing_id"),
@@ -212,6 +217,7 @@ class CatalogProductRepository:
                 )
                 .label("rn"),
             )
+            .filter(ProductListingImage.listing_id.in_(selected_primary_listing_ids))
             .subquery("site_catalog_first_listing_image")
         )
         representative_variant_sq = (
@@ -228,6 +234,7 @@ class CatalogProductRepository:
                 )
                 .label("rn"),
             )
+            .filter(ProductListingVariant.listing_id.in_(selected_primary_listing_ids))
             .filter(ProductListingVariant.is_orderable.is_(True))
             .subquery("site_catalog_representative_variant")
         )
@@ -236,6 +243,8 @@ class CatalogProductRepository:
                 ProductListingGalleryImage.product_id.label("product_id"),
                 ProductListingGalleryImage.listing_id.label("listing_id"),
             )
+            .filter(ProductListingGalleryImage.product_id.in_(normalized_ids))
+            .filter(ProductListingGalleryImage.listing_id.in_(selected_primary_listing_ids))
             .group_by(ProductListingGalleryImage.product_id, ProductListingGalleryImage.listing_id)
             .subquery("site_catalog_gallery_scope")
         )
@@ -264,6 +273,8 @@ class CatalogProductRepository:
             .outerjoin(ProductListingImage, ProductListingImage.id == ProductListingGalleryImage.listing_image_id)
             .join(ProductListing, ProductListing.id == ProductListingGalleryImage.listing_id)
             .outerjoin(SourceSetting, SourceSetting.source_id == ProductListing.source_id)
+            .filter(ProductListingGalleryImage.product_id.in_(normalized_ids))
+            .filter(ProductListingGalleryImage.listing_id.in_(selected_primary_listing_ids))
             .filter(ProductListingGalleryImage.is_hidden.is_(False))
             .filter(
                 or_(
