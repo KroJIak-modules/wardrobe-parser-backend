@@ -931,7 +931,7 @@ class ProductWriteService:
             raise ValidationError(f"Не найден custom catalog: {normalized_slug}")
         taxonomy.set_custom_catalog_product_membership(
             catalog_id=int(catalog.id),
-            product_id=int(product.id),
+            product_id=int(product_id),
             is_assigned=bool(is_assigned),
         )
 
