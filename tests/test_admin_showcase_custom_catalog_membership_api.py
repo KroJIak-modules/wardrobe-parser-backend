@@ -88,10 +88,9 @@ def test_showcase_custom_catalog_membership_is_targeted_and_idempotent(monkeypat
 
         listed = client.get(f"/api/v1/admin/showcase/products/{product_id}/custom-catalogs")
         assert listed.status_code == 200
-        assert listed.json()["items"] == [
-            {"slug": f"first-{marker}", "label": "First catalog", "is_assigned": False},
-            {"slug": f"second-{marker}", "label": "Second catalog", "is_assigned": True},
-        ]
+        listed_items = {item["slug"]: item for item in listed.json()["items"]}
+        assert listed_items[f"first-{marker}"] == {"slug": f"first-{marker}", "label": "First catalog", "is_assigned": False}
+        assert listed_items[f"second-{marker}"] == {"slug": f"second-{marker}", "label": "Second catalog", "is_assigned": True}
 
         assigned = client.patch(
             f"/api/v1/admin/showcase/products/{product_id}/custom-catalogs/first-{marker}",

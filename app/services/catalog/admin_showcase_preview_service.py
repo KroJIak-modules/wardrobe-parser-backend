@@ -355,6 +355,7 @@ class AdminShowcasePreviewService:
                                 "target": {
                                     "pathname": "/catalog/sale" if view_key == "sale" else "/catalog",
                                     "query": {
+                                        "collection": str(catalog.get("slug") or ""),
                                         "ctx": "custom",
                                         "ctx_ref": str(catalog.get("slug") or ""),
                                         **({"gender": gender} if gender else {}),
@@ -627,6 +628,7 @@ class AdminShowcasePreviewService:
                         "target": {
                             "pathname": "/catalog",
                             "query": {
+                                "collection": str(catalog.get("slug") or ""),
                                 "ctx": "custom",
                                 "ctx_ref": str(catalog.get("slug") or ""),
                             },

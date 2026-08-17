@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 from app.core.database import SessionLocal
-from app.models import Designer, ImageAsset, Product, ProductListing
+from app.models import CustomCatalog, CustomCatalogProduct, Designer, ImageAsset, Product, ProductListing
 from app.services.catalog.product_query_service import ProductQueryService
 from app.services.catalog.product_write_service import ProductWriteService
 from app.services.catalog.designer_support import slugify_designer_name

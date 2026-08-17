@@ -1621,6 +1621,7 @@ class ProductQueryService:
                 base_query.join(CustomCatalogProduct, CustomCatalogProduct.product_id == Product.id)
                 .join(CustomCatalog, CustomCatalog.id == CustomCatalogProduct.catalog_id)
                 .filter(CustomCatalog.slug == effective_custom_catalog_slug)
+                .filter(CustomCatalog.is_enabled.is_(True))
             )
 
         if normalized_query:
