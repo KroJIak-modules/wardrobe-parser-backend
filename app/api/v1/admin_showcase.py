@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.exceptions import NotFoundError
 from app.schemas.showcase_preview import (
     CatalogExperienceResponse,
     ShowcaseDesignersDirectoryResponse,
@@ -12,10 +14,16 @@ from app.schemas.showcase_preview import (
 from app.schemas.site import SiteCatalogProductsResponse
 from app.services.auth.admin_auth_service import require_permission
 from app.services.catalog.admin_showcase_preview_service import AdminShowcasePreviewService
+from app.services.catalog.product_query_service import ProductQueryService
+from app.services.catalog.product_write_service import ProductWriteService
 from app.services.catalog.site_query_service import SiteQueryService
 
 
 router = APIRouter(tags=["admin-showcase"])
+
+
+class ShowcaseCustomCatalogMembershipRequest(BaseModel):
+    is_assigned: bool
 
 
 @router.get(
@@ -49,6 +57,36 @@ def get_admin_showcase_catalog_experience(
         view_key=normalized_view_key,  # type: ignore[arg-type]
         search_params=search_params,
     )
+
+
+@router.get(
+    "/admin/showcase/products/{product_id}/custom-catalogs",
+    dependencies=[Depends(require_permission("showcase.read"))],
+)
+def get_admin_showcase_product_custom_catalogs(product_id: int, db: Session = Depends(get_db)) -> dict:
+    items = ProductQueryService(db).list_custom_catalog_membership(product_id)
+    if items is None:
+        raise NotFoundError("Товар не найден")
+    return {"items": items}
+
+
+@router.patch(
+    "/admin/showcase/products/{product_id}/custom-catalogs/{catalog_slug}",
+    dependencies=[Depends(require_permission("control.products.edit"))],
+)
+def set_admin_showcase_product_custom_catalog_membership(
+    product_id: int,
+    catalog_slug: str,
+    payload: ShowcaseCustomCatalogMembershipRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    ProductWriteService(db).set_custom_catalog_membership(
+        product_id=product_id,
+        catalog_slug=catalog_slug,
+        is_assigned=payload.is_assigned,
+    )
+    db.commit()
+    return {"slug": catalog_slug, "is_assigned": payload.is_assigned}
 
 
 @router.get(

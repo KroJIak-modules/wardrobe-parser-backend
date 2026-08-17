@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
     CustomCatalog,
+    CustomCatalogProduct,
     Filter,
     FilterNode,
     Product,
@@ -56,6 +57,52 @@ class CatalogTaxonomyRepository:
             .order_by(CustomCatalog.slug.asc(), CustomCatalog.id.asc())
             .all()
         )
+
+    def list_custom_catalog_membership(self, product_id: int) -> list[tuple[str, str, bool]]:
+        rows = (
+            self.session.query(
+                CustomCatalog.slug,
+                CustomCatalog.title,
+                CustomCatalogProduct.product_id,
+            )
+            .outerjoin(
+                CustomCatalogProduct,
+                (CustomCatalogProduct.catalog_id == CustomCatalog.id)
+                & (CustomCatalogProduct.product_id == int(product_id)),
+            )
+            .order_by(CustomCatalog.title.asc(), CustomCatalog.id.asc())
+            .all()
+        )
+        return [
+            (str(slug), str(title), assigned_product_id is not None)
+            for slug, title, assigned_product_id in rows
+        ]
+
+    def get_custom_catalog_by_slug(self, slug: str) -> CustomCatalog | None:
+        return self.session.query(CustomCatalog).filter(CustomCatalog.slug == slug).one_or_none()
+
+    def set_custom_catalog_product_membership(self, *, catalog_id: int, product_id: int, is_assigned: bool) -> None:
+        if is_assigned:
+            existing = (
+                self.session.query(CustomCatalogProduct)
+                .filter(
+                    CustomCatalogProduct.catalog_id == int(catalog_id),
+                    CustomCatalogProduct.product_id == int(product_id),
+                )
+                .one_or_none()
+            )
+            if existing is None:
+                self.session.add(CustomCatalogProduct(catalog_id=int(catalog_id), product_id=int(product_id)))
+        else:
+            (
+                self.session.query(CustomCatalogProduct)
+                .filter(
+                    CustomCatalogProduct.catalog_id == int(catalog_id),
+                    CustomCatalogProduct.product_id == int(product_id),
+                )
+                .delete(synchronize_session=False)
+            )
+        self.session.flush()
 
     def list_showcase_categories(self) -> list[ShowcaseCategory]:
         return (

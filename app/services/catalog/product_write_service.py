@@ -15,11 +15,13 @@ from app.models import (
     Filter,
     FilterManualProduct,
     ImageAsset,
+    Product,
     ProductDedupDecision,
     ProductListingGalleryImage,
     ProductListingMember,
 )
 from app.repositories.catalog_products import CatalogProductRepository
+from app.repositories.catalog_taxonomy import CatalogTaxonomyRepository
 from app.services.catalog.dedup_service_v2 import DedupServiceV2
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.designer_support import normalize_designer_text, slugify_designer_name
@@ -915,6 +917,23 @@ class ProductWriteService:
             position += 1
 
         self.db.flush()
+
+    def set_custom_catalog_membership(self, *, product_id: int, catalog_slug: str, is_assigned: bool) -> None:
+        product_exists = self.db.query(Product.id).filter(Product.id == int(product_id)).scalar()
+        if product_exists is None:
+            raise NotFoundError("Товар не найден")
+        normalized_slug = str(catalog_slug or "").strip()
+        if not normalized_slug:
+            raise ValidationError("Не указан кастомный каталог")
+        taxonomy = CatalogTaxonomyRepository(self.db)
+        catalog = taxonomy.get_custom_catalog_by_slug(normalized_slug)
+        if catalog is None:
+            raise ValidationError(f"Не найден custom catalog: {normalized_slug}")
+        taxonomy.set_custom_catalog_product_membership(
+            catalog_id=int(catalog.id),
+            product_id=int(product.id),
+            is_assigned=bool(is_assigned),
+        )
 
     def update_product(self, *, product_id: int, payload: dict) -> None:
         product = self._product_or_error(product_id)

@@ -28,6 +28,7 @@ from app.models import (
     ShowcaseCategoryAttachment,
 )
 from app.repositories.catalog_products import CatalogProductRepository
+from app.repositories.catalog_taxonomy import CatalogTaxonomyRepository
 from app.schemas.admin_settings import PricingSettingsResponse, PricingSupplierRateResponse, PricingSupplierResponse
 from app.services.catalog.product_title_service import ProductTitleService
 from app.services.catalog.source_registry_service import SourceRegistryService
@@ -1736,6 +1737,14 @@ class ProductQueryService:
         if product is None:
             return None
         return self.build_admin_product_payload(product)
+
+    def list_custom_catalog_membership(self, product_id: int) -> list[dict] | None:
+        if self.db.query(Product.id).filter(Product.id == int(product_id)).scalar() is None:
+            return None
+        return [
+            {"slug": slug, "label": label, "is_assigned": is_assigned}
+            for slug, label, is_assigned in CatalogTaxonomyRepository(self.db).list_custom_catalog_membership(product_id)
+        ]
 
     def get_dedup_payloads_by_ids(self, product_ids: list[int]) -> dict[int, dict]:
         products = self.products.list_products_for_dedup_by_ids(product_ids)
