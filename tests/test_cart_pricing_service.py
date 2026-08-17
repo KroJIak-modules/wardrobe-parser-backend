@@ -214,6 +214,7 @@ def test_cart_quote_applies_preorder_source_surcharge_and_svc_once() -> None:
         # not product compare-at prices.
         assert quote.svc_progress.preorder_subtotal_rub == 21000.0
         assert quote.svc_progress.applied_amount_rub == 500.0
+        assert quote.svc_progress.amount_to_next_threshold_rub is None
         assert quote.final_total_rub == quote.total_rub == 26500.0
         assert quote.original_total_rub == 28000.0
         assert quote.original_total_rub > quote.final_total_rub
@@ -281,6 +282,43 @@ def test_empty_cart_quote_exposes_configured_svc_tiers() -> None:
         assert not any(tier.is_applied for tier in quote.svc_tiers)
         assert quote.svc_progress.preorder_subtotal_rub == 0.0
         assert quote.svc_progress.next_threshold_rub == 10_000.0
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_cart_quote_rounds_amount_to_next_svc_threshold_with_final_price_rule() -> None:
+    db = SessionLocal()
+    try:
+        pricing, _ = PricingSettingsService(db)._get_or_create_pricing_entity()
+        pricing.markup_multiplier = 1.0
+        pricing.weight_tolerance = 1.0
+        pricing.customs_threshold_eur = 1_000_000.0
+        pricing.customs_duty_rate = 0.0
+        pricing.payment_fee_rate = 0.0
+        pricing.customs_processing_rate = 0.0
+        pricing.customs_fixed_rub = 0.0
+        pricing.tax_rate = 0.0
+        pricing.usdt_to_rub_rate = 100.0
+        pricing.usd_to_rub_rate = 100.0
+        pricing.eur_to_usd_rate = 1.0
+        pricing.eur_to_rub_rate = 100.0
+        pricing.usdt_extra_rub = 0.0
+        pricing.final_rounding_mode = "hundred"
+        pricing.svc_rules = [
+            {"min_rub": 0.0, "max_rub": 20_000.0, "mode": "fixed_rub", "value": 500.0},
+            {"min_rub": 30_000.0, "max_rub": None, "mode": "fixed_rub", "value": 300.0},
+        ]
+        preorder_product_id, _, first_id, _, _ = _create_quote_variants(db)
+        db.flush()
+
+        quote = CartPricingService(db).quote([
+            SiteCartQuoteItemRequest(product_id=preorder_product_id, variant_id=first_id, quantity=1),
+        ])
+
+        assert quote.svc_progress.preorder_subtotal_rub == 11_000.0
+        assert quote.svc_progress.next_threshold_rub == 30_000.0
+        assert quote.svc_progress.amount_to_next_threshold_rub == 19_000.0
     finally:
         db.rollback()
         db.close()

@@ -356,6 +356,7 @@ class SiteCartQuoteSvcProgressResponse(BaseModel):
     preorder_subtotal_rub: float
     applied_amount_rub: float
     next_threshold_rub: float | None = None
+    amount_to_next_threshold_rub: float | None = None
 
 
 class SiteCartQuoteResponse(BaseModel):

@@ -293,6 +293,10 @@ class CartPricingService:
             normalized_rules = self.pricing._normalize_svc_rules(
                 [rule.model_dump() if hasattr(rule, "model_dump") else rule for rule in settings.svc_rules]
             )
+            next_threshold_rub = next(
+                (float(rule["min_rub"]) for rule in normalized_rules if float(rule["min_rub"]) > 0),
+                None,
+            )
             return SiteCartQuoteResponse(
                 items=[],
                 unavailable_variant_ids=unavailable_variant_ids,
@@ -307,9 +311,11 @@ class CartPricingService:
                 svc_progress=SiteCartQuoteSvcProgressResponse(
                     preorder_subtotal_rub=0.0,
                     applied_amount_rub=0.0,
-                    next_threshold_rub=next(
-                        (float(rule["min_rub"]) for rule in normalized_rules if float(rule["min_rub"]) > 0),
-                        None,
+                    next_threshold_rub=next_threshold_rub,
+                    amount_to_next_threshold_rub=(
+                        self._money(self.pricing._apply_final_rounding(next_threshold_rub, settings.final_rounding_mode))
+                        if next_threshold_rub is not None
+                        else None
                     ),
                 ),
             )
@@ -464,6 +470,16 @@ class CartPricingService:
         # basket; it must never be derived from item compare-at prices.
         original_total_rub = self._money(sum(item.original_line_total_rub for item in quote_items))
         final_total_rub = self._money(sum(item.final_line_total_rub for item in quote_items))
+        amount_to_next_threshold_rub = (
+            self._money(
+                self.pricing._apply_final_rounding(
+                    max(0.0, next_threshold_rub - preorder_subtotal_rub),
+                    settings.final_rounding_mode,
+                )
+            )
+            if next_threshold_rub is not None
+            else None
+        )
         return SiteCartQuoteResponse(
             items=quote_items,
             unavailable_variant_ids=unavailable_variant_ids,
@@ -479,5 +495,6 @@ class CartPricingService:
                     if next_threshold_rub is not None
                     else None
                 ),
+                amount_to_next_threshold_rub=amount_to_next_threshold_rub,
             ),
         )
