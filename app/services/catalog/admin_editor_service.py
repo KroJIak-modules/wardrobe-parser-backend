@@ -430,20 +430,25 @@ class AdminEditorService:
         if not normalized_source_brand:
             raise ValidationError("Не указан бренд-источник")
 
-        mapping = (
+        mappings = (
             self.db.query(DesignerSourceName)
             .filter(func.lower(DesignerSourceName.source_name) == normalized_source_brand.lower())
-            .one_or_none()
+            .order_by(
+                DesignerSourceName.is_admin_touched.desc(),
+                DesignerSourceName.id.asc(),
+            )
+            .all()
         )
-        if mapping is None:
+        if not mappings:
             raise ValidationError("Бренд-источник не найден")
 
-        mapping.is_enabled = bool(include_in_designers)
-        mapping.is_admin_touched = True
+        for mapping in mappings:
+            mapping.is_enabled = bool(include_in_designers)
+            mapping.is_admin_touched = True
         self.db.flush()
         return {
             "source_brand": normalized_source_brand,
-            "include_in_designers": bool(mapping.is_enabled),
+            "include_in_designers": bool(include_in_designers),
         }
 
     def list_taxonomy_editor_state(self) -> dict:

@@ -175,6 +175,42 @@ def test_untouched_source_brand_is_disabled_when_all_products_become_unavailable
         db.close()
 
 
+def test_source_enabled_patch_updates_case_variant_mappings(monkeypatch) -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key="source-case-variants")
+        _create_sync_product(db, source=source, brand="ZZ TEST Case Brand", suffix="case-variant")
+        first = DesignerSourceName(
+            source_name="ZZ TEST Case Brand",
+            designer_name="ZZ TEST Case Brand",
+            is_enabled=False,
+            is_admin_touched=True,
+        )
+        second = DesignerSourceName(
+            source_name="ZZ TEST CASE BRAND",
+            designer_name="ZZ TEST CASE BRAND",
+            is_enabled=True,
+            is_admin_touched=False,
+        )
+        db.add_all([first, second])
+        db.flush()
+
+        monkeypatch.setattr(DesignerCatalogSyncService, "reconcile", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected reconcile")))
+        result = AdminEditorService(db).set_designer_source_enabled(
+            source_brand="ZZ TEST Case Brand",
+            include_in_designers=True,
+        )
+
+        assert result == {"source_brand": "ZZ TEST Case Brand", "include_in_designers": True}
+        assert first.is_enabled is True
+        assert second.is_enabled is True
+        assert first.is_admin_touched is True
+        assert second.is_admin_touched is True
+    finally:
+        db.rollback()
+        db.close()
+
+
 def test_source_enabled_patch_updates_only_the_target_mapping(monkeypatch) -> None:
     db = SessionLocal()
     try:
