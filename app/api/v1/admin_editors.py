@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.schemas.admin_editors import (
     AdminDesignerEditorPayload,
+    AdminDesignerSourceEnabledPatch,
     AdminFilterAssignmentRebuildStartResponse,
     AdminFilterAssignmentRebuildStatus,
     AdminTaxonomyEditorPayload,
@@ -25,6 +26,24 @@ def get_admin_designers_editor_state(db: Session = Depends(get_db)) -> dict:
 @router.put("/admin/designers/editor", response_model=AdminDesignerEditorPayload, dependencies=[Depends(require_permission("control.designers.edit"))])
 def save_admin_designers_editor_state(payload: AdminDesignerEditorPayload, db: Session = Depends(get_db)) -> dict:
     result = AdminEditorService(db).save_designer_editor_state(payload.model_dump(exclude_unset=True))
+    db.commit()
+    return result
+
+
+@router.patch(
+    "/admin/designers/editor/sources/{source_brand}/enabled",
+    response_model=AdminDesignerSourceEnabledPatch,
+    dependencies=[Depends(require_permission("control.designers.edit"))],
+)
+def set_admin_designer_source_enabled(
+    source_brand: str,
+    payload: AdminDesignerSourceEnabledPatch,
+    db: Session = Depends(get_db),
+) -> dict:
+    result = AdminEditorService(db).set_designer_source_enabled(
+        source_brand=source_brand,
+        include_in_designers=payload.include_in_designers,
+    )
     db.commit()
     return result
 

@@ -175,6 +175,27 @@ def test_untouched_source_brand_is_disabled_when_all_products_become_unavailable
         db.close()
 
 
+def test_source_enabled_patch_updates_only_the_target_mapping(monkeypatch) -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key="source-fast-toggle")
+        brand = "ZZ TEST Fast Toggle"
+        _create_sync_product(db, source=source, brand=brand, suffix="fast-toggle")
+        sync = DesignerCatalogSyncService(db)
+        sync.reconcile(sync_product_links=True)
+
+        monkeypatch.setattr(DesignerCatalogSyncService, "reconcile", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected reconcile")))
+        result = AdminEditorService(db).set_designer_source_enabled(source_brand=brand, include_in_designers=False)
+
+        mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).one()
+        assert result == {"source_brand": brand, "include_in_designers": False}
+        assert mapping.is_enabled is False
+        assert mapping.is_admin_touched is True
+    finally:
+        db.rollback()
+        db.close()
+
+
 def test_disabled_source_brand_is_excluded_from_public_designer_directory() -> None:
     db = SessionLocal()
     try:

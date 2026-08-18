@@ -75,6 +75,13 @@ class AdminDesignerEditorSourceRow(BaseModel):
     include_in_designers: bool = False
 
 
+class AdminDesignerSourceEnabledPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_brand: str = Field(min_length=1)
+    include_in_designers: bool
+
+
 class AdminDesignerEditorDesigner(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

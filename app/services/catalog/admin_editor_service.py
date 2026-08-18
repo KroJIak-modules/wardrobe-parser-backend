@@ -425,6 +425,27 @@ class AdminEditorService:
         self.db.flush()
         return self.list_designer_editor_state(reconcile=False)
 
+    def set_designer_source_enabled(self, *, source_brand: str, include_in_designers: bool) -> dict:
+        normalized_source_brand = self._normalize_text(source_brand)
+        if not normalized_source_brand:
+            raise ValidationError("Не указан бренд-источник")
+
+        mapping = (
+            self.db.query(DesignerSourceName)
+            .filter(func.lower(DesignerSourceName.source_name) == normalized_source_brand.lower())
+            .one_or_none()
+        )
+        if mapping is None:
+            raise ValidationError("Бренд-источник не найден")
+
+        mapping.is_enabled = bool(include_in_designers)
+        mapping.is_admin_touched = True
+        self.db.flush()
+        return {
+            "source_brand": normalized_source_brand,
+            "include_in_designers": bool(mapping.is_enabled),
+        }
+
     def list_taxonomy_editor_state(self) -> dict:
         filters_state = self.taxonomy.get_state()
         filter_assignment_rebuild = ProductFilterAssignmentService(self.db).get_rebuild_status()
