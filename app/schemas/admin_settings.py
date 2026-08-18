@@ -250,22 +250,6 @@ class SettingsTransferWeightRuleEntry(BaseModel):
     keywords: list[str] = Field(default_factory=list)
 
 
-class SettingsTransferDesignerSourceNameEntry(BaseModel):
-    source_name: str = Field(min_length=1, max_length=255)
-    designer_name: str | None = Field(default=None, min_length=1, max_length=255)
-    is_enabled: bool = True
-    is_admin_touched: bool = False
-
-
-class SettingsTransferDesignerEntry(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
-    slug: str = Field(min_length=1, max_length=255)
-    description: str | None = None
-    origin_kind: Literal["auto", "manual"] = "manual"
-    is_admin_touched: bool = False
-    is_enabled: bool = True
-
-
 class SettingsTransferTaxonomyFilterNode(BaseModel):
     slug: str = Field(min_length=1, max_length=255)
     title: str = Field(min_length=1)
@@ -351,8 +335,6 @@ class SettingsTransferPayload(BaseModel):
     suppliers: list[SettingsTransferSupplierEntry] = Field(default_factory=list)
     sources: list[SettingsTransferSourceEntry] = Field(default_factory=list)
     weight_rules: list[SettingsTransferWeightRuleEntry] = Field(default_factory=list)
-    designers: list[SettingsTransferDesignerEntry] = Field(default_factory=list)
-    designer_source_names: list[SettingsTransferDesignerSourceNameEntry] = Field(default_factory=list)
     taxonomy: SettingsTransferTaxonomyState = Field(default_factory=SettingsTransferTaxonomyState)
     site_content: SettingsTransferSiteContent = Field(default_factory=SettingsTransferSiteContent)
 

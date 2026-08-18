@@ -13,10 +13,7 @@ from sqlalchemy.orm import Session
 from app.models import (
     AdminRole,
     AdminUiSettings,
-    Designer,
-    DesignerSourceName,
     PricingSetting,
-    Product,
     ProductListing,
     SiteAboutSetting,
     SiteAccessSetting,
@@ -35,8 +32,6 @@ from app.repositories import (
     CatalogSupplierRepository,
     CatalogWeightRuleRepository,
 )
-from app.services.catalog.designer_support import slugify_designer_name
-from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.catalog_defaults_service import CatalogDefaultsService
 from app.services.catalog.source_registry_service import SourceRegistryService
 from app.services.catalog.taxonomy_service import TaxonomyService
@@ -52,8 +47,6 @@ from app.services.settings.pricing_service import PricingSettingsService
 from app.services.settings.default_admin_settings import DefaultAdminSettingsLoader
 from app.schemas.admin_settings import (
     SettingsTransferAdminUiSettings,
-    SettingsTransferDesignerEntry,
-    SettingsTransferDesignerSourceNameEntry,
     SettingsTransferPayload,
     SettingsTransferPricingSettings,
     SettingsTransferResponse,
@@ -75,7 +68,7 @@ from app.schemas.admin_settings import (
 from app.services.auth.passwords import hash_password
 from app.services.auth.permissions import normalize_permission_list
 
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 11
 _PROJECT_NAME = "wardrobe-parser-platform"
 
 _PRICING_EXPORT_FIELDS = [
@@ -118,9 +111,6 @@ def _normalize_supplier_key(raw_key: str, fallback_name: str, index: int) -> str
     return source[:64]
 
 
-def _slugify_name(raw: str) -> str:
-    return slugify_designer_name(raw)
-
 
 def _numeric_values_equal(left: object, right: object) -> bool:
     try:
@@ -139,10 +129,6 @@ class SettingsTransferService:
         self.source_repo = CatalogSourceRepository(db)
         self.weight_rule_repo = CatalogWeightRuleRepository(db)
         self.taxonomy = TaxonomyService(db)
-
-    @staticmethod
-    def _normalize_designer_key(raw: str | None) -> str:
-        return " ".join(str(raw or "").strip().split()).lower()
 
     @classmethod
     def _serialize_taxonomy_filters(cls, nodes: list[TaxonomyFilterNode]) -> list[SettingsTransferTaxonomyFilterNode]:
@@ -297,17 +283,6 @@ class SettingsTransferService:
         weight_rules = self.weight_rule_repo.list_active()
         supplier_by_id = {int(supplier.id): supplier for supplier in suppliers}
         role_rows = self.db.query(AdminRole).order_by(AdminRole.name.asc(), AdminRole.id.asc()).all()
-        designer_rows = (
-            self.db.query(Designer)
-            .order_by(Designer.name.asc(), Designer.id.asc())
-            .all()
-        )
-        mapping_rows = (
-            self.db.query(DesignerSourceName)
-            .order_by(DesignerSourceName.source_name.asc(), DesignerSourceName.id.asc())
-            .all()
-        )
-
         pricing = SettingsTransferPricingSettings(
             **{
                 field: getattr(pricing_row, field)
@@ -415,27 +390,6 @@ class SettingsTransferService:
             suppliers=supplier_entries,
             sources=source_entries,
             weight_rules=weight_entries,
-            designers=[
-                SettingsTransferDesignerEntry(
-                    name=str(row.name),
-                    slug=str(row.slug),
-                    description=(str(row.description) if row.description else None),
-                    origin_kind=str(getattr(row, "origin_kind", "manual") or "manual"),
-                    is_admin_touched=bool(getattr(row, "is_admin_touched", False)),
-                    is_enabled=bool(getattr(row, "is_enabled", True)),
-                )
-                for row in designer_rows
-                if str(row.name or "").strip() and str(row.slug or "").strip()
-            ],
-            designer_source_names=[
-                SettingsTransferDesignerSourceNameEntry(
-                    source_name=str(row.source_name),
-                    designer_name=(str(row.designer_name) if row.designer_name is not None else None),
-                    is_enabled=bool(getattr(row, "is_enabled", True)),
-                    is_admin_touched=bool(getattr(row, "is_admin_touched", False)),
-                )
-                for row in mapping_rows
-            ],
             taxonomy=self._export_taxonomy(),
             site_content=self._export_site_content(),
         )
@@ -452,16 +406,12 @@ class SettingsTransferService:
             pricing_updated = self._import_pricing(payload.pricing_settings)
             admin_ui_updated = self._import_admin_ui(payload.admin_ui_settings)
             roles_updated = self._import_roles(payload.roles)
-            designer_count = self._import_designers(payload.designers)
-            designer_source_names_updated = self._import_designer_source_names(payload.designer_source_names)
             source_count = self._import_sources(payload.sources, supplier_map=supplier_map)
             weight_count = self._import_weight_rules(payload.weight_rules)
             taxonomy_state = self._import_taxonomy(payload.taxonomy)
             site_content_updated = self._import_site_content(payload.site_content)
-            DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
             pruned_source_count = self._prune_sources(payload.sources)
             pruned_supplier_count = self._prune_suppliers(payload.suppliers)
-            pruned_designer_count = self._prune_designers(payload.designers)
 
             self.db.commit()
             # A transfer replaces several singleton rows; expire the identity map
@@ -480,9 +430,6 @@ class SettingsTransferService:
                     "sources_upserted": source_count,
                     "sources_deleted": pruned_source_count,
                     "weight_rules_replaced": weight_count,
-                    "designers_upserted": designer_count,
-                    "designers_deleted": pruned_designer_count,
-                    "designer_source_names_replaced": designer_source_names_updated,
                     "suppliers_deleted": pruned_supplier_count,
                     "taxonomy_filters_replaced": len(taxonomy_state.filters),
                     "taxonomy_custom_catalogs_replaced": len(taxonomy_state.custom_catalogs),
@@ -544,8 +491,7 @@ class SettingsTransferService:
         self.db.flush()
         weight_rule_count = 0
 
-        # 4) Reset designer source names.
-        self.db.query(DesignerSourceName).delete(synchronize_session=False)
+        # Designer mappings remain catalog data and are intentionally outside reset.
         self.db.query(SiteQuestionItem).delete(synchronize_session=False)
         about = self.db.query(SiteAboutSetting).filter(SiteAboutSetting.id == 1).one_or_none()
         if about is None:
@@ -579,49 +525,6 @@ class SettingsTransferService:
                 "site_access_settings_updated": 1,
             },
         )
-
-    def _import_designers(self, rows: list[SettingsTransferDesignerEntry]) -> int:
-        existing_by_slug = {
-            str(row.slug).strip(): row
-            for row in self.db.query(Designer).order_by(Designer.id.asc()).all()
-            if str(row.slug or "").strip()
-        }
-        existing_by_name = {
-            self._normalize_designer_key(getattr(row, "name", None)): row
-            for row in existing_by_slug.values()
-            if self._normalize_designer_key(getattr(row, "name", None))
-        }
-        kept_ids: set[int] = set()
-        for item in rows:
-            slug = str(item.slug or "").strip()
-            name = " ".join(str(item.name or "").strip().split())
-            if not slug or not name:
-                continue
-            entity = existing_by_slug.get(slug)
-            if entity is None:
-                entity = existing_by_name.get(self._normalize_designer_key(name))
-            if entity is None:
-                entity = Designer(
-                    name=name,
-                    slug=slug,
-                    description=item.description,
-                    origin_kind=item.origin_kind,
-                    is_admin_touched=bool(item.is_admin_touched),
-                    is_enabled=bool(item.is_enabled),
-                )
-                self.db.add(entity)
-                self.db.flush()
-            else:
-                entity.name = name
-                entity.slug = slug
-                entity.description = item.description
-                entity.origin_kind = str(item.origin_kind or "manual")
-                entity.is_admin_touched = bool(item.is_admin_touched)
-                entity.is_enabled = bool(item.is_enabled)
-            existing_by_slug[slug] = entity
-            existing_by_name[self._normalize_designer_key(name)] = entity
-            kept_ids.add(int(entity.id))
-        return len(kept_ids)
 
     def _import_taxonomy(self, payload: SettingsTransferTaxonomyState) -> TaxonomyState:
         weight_rule_id_by_grams = {
@@ -774,31 +677,6 @@ class SettingsTransferService:
                     detail=f"В файле отсутствует тариф '{supplier.name}', но он все еще назначен на {assigned_sources} источников.",
                 )
             self.db.delete(supplier)
-            deleted += 1
-        self.db.flush()
-        return deleted
-
-    def _prune_designers(self, rows: list[SettingsTransferDesignerEntry]) -> int:
-        desired_slugs = {str(item.slug or "").strip() for item in rows if str(item.slug or "").strip()}
-        desired_names = {self._normalize_designer_key(item.name) for item in rows if self._normalize_designer_key(item.name)}
-        referenced_designer_ids = {
-            int(designer_id)
-            for designer_id, in self.db.query(Product.designer_id).filter(Product.designer_id.is_not(None)).all()
-        }
-        referenced_designer_ids.update(
-            int(designer_id)
-            for designer_id, in self.db.query(DesignerSourceName.designer_id).filter(DesignerSourceName.designer_id.is_not(None)).all()
-        )
-
-        deleted = 0
-        for designer in self.db.query(Designer).order_by(Designer.id.asc()).all():
-            if int(designer.id) in referenced_designer_ids:
-                continue
-            if str(designer.slug or "").strip() in desired_slugs:
-                continue
-            if self._normalize_designer_key(designer.name) in desired_names:
-                continue
-            self.db.delete(designer)
             deleted += 1
         self.db.flush()
         return deleted
@@ -1062,51 +940,3 @@ class SettingsTransferService:
                 )
             count += 1
         return count
-
-    def _import_designer_source_names(self, rows: list[SettingsTransferDesignerSourceNameEntry]) -> int:
-        self.db.query(DesignerSourceName).delete(synchronize_session=False)
-        self.db.flush()
-        inserted = 0
-        designers_by_name = {
-            self._normalize_designer_key(getattr(designer, "name", None)): designer
-            for designer in self.db.query(Designer).order_by(Designer.id.asc()).all()
-            if self._normalize_designer_key(getattr(designer, "name", None))
-        }
-        seen_source_names: set[str] = set()
-
-        for item in rows:
-            source_name = str(item.source_name or "").strip()
-            if not source_name:
-                continue
-            if source_name in seen_source_names:
-                continue
-            seen_source_names.add(source_name)
-
-            designer_id = None
-            designer_name = " ".join(str(item.designer_name or "").strip().split())
-            if designer_name:
-                designer = designers_by_name.get(self._normalize_designer_key(designer_name))
-                if designer is None:
-                    designer = Designer(
-                        name=designer_name,
-                        slug=_slugify_name(designer_name),
-                        origin_kind="manual",
-                        is_admin_touched=True,
-                        is_enabled=True,
-                    )
-                    self.db.add(designer)
-                    self.db.flush()
-                    designers_by_name[self._normalize_designer_key(designer_name)] = designer
-                designer_id = int(designer.id)
-
-            self.db.add(
-                DesignerSourceName(
-                    source_name=source_name,
-                    designer_name=(designer_name or source_name),
-                    designer_id=designer_id,
-                    is_enabled=bool(item.is_enabled),
-                    is_admin_touched=bool(item.is_admin_touched),
-                )
-            )
-            inserted += 1
-        return inserted

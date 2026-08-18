@@ -259,13 +259,12 @@ def test_settings_transfer_import_of_exported_payload_is_idempotent_for_pricing_
         db.close()
 
 
-def test_settings_transfer_import_prunes_unreferenced_source_supplier_and_designer_missing_from_file() -> None:
+def test_settings_transfer_import_prunes_unreferenced_source_and_supplier_missing_from_file() -> None:
     db = SessionLocal()
     marker = uuid4().hex[:10]
     extra_supplier_key = f"extra-supplier-{marker}"
     extra_source_key = f"extra-source-{marker}.example"
     extra_source_url = f"https://{extra_source_key}/"
-    extra_designer_slug = f"extra-designer-{marker}"
 
     supplier = Supplier(
         key=extra_supplier_key,
@@ -288,15 +287,6 @@ def test_settings_transfer_import_prunes_unreferenced_source_supplier_and_design
     db.add(source)
     db.flush()
     db.add(SourceSetting(source_id=int(source.id), supplier_id=int(supplier.id)))
-
-    designer = Designer(
-        name=f"Extra Designer {marker}",
-        slug=extra_designer_slug,
-        origin_kind="manual",
-        is_admin_touched=True,
-        is_enabled=True,
-    )
-    db.add(designer)
     db.flush()
 
     service = SettingsTransferService(db)
@@ -307,21 +297,57 @@ def test_settings_transfer_import_prunes_unreferenced_source_supplier_and_design
         payload_data = original_payload.model_dump()
         payload_data["sources"] = [item for item in payload_data["sources"] if item["key"] != extra_source_key]
         payload_data["suppliers"] = [item for item in payload_data["suppliers"] if item["key"] != extra_supplier_key]
-        payload_data["designers"] = [item for item in payload_data["designers"] if item["slug"] != extra_designer_slug]
 
         payload = original_payload.__class__.model_validate(payload_data)
         import_result = SettingsTransferService(db).import_payload(payload)
         assert import_result.ok is True
         assert import_result.imported_counts["sources_deleted"] >= 1
         assert import_result.imported_counts["suppliers_deleted"] >= 1
-        assert import_result.imported_counts["designers_deleted"] >= 1
 
         assert db.query(Source).filter(Source.key == extra_source_key).one_or_none() is None
         assert db.query(Supplier).filter(Supplier.key == extra_supplier_key).one_or_none() is None
-        assert db.query(Designer).filter(Designer.slug == extra_designer_slug).one_or_none() is None
     finally:
         SettingsTransferService(db).import_payload(restore_payload)
         db.commit()
+        db.close()
+
+
+def test_settings_transfer_export_and_import_leave_catalog_designers_untouched() -> None:
+    db = SessionLocal()
+    service = SettingsTransferService(db)
+    designer_rows_before = [
+        (int(row.id), str(row.name), str(row.slug), bool(row.is_enabled))
+        for row in db.query(Designer).order_by(Designer.id.asc()).all()
+    ]
+    source_name_rows_before = [
+        (int(row.id), str(row.source_name), row.designer_name, row.designer_id, bool(row.is_enabled))
+        for row in db.query(DesignerSourceName).order_by(DesignerSourceName.id.asc()).all()
+    ]
+    payload = service.export_payload()
+
+    try:
+        serialized = payload.model_dump()
+        assert "designers" not in serialized
+        assert "designer_source_names" not in serialized
+
+        result = service.import_payload(payload)
+        assert result.ok is True
+        assert "designers_upserted" not in result.imported_counts
+        assert "designers_deleted" not in result.imported_counts
+        assert "designer_source_names_replaced" not in result.imported_counts
+
+        designer_rows_after = [
+            (int(row.id), str(row.name), str(row.slug), bool(row.is_enabled))
+            for row in db.query(Designer).order_by(Designer.id.asc()).all()
+        ]
+        source_name_rows_after = [
+            (int(row.id), str(row.source_name), row.designer_name, row.designer_id, bool(row.is_enabled))
+            for row in db.query(DesignerSourceName).order_by(DesignerSourceName.id.asc()).all()
+        ]
+        assert designer_rows_after == designer_rows_before
+        assert source_name_rows_after == source_name_rows_before
+    finally:
+        db.rollback()
         db.close()
 
 
