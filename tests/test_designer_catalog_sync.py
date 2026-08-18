@@ -124,7 +124,35 @@ def test_designer_editor_counts_unavailable_products_separately_from_public_prod
         db.close()
 
 
-def test_untouched_source_brand_is_removed_when_all_products_become_unavailable() -> None:
+def test_untouched_designer_auto_disables_when_all_products_are_not_orderable_and_reenables() -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key="source-auto-availability")
+        brand = "ZZ TEST Automatic Availability"
+        _, listing = _create_sync_product(db, source=source, brand=brand, suffix="availability")
+        sync = DesignerCatalogSyncService(db)
+
+        sync.reconcile(sync_product_links=True)
+        mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).one()
+        assert mapping.is_enabled is True
+
+        listing.orderability_status = "sold_out"
+        sync.reconcile(sync_product_links=True)
+        assert mapping.is_enabled is False
+
+        listing.orderability_status = "unavailable"
+        sync.reconcile(sync_product_links=True)
+        assert mapping.is_enabled is False
+
+        listing.orderability_status = "orderable"
+        sync.reconcile(sync_product_links=True)
+        assert mapping.is_enabled is True
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_untouched_source_brand_is_disabled_when_all_products_become_unavailable() -> None:
     db = SessionLocal()
     try:
         source = _create_source(db, key="source-beta")
@@ -138,8 +166,9 @@ def test_untouched_source_brand_is_removed_when_all_products_become_unavailable(
         listing.orderability_status = "unavailable"
         DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
 
-        assert db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).count() == 0
-        assert db.query(Designer).filter(Designer.name == brand).count() == 0
+        mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).one()
+        assert mapping.is_enabled is False
+        assert db.query(Designer).filter(Designer.name == brand).count() == 1
         assert db.query(Product).filter(Product.id == int(product.id)).one().designer_id is None
     finally:
         db.rollback()
@@ -341,7 +370,7 @@ def test_multiple_source_brands_can_share_one_designer_and_unused_auto_designer_
         db.close()
 
 
-def test_source_brand_is_recreated_after_untouched_brand_disappears_and_returns() -> None:
+def test_untouched_source_brand_reenables_after_an_orderable_product_returns() -> None:
     db = SessionLocal()
     try:
         source = _create_source(db, key="source-theta")
@@ -352,16 +381,16 @@ def test_source_brand_is_recreated_after_untouched_brand_disappears_and_returns(
         listing.orderability_status = "unavailable"
         DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
 
-        assert db.query(Designer).filter(Designer.name == brand).count() == 0
-        assert db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).count() == 0
+        mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).one()
+        designer = db.query(Designer).filter(Designer.name == brand).one()
+        assert mapping.is_enabled is False
+        assert designer.origin_kind == "auto"
 
         listing.orderability_status = "orderable"
         DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
 
-        recreated_mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).one()
-        recreated_designer = db.query(Designer).filter(Designer.name == brand).one()
-        assert recreated_mapping.is_admin_touched is False
-        assert recreated_designer.origin_kind == "auto"
+        assert mapping.is_enabled is True
+        assert mapping.is_admin_touched is False
     finally:
         db.rollback()
         db.close()
