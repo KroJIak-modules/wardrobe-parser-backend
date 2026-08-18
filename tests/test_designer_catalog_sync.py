@@ -87,6 +87,8 @@ def test_active_source_brand_creates_catalog_designer_automatically() -> None:
         assert row["include_in_designers"] is True
         assert row["designer_name"] == brand
         assert row["source_product_count"] == 1
+        assert row["source_unavailable_product_count"] == 0
+        assert row["source_public_product_count"] == 1
 
         persisted_mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).one()
         persisted_designer = db.query(Designer).filter(Designer.name == brand).one()
@@ -97,6 +99,26 @@ def test_active_source_brand_creates_catalog_designer_automatically() -> None:
         assert int(persisted_mapping.designer_id or 0) == int(persisted_designer.id)
         assert persisted_designer.origin_kind == "auto"
         assert persisted_designer.is_admin_touched is False
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_designer_editor_counts_unavailable_products_separately_from_public_products() -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key="source-counts")
+        brand = "ZZ TEST Availability Counts"
+        _create_sync_product(db, source=source, brand=brand, suffix="available")
+        _create_sync_product(db, source=source, brand=brand, suffix="sold-out", status="sold_out")
+        _create_sync_product(db, source=source, brand=brand, suffix="unavailable", status="unavailable")
+
+        state = AdminEditorService(db).list_designer_editor_state()
+        row = next(item for item in state["rows"] if item["source_brand"] == brand)
+
+        assert row["source_product_count"] == 3
+        assert row["source_unavailable_product_count"] == 2
+        assert row["source_public_product_count"] == 1
     finally:
         db.rollback()
         db.close()
@@ -119,6 +141,26 @@ def test_untouched_source_brand_is_removed_when_all_products_become_unavailable(
         assert db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).count() == 0
         assert db.query(Designer).filter(Designer.name == brand).count() == 0
         assert db.query(Product).filter(Product.id == int(product.id)).one().designer_id is None
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_disabled_source_brand_is_excluded_from_public_designer_directory() -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key="source-disabled-directory")
+        brand = "ZZ TEST Disabled Directory"
+        _create_sync_product(db, source=source, brand=brand, suffix="disabled-directory")
+
+        service = AdminEditorService(db)
+        state = service.list_designer_editor_state()
+        row = next(item for item in state["rows"] if item["source_brand"] == brand)
+        row["include_in_designers"] = False
+        service.save_designer_editor_state({"rows": state["rows"], "designers": state["designers"]})
+
+        directory = service.list_taxonomy_editor_state()["designer_directory"]
+        assert all(item["label"] != brand for item in directory)
     finally:
         db.rollback()
         db.close()
@@ -148,7 +190,10 @@ def test_source_brand_stays_after_admin_toggles_it() -> None:
         assert designer.is_admin_touched is False
 
         editor_state = AdminEditorService(db).list_designer_editor_state()
-        assert all(item["source_brand"] != brand for item in editor_state["rows"])
+        row = next(item for item in editor_state["rows"] if item["source_brand"] == brand)
+        assert row["source_product_count"] == 1
+        assert row["source_unavailable_product_count"] == 1
+        assert row["source_public_product_count"] == 0
         assert any(item["name"] == brand for item in editor_state["designers"])
     finally:
         db.rollback()
@@ -178,7 +223,10 @@ def test_source_brand_stays_after_admin_changes_description() -> None:
         assert db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).count() == 1
 
         editor_state = AdminEditorService(db).list_designer_editor_state()
-        assert all(item["source_brand"] != brand for item in editor_state["rows"])
+        row = next(item for item in editor_state["rows"] if item["source_brand"] == brand)
+        assert row["source_product_count"] == 1
+        assert row["source_unavailable_product_count"] == 1
+        assert row["source_public_product_count"] == 0
         assert any(item["name"] == brand for item in editor_state["designers"])
     finally:
         db.rollback()

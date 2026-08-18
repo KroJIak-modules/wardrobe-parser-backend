@@ -254,7 +254,7 @@ class AdminEditorService:
         sync = DesignerCatalogSyncService(self.db)
         if reconcile:
             sync.reconcile(sync_product_links=False)
-        count_by_source_name = sync.active_source_brand_counts()
+        count_by_source_name = sync.source_brand_product_counts()
         mapping_rows = self.db.query(DesignerSourceName).all()
         mapping_by_source_name = {
             self._normalize_text(row.source_name): row
@@ -267,11 +267,14 @@ class AdminEditorService:
         result_rows: list[dict] = []
         for source_name in all_source_names:
             mapping = mapping_by_source_name.get(source_name)
+            public_count, total_count, unavailable_count = count_by_source_name.get(source_name, (0, 0, 0))
             mapped_designer_name = self._normalize_text(getattr(mapping, "designer_name", None)) if mapping is not None else ""
             result_rows.append(
                 {
                     "source_brand": source_name,
-                    "source_product_count": int(count_by_source_name.get(source_name, 0)),
+                    "source_product_count": total_count,
+                    "source_unavailable_product_count": unavailable_count,
+                    "source_public_product_count": public_count,
                     "designer_name": mapped_designer_name or source_name,
                     "include_in_designers": bool(True if mapping is None else getattr(mapping, "is_enabled", True)),
                 }
@@ -571,7 +574,7 @@ class AdminEditorService:
                 continue
             designer_name = self._normalize_text(row.get("designer_name"))
             if designer_name:
-                product_count_by_designer[designer_name] += int(row.get("source_product_count") or 0)
+                product_count_by_designer[designer_name] += int(row.get("source_public_product_count") or 0)
         designer_directory = [
             {
                 "id": str(item["id"]),
@@ -579,7 +582,7 @@ class AdminEditorService:
                 "product_count": int(product_count_by_designer.get(str(item["name"]), 0)),
             }
             for item in designer_state["designers"]
-            if str(item.get("name") or "").strip()
+            if str(item.get("name") or "").strip() and int(product_count_by_designer.get(str(item["name"]), 0)) > 0
         ]
         designer_directory.sort(key=lambda item: (str(item["label"]), str(item["id"])))
 

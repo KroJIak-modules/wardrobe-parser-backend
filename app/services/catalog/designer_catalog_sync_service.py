@@ -36,6 +36,39 @@ class DesignerCatalogSyncService:
             if normalize_designer_text(row.source_brand)
         }
 
+    def source_brand_product_counts(self) -> dict[str, tuple[int, int, int]]:
+        """Return public, total, and unavailable active-product counts by source brand."""
+        self.db.flush()
+        source_brand = func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw)
+        rows = (
+            self.db.query(
+                source_brand.label("source_brand"),
+                func.count(func.distinct(Product.id)).label("total_count"),
+                func.count(func.distinct(Product.id)).filter(
+                    func.coalesce(ProductListing.orderability_status, "unavailable") != "orderable"
+                ).label("unavailable_count"),
+            )
+            .select_from(ProductListing)
+            .join(ProductListingMember, ProductListingMember.listing_id == ProductListing.id)
+            .join(Product, Product.id == ProductListingMember.product_id)
+            .outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
+            .filter(Product.lifecycle_status == "active")
+            .filter(func.length(func.trim(func.coalesce(ProductListing.source_designer_raw, ""))) > 0)
+            .filter(func.length(func.trim(source_brand)) > 0)
+            .group_by(source_brand)
+            .order_by(func.lower(source_brand).asc())
+            .all()
+        )
+        result: dict[str, tuple[int, int, int]] = {}
+        for row in rows:
+            name = normalize_designer_text(row.source_brand)
+            if not name:
+                continue
+            total_count = int(row.total_count or 0)
+            unavailable_count = int(row.unavailable_count or 0)
+            result[name] = (max(0, total_count - unavailable_count), total_count, unavailable_count)
+        return result
+
     def reconcile(self, *, sync_product_links: bool = True) -> None:
         self.db.flush()
         active_counts = self.active_source_brand_counts()
