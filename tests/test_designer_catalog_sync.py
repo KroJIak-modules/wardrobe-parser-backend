@@ -170,7 +170,31 @@ def test_untouched_source_brand_is_disabled_when_all_products_become_unavailable
         mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).one()
         assert mapping.is_enabled is False
         assert db.query(Designer).filter(Designer.name == brand).count() == 1
-        assert db.query(Product).filter(Product.id == int(product.id)).one().designer_id is None
+        assert db.query(Product).filter(Product.id == int(product.id)).one().designer_id == mapping.designer_id
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_reenabling_source_brand_restores_product_designer_links() -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key="source-reenable-links")
+        brand = "ZZ TEST Reenable Designer Links"
+        product, _ = _create_sync_product(db, source=source, brand=brand, suffix="reenable-links")
+        DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
+        assert db.query(Product).filter(Product.id == int(product.id)).one().designer_id is not None
+
+        service = AdminEditorService(db)
+        service.set_designer_source_enabled(source_brand=brand, include_in_designers=False)
+        disabled = db.query(Product).filter(Product.id == int(product.id)).one()
+        assert disabled.designer_id is not None
+        assert disabled.visibility_status == "hidden"
+
+        service.set_designer_source_enabled(source_brand=brand, include_in_designers=True)
+        restored = db.query(Product).filter(Product.id == int(product.id)).one()
+        mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).one()
+        assert restored.designer_id == mapping.designer_id
     finally:
         db.rollback()
         db.close()

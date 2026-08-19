@@ -447,10 +447,13 @@ class AdminEditorService:
         if not mappings:
             raise ValidationError("Бренд-источник не найден")
 
+        source_names = [mapping.source_name for mapping in mappings]
         for mapping in mappings:
             mapping.is_enabled = bool(include_in_designers)
             mapping.is_admin_touched = True
-        ProductVisibilityService(self.db).refresh_source_brands([mapping.source_name for mapping in mappings])
+        if include_in_designers:
+            DesignerCatalogSyncService(self.db).sync_product_links_for_source_brands(source_names)
+        ProductVisibilityService(self.db).refresh_source_brands(source_names)
         self.db.flush()
         return {
             "source_brand": normalized_source_brand,

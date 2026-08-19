@@ -71,6 +71,43 @@ class DesignerCatalogSyncService:
             result[name] = (max(0, total_count - unavailable_count), total_count, unavailable_count)
         return result
 
+    def sync_product_links_for_source_brands(self, source_brands: list[str]) -> None:
+        """Restore current designer links for a small, explicitly changed brand set."""
+        normalized_brands = {normalize_designer_text(source_brand) for source_brand in source_brands}
+        normalized_brands.discard("")
+        if not normalized_brands:
+            return
+
+        mappings = (
+            self.db.query(DesignerSourceName)
+            .options(joinedload(DesignerSourceName.designer))
+            .filter(func.lower(DesignerSourceName.source_name).in_({brand.lower() for brand in normalized_brands}))
+            .order_by(DesignerSourceName.is_admin_touched.desc(), DesignerSourceName.id.asc())
+            .all()
+        )
+        designer_ids: dict[str, int] = {}
+        for mapping in mappings:
+            source_brand = normalize_designer_text(mapping.source_name)
+            if source_brand and mapping.designer_id is not None:
+                designer_ids.setdefault(source_brand, int(mapping.designer_id))
+        source_brand = func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw)
+        products = (
+            self.db.query(Product)
+            .join(ProductListing, ProductListing.id == Product.primary_listing_id)
+            .outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
+            .filter(Product.lifecycle_status == "active")
+            .filter(func.lower(source_brand).in_({brand.lower() for brand in normalized_brands}))
+            .all()
+        )
+        for product in products:
+            source_brand_name = normalize_designer_text(
+                getattr(product.presentation, "brand_override_name", None)
+                or getattr(product.primary_listing, "source_designer_raw", None)
+            )
+            if source_brand_name in designer_ids:
+                product.designer_id = designer_ids[source_brand_name]
+        self.db.flush()
+
     def reconcile(self, *, sync_product_links: bool = True, refresh_visibility: bool = True) -> None:
         self.db.flush()
         source_counts = self.source_brand_counts(orderable_only=False)
@@ -79,14 +116,14 @@ class DesignerCatalogSyncService:
         mappings = (
             self.db.query(DesignerSourceName)
             .options(joinedload(DesignerSourceName.designer))
-            .order_by(DesignerSourceName.id.asc())
+            .order_by(DesignerSourceName.is_admin_touched.desc(), DesignerSourceName.id.asc())
             .all()
         )
-        mapping_by_source_name = {
-            normalize_designer_text(mapping.source_name): mapping
-            for mapping in mappings
-            if normalize_designer_text(mapping.source_name)
-        }
+        mapping_by_source_name: dict[str, DesignerSourceName] = {}
+        for mapping in mappings:
+            source_name = normalize_designer_text(mapping.source_name)
+            if source_name:
+                mapping_by_source_name.setdefault(source_name, mapping)
 
         designers = self.db.query(Designer).order_by(Designer.id.asc()).all()
         designers_by_id = {int(designer.id): designer for designer in designers}
@@ -200,7 +237,7 @@ class DesignerCatalogSyncService:
                             else None
                         )
                         if mapping is not None:
-                            if bool(mapping.is_enabled) and (override_name in source_counts or mapping_is_protected(mapping, linked)):
+                            if override_name in source_counts or mapping_is_protected(mapping, linked):
                                 desired_designer_id = int(mapping.designer_id) if mapping.designer_id is not None else None
                         else:
                             existing = designers_by_name.get(override_name)
@@ -215,7 +252,7 @@ class DesignerCatalogSyncService:
                                 if mapping is not None and mapping.designer_id is not None
                                 else None
                             )
-                            if mapping is not None and bool(mapping.is_enabled):
+                            if mapping is not None:
                                 if source_name in source_counts or mapping_is_protected(mapping, linked):
                                     desired_designer_id = int(mapping.designer_id) if mapping.designer_id is not None else None
                 if int(product.designer_id or 0) != int(desired_designer_id or 0):
