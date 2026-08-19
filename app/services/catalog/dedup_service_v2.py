@@ -434,6 +434,7 @@ class DedupServiceV2:
             "primary_listing_id": int(product.primary_listing_id) if product.primary_listing_id is not None else None,
             "source_gender": str(getattr(product, "source_gender", "") or ""),
             "gender_is_manual": bool(getattr(product, "gender_is_manual", False)),
+            "is_manually_hidden": bool(getattr(product, "is_manually_hidden", False)),
             "dedup_status": str(getattr(product, "dedup_status", "") or "independent"),
             "dedup_decision_id": (
                 int(getattr(product, "dedup_decision_id"))
@@ -462,6 +463,8 @@ class DedupServiceV2:
             product.source_gender = str(snapshot.get("source_gender") or product.gender)
         if product is not None and "gender_is_manual" in snapshot:
             product.gender_is_manual = bool(snapshot.get("gender_is_manual"))
+        if product is not None and "is_manually_hidden" in snapshot:
+            product.is_manually_hidden = bool(snapshot.get("is_manually_hidden"))
         self.products.set_product_dedup_state(
             product_id=product_id,
             dedup_status=str(snapshot.get("dedup_status") or "independent"),
@@ -539,7 +542,7 @@ class DedupServiceV2:
             "availability_mode": primary.availability_mode,
             "manual_weight_grams": primary.manual_weight_grams,
             "weight_rule_id": primary.weight_rule_id,
-            "visibility_status": primary.visibility_status,
+            "is_manually_hidden": bool(getattr(primary, "is_manually_hidden", False)),
             "primary_listing_id": (int(primary.primary_listing_id) if primary.primary_listing_id is not None else None),
             "presentation": (
                 {
@@ -584,7 +587,8 @@ class DedupServiceV2:
                 manual_weight_grams=primary_snapshot["manual_weight_grams"],
                 weight_rule_id=primary_snapshot["weight_rule_id"],
                 lifecycle_status="active",
-                visibility_status=primary_snapshot["visibility_status"],
+                visibility_status="visible",
+                is_manually_hidden=bool(primary_snapshot.get("is_manually_hidden", False)),
                 dedup_status="independent",
                 dedup_decision_id=None,
                 dedup_target_product_id=None,

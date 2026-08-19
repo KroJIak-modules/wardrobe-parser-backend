@@ -26,6 +26,7 @@ from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSy
 from app.services.catalog.designer_support import normalize_designer_text, slugify_designer_name
 from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
 from app.services.catalog.product_query_service import ProductQueryService
+from app.services.catalog.product_visibility_service import ProductVisibilityService
 from app.services.catalog.taxonomy_service import TaxonomyService
 
 
@@ -360,6 +361,7 @@ class AdminEditorService:
         }
 
         seen_source_names: set[str] = set()
+        visibility_source_names: set[str] = set()
         for raw_row in rows:
             if not isinstance(raw_row, dict):
                 continue
@@ -389,10 +391,13 @@ class AdminEditorService:
                 or bool(mapping.is_enabled) != include_in_designers
             ):
                 mapping.is_admin_touched = True
+            if bool(mapping.is_enabled) != include_in_designers:
+                visibility_source_names.add(source_name)
             mapping.designer_name = next_designer_name
             mapping.is_enabled = include_in_designers
 
         DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
+        ProductVisibilityService(self.db).refresh_source_brands(visibility_source_names)
 
         referenced_designer_ids = {
             int(row[0])
@@ -445,6 +450,7 @@ class AdminEditorService:
         for mapping in mappings:
             mapping.is_enabled = bool(include_in_designers)
             mapping.is_admin_touched = True
+        ProductVisibilityService(self.db).refresh_source_brands([mapping.source_name for mapping in mappings])
         self.db.flush()
         return {
             "source_brand": normalized_source_brand,

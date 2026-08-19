@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductListingMember, ProductPresentation
 from app.services.catalog.designer_support import normalize_designer_text, slugify_designer_name
+from app.services.catalog.product_visibility_service import ProductVisibilityService
 
 
 class DesignerCatalogSyncService:
@@ -70,10 +71,11 @@ class DesignerCatalogSyncService:
             result[name] = (max(0, total_count - unavailable_count), total_count, unavailable_count)
         return result
 
-    def reconcile(self, *, sync_product_links: bool = True) -> None:
+    def reconcile(self, *, sync_product_links: bool = True, refresh_visibility: bool = True) -> None:
         self.db.flush()
         source_counts = self.source_brand_counts(orderable_only=False)
         orderable_source_counts = self.source_brand_counts(orderable_only=True)
+        visibility_source_names: set[str] = set()
         mappings = (
             self.db.query(DesignerSourceName)
             .options(joinedload(DesignerSourceName.designer))
@@ -141,6 +143,7 @@ class DesignerCatalogSyncService:
         for source_name in source_counts:
             mapping = mapping_by_source_name.get(source_name)
             if mapping is None:
+                visibility_source_names.add(source_name)
                 mapping = DesignerSourceName(
                     source_name=source_name,
                     designer_name=source_name,
@@ -151,7 +154,10 @@ class DesignerCatalogSyncService:
                 self.db.flush()
                 mapping_by_source_name[source_name] = mapping
             elif not bool(mapping.is_admin_touched):
-                mapping.is_enabled = source_name in orderable_source_counts
+                next_is_enabled = source_name in orderable_source_counts
+                if bool(mapping.is_enabled) != next_is_enabled:
+                    visibility_source_names.add(source_name)
+                    mapping.is_enabled = next_is_enabled
 
         for source_name, mapping in mapping_by_source_name.items():
             normalized_source_name = normalize_designer_text(source_name)
@@ -227,6 +233,8 @@ class DesignerCatalogSyncService:
             mapping_by_source_name.pop(source_name, None)
 
         self.db.flush()
+        if refresh_visibility:
+            ProductVisibilityService(self.db).refresh_source_brands(visibility_source_names)
 
         referenced_designer_ids = {
             int(designer_id)

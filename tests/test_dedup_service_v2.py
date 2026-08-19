@@ -201,7 +201,7 @@ class _FakeFilterAssignments:
 
 
 def _service() -> tuple[DedupServiceV2, _FakeProductsRepo, _FakeDecisionsRepo, _FakeFilterAssignments]:
-    service = DedupServiceV2(db=SimpleNamespace(add=lambda *_: None, flush=lambda: None, delete=lambda *_: None))  # type: ignore[arg-type]
+    service = DedupServiceV2(db=SimpleNamespace(add=lambda *_: None, flush=lambda: None, delete=lambda *_: None, info={}))  # type: ignore[arg-type]
     products = _FakeProductsRepo()
     decisions = _FakeDecisionsRepo()
     filter_assignments = _FakeFilterAssignments()

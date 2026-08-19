@@ -27,6 +27,7 @@ from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSy
 from app.services.catalog.designer_support import normalize_designer_text, slugify_designer_name
 from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
 from app.services.catalog.product_ingest_service import ProductIngestService
+from app.services.catalog.product_visibility_service import ProductVisibilityService
 from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
 from app.services.catalog.source_registry_service import SourceRegistryService
 
@@ -52,6 +53,7 @@ class ProductWriteService:
         self.products = CatalogProductRepository(db)
         self.sources = SourceRegistryService(db)
         self.filter_assignments = ProductFilterAssignmentService(db)
+        self.visibility = ProductVisibilityService(db)
         self.site_sort_prices = SiteCatalogSortPriceService(db)
 
     @staticmethod
@@ -130,7 +132,7 @@ class ProductWriteService:
             "availability_mode": str(getattr(product, "availability_mode", "") or "by_order"),
             "manual_weight_grams": int(product.manual_weight_grams) if getattr(product, "manual_weight_grams", None) is not None else None,
             "weight_rule_id": int(product.weight_rule_id) if getattr(product, "weight_rule_id", None) is not None else None,
-            "visibility_status": str(getattr(product, "visibility_status", "") or "visible"),
+            "is_manually_hidden": bool(getattr(product, "is_manually_hidden", False)),
             "primary_listing_id": int(product.primary_listing_id) if getattr(product, "primary_listing_id", None) is not None else None,
             "presentation": (
                 {
@@ -245,7 +247,7 @@ class ProductWriteService:
         product.availability_mode = self._normalize_availability_mode(snapshot.get("availability_mode"))
         product.manual_weight_grams = self._int_or_none(snapshot.get("manual_weight_grams"))
         product.weight_rule_id = self._int_or_none(snapshot.get("weight_rule_id"))
-        product.visibility_status = self._normalize_visibility_status(snapshot.get("visibility_status"))
+        product.is_manually_hidden = bool(snapshot.get("is_manually_hidden"))
 
         available_listing_ids = {
             int(listing.id)
@@ -462,7 +464,8 @@ class ProductWriteService:
             gender_is_manual=True,
             availability_mode=normalized_availability_mode,
             lifecycle_status="active",
-            visibility_status=self._normalize_visibility_status(payload.get("visibility_status")),
+            visibility_status="visible",
+            is_manually_hidden=self._normalize_visibility_status(payload.get("visibility_status")) == "hidden",
             manual_weight_grams=self._int_or_none(payload.get("manual_weight_grams")),
         )
         return product, title, normalized_orderability_status
@@ -505,6 +508,7 @@ class ProductWriteService:
                 items=[service_item],
                 target_product_id=int(product.id),
                 force_primary_listing=bool(force_primary_listing),
+                refresh_visibility=False,
             )
 
             refreshed_product_id = int(product.id)
@@ -521,13 +525,15 @@ class ProductWriteService:
             )
             self.db.flush()
             self.db.expire(refreshed_product)
-            DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
+            DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True, refresh_visibility=False)
             self._sync_weight_state(product=refreshed_product, listing=primary_listing)
-            self.site_sort_prices.refresh_product_ids([int(refreshed_product.id)], commit=False)
             self.db.flush()
-            self.filter_assignments.enqueue_product_ids_after_commit([int(refreshed_product.id)])
-            self.site_sort_prices.enqueue_product_ids_after_commit([int(refreshed_product.id)])
-            return int(refreshed_product.id)
+            self.filter_assignments.enqueue_product_ids_after_commit([refreshed_product_id])
+            self.site_sort_prices.enqueue_product_ids_after_commit([refreshed_product_id])
+
+        self.visibility.refresh_product_ids([refreshed_product_id])
+        self.site_sort_prices.refresh_product_ids([refreshed_product_id], commit=False)
+        return refreshed_product_id
 
     def _ensure_designer_for_brand(self, brand_name: str):
         normalized_name = normalize_designer_text(brand_name)
@@ -1010,7 +1016,7 @@ class ProductWriteService:
             presentation.description_visibility = bool(payload.get("description_visibility"))
 
         if "visibility_status" in payload:
-            product.visibility_status = self._normalize_visibility_status(payload.get("visibility_status"))
+            product.is_manually_hidden = self._normalize_visibility_status(payload.get("visibility_status")) == "hidden"
 
         if "availability_mode" in payload:
             next_availability_mode = self._normalize_availability_mode(payload.get("availability_mode"))
@@ -1066,6 +1072,7 @@ class ProductWriteService:
             self.db.expire(product)
             DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
         self._sync_weight_state(product=product, listing=listing)
+        self.visibility.refresh_product_ids([int(product.id)])
         self.site_sort_prices.refresh_product_ids([int(product.id)], commit=False)
         self.db.flush()
         if "filter_slugs" in payload:
@@ -1118,6 +1125,7 @@ class ProductWriteService:
             listing = self._primary_listing_or_error(product)
             self._sync_weight_state(product=product, listing=listing)
 
+        self.visibility.refresh_product_ids(normalized_ids)
         self.db.flush()
         return [int(product.id) for product in products]
 
@@ -1161,13 +1169,16 @@ class ProductWriteService:
                 filter_slugs=payload.get("filter_slugs"),
                 custom_catalog_slugs=payload.get("custom_catalog_slugs"),
             )
-            DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
+            DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True, refresh_visibility=False)
             self._sync_weight_state(product=product, listing=listing, variant_payloads=variants)
-            self.site_sort_prices.refresh_product_ids([int(product.id)], commit=False)
+            product_id = int(product.id)
             self.db.flush()
-            self.filter_assignments.enqueue_product_ids_after_commit([int(product.id)])
-            self.site_sort_prices.enqueue_product_ids_after_commit([int(product.id)])
-            return int(product.id)
+            self.filter_assignments.enqueue_product_ids_after_commit([product_id])
+            self.site_sort_prices.enqueue_product_ids_after_commit([product_id])
+
+        self.visibility.refresh_product_ids([product_id])
+        self.site_sort_prices.refresh_product_ids([product_id], commit=False)
+        return product_id
 
     def update_manual_product(self, *, product_id: int, payload: dict) -> None:
         product = self._product_or_error(product_id)
@@ -1198,7 +1209,7 @@ class ProductWriteService:
         if "availability_mode" in payload:
             product.availability_mode = next_availability_mode
         if "visibility_status" in payload:
-            product.visibility_status = self._normalize_visibility_status(payload.get("visibility_status"))
+            product.is_manually_hidden = self._normalize_visibility_status(payload.get("visibility_status")) == "hidden"
         if "description_text" in payload:
             listing.source_description_text = str(payload.get("description_text") or "").strip() or None
         if "description_html" in payload:
@@ -1241,6 +1252,7 @@ class ProductWriteService:
         if designer_state_changed:
             DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
         self._sync_weight_state(product=product, listing=listing, variant_payloads=variants)
+        self.visibility.refresh_product_ids([int(product.id)])
         self.site_sort_prices.refresh_product_ids([int(product.id)], commit=False)
         self.db.flush()
         if any(key in payload for key in ("title", "source_category_name", "filter_slugs")):
@@ -1274,6 +1286,7 @@ class ProductWriteService:
                 availability_mode=str(product.availability_mode),
                 lifecycle_status="active",
                 visibility_status="visible",
+                is_manually_hidden=bool(getattr(product, "is_manually_hidden", False)),
                 manual_weight_grams=None,
                 weight_rule_id=None,
             )
@@ -1319,6 +1332,7 @@ class ProductWriteService:
             availability_mode=str(product.availability_mode),
             lifecycle_status="active",
             visibility_status="visible",
+            is_manually_hidden=bool(getattr(product, "is_manually_hidden", False)),
             manual_weight_grams=None,
             weight_rule_id=None,
         )

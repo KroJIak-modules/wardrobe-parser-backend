@@ -85,8 +85,8 @@ def test_default_product_sorting_uses_source_orderability_novelty_and_visibility
     source_a_key = f"sorting-a-{marker}.example"
     source_b_key = f"sorting-b-{marker}.example"
     try:
-        source_a = _create_source(db, key=source_a_key, sort_priority=1)
-        source_b = _create_source(db, key=source_b_key, sort_priority=2)
+        source_a = _create_source(db, key=source_a_key, sort_priority=-2)
+        source_b = _create_source(db, key=source_b_key, sort_priority=-1)
 
         alpha_orderable_older_visible = _ingest_product(
             db,
@@ -138,6 +138,7 @@ def test_default_product_sorting_uses_source_orderability_novelty_and_visibility
         )
 
         alpha_orderable_older_visible.availability_mode = "in_stock"
+        alpha_orderable_newer_hidden.is_manually_hidden = True
         alpha_orderable_newer_hidden.visibility_status = "hidden"
         alpha_orderable_newer_hidden.availability_mode = "in_stock"
         alpha_unavailable.availability_mode = "by_order"

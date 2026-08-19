@@ -49,6 +49,7 @@ class Product(Base):
         index=True,
     )
     visibility_status = Column(String(16), nullable=False, default="visible", server_default="visible")
+    is_manually_hidden = Column(Boolean, nullable=False, default=False, server_default="false")
     site_sort_price_rub = Column(Numeric(12, 2), nullable=True, index=True)
     site_sort_price_synced_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

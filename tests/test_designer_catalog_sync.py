@@ -5,9 +5,10 @@ from fastapi.testclient import TestClient
 import app.api.v1.auth as auth_module
 from app.core.database import SessionLocal
 from app.main import app
-from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductListingMember, Source
+from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductListingMember, Source, SourceSetting
 from app.services.catalog.admin_editor_service import AdminEditorService
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
+from app.services.catalog.product_visibility_service import ProductVisibilityService
 from app.services.catalog.product_write_service import ProductWriteService
 
 
@@ -170,6 +171,87 @@ def test_untouched_source_brand_is_disabled_when_all_products_become_unavailable
         assert mapping.is_enabled is False
         assert db.query(Designer).filter(Designer.name == brand).count() == 1
         assert db.query(Product).filter(Product.id == int(product.id)).one().designer_id is None
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_brand_visibility_preserves_manual_hidden_products() -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key="source-brand-visibility")
+        brand = "ZZ TEST Brand Visibility"
+        automatic_product, _ = _create_sync_product(db, source=source, brand=brand, suffix="automatic")
+        manual_product, _ = _create_sync_product(db, source=source, brand=brand, suffix="manual")
+        manual_product.is_manually_hidden = True
+        sync = DesignerCatalogSyncService(db)
+        sync.reconcile(sync_product_links=True)
+
+        AdminEditorService(db).set_designer_source_enabled(source_brand=brand, include_in_designers=False)
+        db.expire_all()
+        assert db.query(Product).filter(Product.id == int(automatic_product.id)).one().visibility_status == "hidden"
+        assert db.query(Product).filter(Product.id == int(manual_product.id)).one().visibility_status == "hidden"
+
+        AdminEditorService(db).set_designer_source_enabled(source_brand=brand, include_in_designers=True)
+        db.expire_all()
+        assert db.query(Product).filter(Product.id == int(automatic_product.id)).one().visibility_status == "visible"
+        assert db.query(Product).filter(Product.id == int(manual_product.id)).one().visibility_status == "hidden"
+
+        manual_product = db.query(Product).filter(Product.id == int(manual_product.id)).one()
+        manual_product.is_manually_hidden = False
+        ProductVisibilityService(db).refresh_product_ids([int(manual_product.id)])
+        assert manual_product.visibility_status == "visible"
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_source_visibility_preserves_manual_hidden_products() -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key="source-visibility")
+        visible_product, _ = _create_sync_product(db, source=source, brand="ZZ TEST Source Visibility", suffix="visible")
+        manual_product, _ = _create_sync_product(db, source=source, brand="ZZ TEST Source Visibility", suffix="manual")
+        manual_product.is_manually_hidden = True
+        setting = SourceSetting(source_id=int(source.id), hide_auto_added_products=True)
+        db.add(setting)
+        visibility = ProductVisibilityService(db)
+        visibility.refresh_source_ids([int(source.id)])
+        db.expire_all()
+        assert db.query(Product).filter(Product.id == int(visible_product.id)).one().visibility_status == "hidden"
+        assert db.query(Product).filter(Product.id == int(manual_product.id)).one().visibility_status == "hidden"
+
+        setting = db.query(SourceSetting).filter(SourceSetting.source_id == int(source.id)).one()
+        setting.hide_auto_added_products = False
+        visibility.refresh_source_ids([int(source.id)])
+        db.expire_all()
+        assert db.query(Product).filter(Product.id == int(visible_product.id)).one().visibility_status == "visible"
+        assert db.query(Product).filter(Product.id == int(manual_product.id)).one().visibility_status == "hidden"
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_product_write_manual_visibility_is_preserved_across_brand_toggle() -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key="source-product-write-visibility")
+        brand = "ZZ TEST Product Write Visibility"
+        product, _ = _create_sync_product(db, source=source, brand=brand, suffix="product-write")
+        sync = DesignerCatalogSyncService(db)
+        sync.reconcile(sync_product_links=True)
+
+        ProductWriteService(db).update_product(product_id=int(product.id), payload={"visibility_status": "hidden"})
+        AdminEditorService(db).set_designer_source_enabled(source_brand=brand, include_in_designers=False)
+        AdminEditorService(db).set_designer_source_enabled(source_brand=brand, include_in_designers=True)
+        db.expire_all()
+
+        restored = db.query(Product).filter(Product.id == int(product.id)).one()
+        assert restored.is_manually_hidden is True
+        assert restored.visibility_status == "hidden"
+
+        ProductWriteService(db).update_product(product_id=int(product.id), payload={"visibility_status": "visible"})
+        assert db.query(Product).filter(Product.id == int(product.id)).one().visibility_status == "visible"
     finally:
         db.rollback()
         db.close()

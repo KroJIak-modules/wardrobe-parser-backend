@@ -11,6 +11,7 @@ from app.core.exceptions import ValidationError
 from app.models import Product, ProductListing, WeightRule, WeightRuleKeyword
 from app.repositories.catalog_products import CatalogProductRepository
 from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
+from app.services.catalog.product_visibility_service import ProductVisibilityService
 from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
 from app.services.settings.weight_rule_matcher import WeightRuleMatcherEntry, WeightRuleMatcherField, resolve_match_for_fields
 
@@ -316,6 +317,7 @@ class ProductIngestService:
         reconcile_missing: bool = False,
         target_product_id: int | None = None,
         force_primary_listing: bool = False,
+        refresh_visibility: bool = True,
     ) -> BatchApplyResult:
         result = BatchApplyResult(listings_seen=0, listings_applied=0)
         seen_listing_ids: set[int] = set()
@@ -376,15 +378,14 @@ class ProductIngestService:
             product = self._resolve_product(listing_id=int(listing.id), target_product_id=target_product_id)
             normalized_gender = self._normalize_gender(item.get("gender"))
             if product is None:
-                source_setting = getattr(getattr(listing, "source", None), "setting", None)
-                visibility_status = "hidden" if bool(getattr(source_setting, "hide_auto_added_products", False)) else "visible"
                 product = self.products.create_product(
                     gender=normalized_gender,
                     source_gender=normalized_gender,
                     gender_is_manual=False,
                     availability_mode="by_order",
                     lifecycle_status="active",
-                    visibility_status=visibility_status,
+                    visibility_status="visible",
+                    is_manually_hidden=False,
                 )
                 self.products.ensure_membership(product_id=int(product.id), listing_id=int(listing.id))
                 product.primary_listing_id = int(listing.id)
@@ -447,6 +448,8 @@ class ProductIngestService:
                     product.primary_listing_id = int(siblings[0].id)
 
         self.db.flush()
+        if refresh_visibility:
+            ProductVisibilityService(self.db).refresh_product_ids(affected_product_ids)
         ProductFilterAssignmentService(self.db).enqueue_product_ids_after_commit(affected_product_ids)
         SiteCatalogSortPriceService(self.db).enqueue_product_ids_after_commit(affected_product_ids)
         return result
