@@ -30,6 +30,7 @@ from app.models import (
 from app.repositories.catalog_products import CatalogProductRepository
 from app.repositories.catalog_taxonomy import CatalogTaxonomyRepository
 from app.schemas.admin_settings import PricingSettingsResponse, PricingSupplierRateResponse, PricingSupplierResponse
+from app.services.catalog.public_product_policy import effective_public_orderability_expression
 from app.services.catalog.product_title_service import ProductTitleService
 from app.services.catalog.source_registry_service import SourceRegistryService
 from app.services.settings.pricing_service import PricingSettingsService
@@ -1581,39 +1582,7 @@ class ProductQueryService:
             base_query = base_query.filter(Product.availability_mode == str(availability_mode).strip().lower())
         if orderability_status:
             normalized_orderability_status = str(orderability_status).strip().lower()
-            primary_listing_has_gallery_scope = select(ProductListingGalleryImage.id).where(
-                ProductListingGalleryImage.product_id == Product.id,
-                ProductListingGalleryImage.listing_id == Product.primary_listing_id,
-            ).exists()
-            primary_listing_has_visible_gallery_image = select(ProductListingGalleryImage.id).where(
-                ProductListingGalleryImage.product_id == Product.id,
-                ProductListingGalleryImage.listing_id == Product.primary_listing_id,
-                ProductListingGalleryImage.is_hidden.is_(False),
-                or_(
-                    ProductListingGalleryImage.image_asset_id.is_not(None),
-                    and_(
-                        ProductListingGalleryImage.listing_image_id.is_not(None),
-                        func.coalesce(SourceSetting.show_images, True).is_(True),
-                    ),
-                ),
-            ).exists()
-            primary_listing_has_source_image = select(ProductListingImage.id).where(
-                ProductListingImage.listing_id == Product.primary_listing_id,
-            ).exists()
-            has_visible_images_expr = case(
-                (primary_listing_has_gallery_scope, primary_listing_has_visible_gallery_image),
-                else_=and_(
-                    func.coalesce(SourceSetting.show_images, True).is_(True),
-                    primary_listing_has_source_image,
-                ),
-            )
-            effective_orderability_expr = case(
-                (Product.dedup_status != "independent", literal("unavailable")),
-                (Product.site_sort_price_rub.is_(None), literal("unavailable")),
-                (not_(has_visible_images_expr), literal("unavailable")),
-                else_=func.coalesce(ProductListing.orderability_status, literal("unavailable")),
-            )
-            base_query = base_query.filter(effective_orderability_expr == normalized_orderability_status)
+            base_query = base_query.filter(effective_public_orderability_expression() == normalized_orderability_status)
         if effective_filter_slug is not None:
             base_query = self._apply_filter_slug_query(base_query, effective_filter_slug)
         if effective_custom_catalog_slug is not None:

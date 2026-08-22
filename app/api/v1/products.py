@@ -18,6 +18,7 @@ from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.sync_error_humanizer import humanize_sync_error, normalize_sync_error_code
 from app.services.catalog.product_ingest_service import ProductIngestService
 from app.services.catalog.product_query_service import ProductQueryService
+from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.product_write_service import ProductWriteService
 from app.services.catalog.source_registry_service import SourceRegistryService
 
@@ -532,6 +533,7 @@ def add_product_by_url(payload: ProductUrlRequest, db: Session = Depends(get_db)
     service_item = _probe_service_product(payload.url)
     source_id = _resolve_source_id(db, payload.url)
     ProductIngestService(db).apply_batch(source_id=source_id, items=[service_item])
+    DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
     db.commit()
     return {"ok": True}
 
@@ -546,6 +548,7 @@ def bind_source_by_url(product_id: int, payload: BindSourceByUrlRequest, db: Ses
         target_product_id=product_id,
         force_primary_listing=bool(payload.set_as_primary),
     )
+    DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
     db.commit()
     return _get_admin_mutation_payload_or_404(db, product_id)
 

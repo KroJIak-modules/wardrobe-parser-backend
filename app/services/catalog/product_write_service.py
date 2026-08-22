@@ -531,8 +531,9 @@ class ProductWriteService:
             self.filter_assignments.enqueue_product_ids_after_commit([refreshed_product_id])
             self.site_sort_prices.enqueue_product_ids_after_commit([refreshed_product_id])
 
-        self.visibility.refresh_product_ids([refreshed_product_id])
         self.site_sort_prices.refresh_product_ids([refreshed_product_id], commit=False)
+        DesignerCatalogSyncService(self.db).reconcile(sync_product_links=False)
+        self.visibility.refresh_product_ids([refreshed_product_id])
         return refreshed_product_id
 
     def _ensure_designer_for_brand(self, brand_name: str):
@@ -1072,8 +1073,9 @@ class ProductWriteService:
             self.db.expire(product)
             DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
         self._sync_weight_state(product=product, listing=listing)
-        self.visibility.refresh_product_ids([int(product.id)])
         self.site_sort_prices.refresh_product_ids([int(product.id)], commit=False)
+        DesignerCatalogSyncService(self.db).reconcile(sync_product_links=False)
+        self.visibility.refresh_product_ids([int(product.id)])
         self.db.flush()
         if "filter_slugs" in payload:
             self.filter_assignments.enqueue_product_ids_after_commit([int(product.id)])
@@ -1091,6 +1093,7 @@ class ProductWriteService:
         listing.status_reason = None
         self._sync_weight_state(product=product, listing=listing, variant_payloads=normalized_variants)
         self.site_sort_prices.refresh_product_ids([int(product.id)], commit=False)
+        DesignerCatalogSyncService(self.db).reconcile(sync_product_links=False)
         self.db.flush()
         self.site_sort_prices.enqueue_product_ids_after_commit([int(product.id)])
 
@@ -1176,8 +1179,9 @@ class ProductWriteService:
             self.filter_assignments.enqueue_product_ids_after_commit([product_id])
             self.site_sort_prices.enqueue_product_ids_after_commit([product_id])
 
-        self.visibility.refresh_product_ids([product_id])
         self.site_sort_prices.refresh_product_ids([product_id], commit=False)
+        DesignerCatalogSyncService(self.db).reconcile(sync_product_links=False)
+        self.visibility.refresh_product_ids([product_id])
         return product_id
 
     def update_manual_product(self, *, product_id: int, payload: dict) -> None:
@@ -1252,8 +1256,9 @@ class ProductWriteService:
         if designer_state_changed:
             DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
         self._sync_weight_state(product=product, listing=listing, variant_payloads=variants)
-        self.visibility.refresh_product_ids([int(product.id)])
         self.site_sort_prices.refresh_product_ids([int(product.id)], commit=False)
+        DesignerCatalogSyncService(self.db).reconcile(sync_product_links=False)
+        self.visibility.refresh_product_ids([int(product.id)])
         self.db.flush()
         if any(key in payload for key in ("title", "source_category_name", "filter_slugs")):
             self.filter_assignments.enqueue_product_ids_after_commit([int(product.id)])

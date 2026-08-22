@@ -6,6 +6,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from sqlalchemy.orm import Session
 
 from app.repositories.catalog_products import CatalogProductRepository
+from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.product_query_service import ProductQueryService
 from app.services.catalog.site_catalog_sort_price_queue import SiteCatalogSortPriceQueue
 
@@ -49,10 +50,10 @@ class SiteCatalogSortPriceService:
             )
             product.site_sort_price_rub = self._normalize_price(final_display_price)
             product.site_sort_price_synced_at = synced_at
+        self.db.flush()
         if commit:
+            DesignerCatalogSyncService(self.db).reconcile(sync_product_links=False)
             self.db.commit()
-        else:
-            self.db.flush()
         return len(products)
 
     def refresh_missing_batch(self, *, batch_size: int) -> int:

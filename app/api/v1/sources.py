@@ -16,6 +16,7 @@ from app.models import ImageAsset, Product, ProductListing, ProductListingMember
 from app.services.auth.admin_auth_service import require_permission
 from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.sync_error_humanizer import humanize_sync_error
+from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.product_visibility_service import ProductVisibilityService
 from app.services.catalog.source_registry_service import SourceRegistryService
 from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
@@ -244,6 +245,7 @@ def patch_hide_auto_added(source_key: str, payload: AutoHidePatch, db: Session =
         raise NotFoundError("Источник не найден")
     setting = repo.ensure_setting(entity)
     setting.hide_auto_added_products = bool(payload.hide_auto_added_products)
+    DesignerCatalogSyncService(db).reconcile(sync_product_links=False)
     ProductVisibilityService(db).refresh_source_ids([int(entity.id)])
     db.commit()
     return _source_payload(entity, _source_counts_by_id(db))
@@ -265,6 +267,8 @@ def patch_display_settings(source_key: str, payload: SourceDisplaySettingsPatch,
         setting.show_images = bool(payload.show_images)
     if payload.clean_public_titles is not None:
         setting.clean_public_titles = bool(payload.clean_public_titles)
+    if payload.show_images is not None:
+        DesignerCatalogSyncService(db).reconcile(sync_product_links=False)
     db.commit()
     return _source_payload(entity, _source_counts_by_id(db))
 

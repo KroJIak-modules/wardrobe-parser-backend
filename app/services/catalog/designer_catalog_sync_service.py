@@ -3,8 +3,9 @@ from __future__ import annotations
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductListingMember, ProductPresentation
+from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductPresentation, SourceSetting
 from app.services.catalog.designer_support import normalize_designer_text, slugify_designer_name
+from app.services.catalog.public_product_policy import public_product_candidate_condition, public_product_condition
 from app.services.catalog.product_visibility_service import ProductVisibilityService
 
 
@@ -12,51 +13,54 @@ class DesignerCatalogSyncService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def source_brand_counts(self, *, orderable_only: bool) -> dict[str, int]:
-        """Count active products by effective source brand, optionally only orderable ones."""
-        self.db.flush()
+    def _source_brand_count_query(self):
         source_brand = func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw)
-        query = (
-            self.db.query(
-                source_brand.label("source_brand"),
-                func.count(func.distinct(Product.id)).label("source_product_count"),
-            )
-            .select_from(ProductListing)
-            .join(ProductListingMember, ProductListingMember.listing_id == ProductListing.id)
-            .join(Product, Product.id == ProductListingMember.product_id)
+        return source_brand, (
+            self.db.query(source_brand.label("source_brand"), Product.id.label("product_id"))
+            .select_from(Product)
+            .join(ProductListing, ProductListing.id == Product.primary_listing_id)
             .outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
+            .outerjoin(SourceSetting, SourceSetting.source_id == ProductListing.source_id)
             .filter(Product.lifecycle_status == "active")
             .filter(func.length(func.trim(func.coalesce(ProductListing.source_designer_raw, ""))) > 0)
             .filter(func.length(func.trim(source_brand)) > 0)
         )
-        if orderable_only:
-            query = query.filter(ProductListing.orderability_status == "orderable")
-        rows = query.group_by(source_brand).order_by(func.lower(source_brand).asc()).all()
+
+    @staticmethod
+    def _counts_by_source_brand(rows) -> dict[str, int]:
         return {
             normalize_designer_text(row.source_brand): int(row.source_product_count or 0)
             for row in rows
             if normalize_designer_text(row.source_brand)
         }
 
-    def source_brand_product_counts(self) -> dict[str, tuple[int, int, int]]:
-        """Return public, total, and unavailable active-product counts by source brand."""
+    def source_brand_counts(self, *, public_candidates_only: bool) -> dict[str, int]:
+        """Count active primary-listing products by brand using the shared public policy."""
         self.db.flush()
-        source_brand = func.coalesce(ProductPresentation.brand_override_name, ProductListing.source_designer_raw)
+        source_brand, query = self._source_brand_count_query()
+        if public_candidates_only:
+            query = query.filter(public_product_candidate_condition())
         rows = (
-            self.db.query(
+            query.with_entities(
                 source_brand.label("source_brand"),
-                func.count(func.distinct(Product.id)).label("total_count"),
-                func.count(func.distinct(Product.id)).filter(
-                    func.coalesce(ProductListing.orderability_status, "unavailable") != "orderable"
-                ).label("unavailable_count"),
+                func.count(Product.id).label("source_product_count"),
             )
-            .select_from(ProductListing)
-            .join(ProductListingMember, ProductListingMember.listing_id == ProductListing.id)
-            .join(Product, Product.id == ProductListingMember.product_id)
-            .outerjoin(ProductPresentation, ProductPresentation.product_id == Product.id)
-            .filter(Product.lifecycle_status == "active")
-            .filter(func.length(func.trim(func.coalesce(ProductListing.source_designer_raw, ""))) > 0)
-            .filter(func.length(func.trim(source_brand)) > 0)
+            .group_by(source_brand)
+            .order_by(func.lower(source_brand).asc())
+            .all()
+        )
+        return self._counts_by_source_brand(rows)
+
+    def source_brand_product_counts(self) -> dict[str, tuple[int, int, int]]:
+        """Return public, total, and non-public active primary-product counts by source brand."""
+        self.db.flush()
+        source_brand, query = self._source_brand_count_query()
+        rows = (
+            query.with_entities(
+                source_brand.label("source_brand"),
+                func.count(Product.id).label("total_count"),
+                func.count(Product.id).filter(public_product_condition()).label("public_count"),
+            )
             .group_by(source_brand)
             .order_by(func.lower(source_brand).asc())
             .all()
@@ -67,8 +71,8 @@ class DesignerCatalogSyncService:
             if not name:
                 continue
             total_count = int(row.total_count or 0)
-            unavailable_count = int(row.unavailable_count or 0)
-            result[name] = (max(0, total_count - unavailable_count), total_count, unavailable_count)
+            public_count = int(row.public_count or 0)
+            result[name] = (public_count, total_count, max(0, total_count - public_count))
         return result
 
     def sync_product_links_for_source_brands(self, source_brands: list[str]) -> None:
@@ -110,8 +114,8 @@ class DesignerCatalogSyncService:
 
     def reconcile(self, *, sync_product_links: bool = True, refresh_visibility: bool = True) -> None:
         self.db.flush()
-        source_counts = self.source_brand_counts(orderable_only=False)
-        orderable_source_counts = self.source_brand_counts(orderable_only=True)
+        source_counts = self.source_brand_counts(public_candidates_only=False)
+        public_candidate_source_counts = self.source_brand_counts(public_candidates_only=True)
         visibility_source_names: set[str] = set()
         mappings = (
             self.db.query(DesignerSourceName)
@@ -184,14 +188,14 @@ class DesignerCatalogSyncService:
                 mapping = DesignerSourceName(
                     source_name=source_name,
                     designer_name=source_name,
-                    is_enabled=source_name in orderable_source_counts,
+                    is_enabled=source_name in public_candidate_source_counts,
                     is_admin_touched=False,
                 )
                 self.db.add(mapping)
                 self.db.flush()
                 mapping_by_source_name[source_name] = mapping
             elif not bool(mapping.is_admin_touched):
-                next_is_enabled = source_name in orderable_source_counts
+                next_is_enabled = source_name in public_candidate_source_counts
                 if bool(mapping.is_enabled) != next_is_enabled:
                     visibility_source_names.add(source_name)
                     mapping.is_enabled = next_is_enabled

@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 import app.api.v1.auth as auth_module
 from app.core.database import SessionLocal
 from app.main import app
-from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductListingMember, Source, SourceSetting
+from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductListingImage, ProductListingMember, Source, SourceSetting
 from app.services.catalog.admin_editor_service import AdminEditorService
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.product_visibility_service import ProductVisibilityService
@@ -49,8 +49,16 @@ def _create_sync_product(db, *, source: Source, brand: str, suffix: str, status:
     db.flush()
 
     db.add(ProductListingMember(product_id=int(product.id), listing_id=int(listing.id)))
+    db.add(
+        ProductListingImage(
+            listing_id=int(listing.id),
+            position=0,
+            url=f"https://{source.key}.example.com/images/{suffix}.jpg",
+        )
+    )
     db.flush()
     product.primary_listing_id = int(listing.id)
+    product.site_sort_price_rub = 100
     db.flush()
     return product, listing
 
@@ -88,7 +96,7 @@ def test_active_source_brand_creates_catalog_designer_automatically() -> None:
         assert row["include_in_designers"] is True
         assert row["designer_name"] == brand
         assert row["source_product_count"] == 1
-        assert row["source_unavailable_product_count"] == 0
+        assert row["source_non_public_product_count"] == 0
         assert row["source_public_product_count"] == 1
 
         persisted_mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).one()
@@ -118,7 +126,7 @@ def test_designer_editor_counts_unavailable_products_separately_from_public_prod
         row = next(item for item in state["rows"] if item["source_brand"] == brand)
 
         assert row["source_product_count"] == 3
-        assert row["source_unavailable_product_count"] == 2
+        assert row["source_non_public_product_count"] == 2
         assert row["source_public_product_count"] == 1
     finally:
         db.rollback()
@@ -146,6 +154,49 @@ def test_untouched_designer_auto_disables_when_all_products_are_not_orderable_an
         assert mapping.is_enabled is False
 
         listing.orderability_status = "orderable"
+        sync.reconcile(sync_product_links=True)
+        assert mapping.is_enabled is True
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_untouched_designer_auto_availability_uses_public_candidate_rule() -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key="source-public-candidate")
+        brand = "ZZ TEST Public Candidate"
+        product, listing = _create_sync_product(db, source=source, brand=brand, suffix="public-candidate")
+        sync = DesignerCatalogSyncService(db)
+
+        sync.reconcile(sync_product_links=True)
+        mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).one()
+        assert mapping.is_enabled is True
+
+        product.is_manually_hidden = True
+        sync.reconcile(sync_product_links=True)
+        assert mapping.is_enabled is False
+
+        product.is_manually_hidden = False
+        sync.reconcile(sync_product_links=True)
+        assert mapping.is_enabled is True
+
+        setting = SourceSetting(source_id=int(source.id), hide_auto_added_products=True)
+        db.add(setting)
+        sync.reconcile(sync_product_links=True)
+        assert mapping.is_enabled is False
+
+        setting.hide_auto_added_products = False
+        product.site_sort_price_rub = None
+        sync.reconcile(sync_product_links=True)
+        assert mapping.is_enabled is False
+
+        product.site_sort_price_rub = 100
+        db.query(ProductListingImage).filter(ProductListingImage.listing_id == int(listing.id)).delete(synchronize_session=False)
+        sync.reconcile(sync_product_links=True)
+        assert mapping.is_enabled is False
+
+        db.add(ProductListingImage(listing_id=int(listing.id), position=0, url="https://example.com/restored.jpg"))
         sync.reconcile(sync_product_links=True)
         assert mapping.is_enabled is True
     finally:
@@ -384,7 +435,7 @@ def test_source_brand_stays_after_admin_toggles_it() -> None:
         editor_state = AdminEditorService(db).list_designer_editor_state()
         row = next(item for item in editor_state["rows"] if item["source_brand"] == brand)
         assert row["source_product_count"] == 1
-        assert row["source_unavailable_product_count"] == 1
+        assert row["source_non_public_product_count"] == 1
         assert row["source_public_product_count"] == 0
         assert any(item["name"] == brand for item in editor_state["designers"])
     finally:
@@ -417,7 +468,7 @@ def test_source_brand_stays_after_admin_changes_description() -> None:
         editor_state = AdminEditorService(db).list_designer_editor_state()
         row = next(item for item in editor_state["rows"] if item["source_brand"] == brand)
         assert row["source_product_count"] == 1
-        assert row["source_unavailable_product_count"] == 1
+        assert row["source_non_public_product_count"] == 1
         assert row["source_public_product_count"] == 0
         assert any(item["name"] == brand for item in editor_state["designers"])
     finally:

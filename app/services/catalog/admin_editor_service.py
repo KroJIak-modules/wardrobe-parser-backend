@@ -274,7 +274,7 @@ class AdminEditorService:
                 {
                     "source_brand": source_name,
                     "source_product_count": total_count,
-                    "source_unavailable_product_count": unavailable_count,
+                    "source_non_public_product_count": unavailable_count,
                     "source_public_product_count": public_count,
                     "designer_name": mapped_designer_name or source_name,
                     "include_in_designers": bool(True if mapping is None else getattr(mapping, "is_enabled", True)),

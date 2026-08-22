@@ -69,7 +69,7 @@ class AdminDesignerEditorSourceRow(BaseModel):
 
     source_brand: str = Field(min_length=1)
     source_product_count: int = Field(ge=0)
-    source_unavailable_product_count: int = Field(default=0, ge=0)
+    source_non_public_product_count: int = Field(default=0, ge=0)
     source_public_product_count: int = Field(default=0, ge=0)
     designer_name: str = Field(default="")
     include_in_designers: bool = False
