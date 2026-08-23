@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 import app.api.v1.auth as auth_module
@@ -61,6 +62,34 @@ def test_admin_showcase_catalog_experience_preview_available(monkeypatch) -> Non
     assert group_keys[:2] == ["sort", "availability"]
     assert group_keys[-1] == "gender"
     assert set(group_keys).issubset({"sort", "availability", "section", "designer", "gender"})
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "?limit=12&offset=0",
+        "?sort=price_asc&limit=12&offset=0",
+        "?sort=price_desc&limit=12&offset=0",
+        "?availability=preorder&limit=12&offset=0",
+        "?availability=in-stock&sort=price_desc&limit=12&offset=0",
+        "?status=sold_out&limit=12&offset=0",
+        "?discounted_only=true&limit=12&offset=0",
+        "?gender=men&limit=12&offset=0",
+        "?gender=women&sort=price_asc&limit=12&offset=0",
+        "?designer=missing-designer&limit=12&offset=0",
+        "?section=missing-section&limit=12&offset=0",
+        "?q=no-such-product&limit=12&offset=0",
+    ],
+)
+def test_admin_showcase_catalog_order_matches_public_for_same_query(monkeypatch, query: str) -> None:
+    client = _authorized_client(monkeypatch)
+
+    admin_response = client.get(f"/api/v1/admin/showcase/catalog-products{query}")
+    public_response = client.get(f"/api/v1/site/catalog/products{query}")
+
+    assert admin_response.status_code == 200
+    assert public_response.status_code == 200
+    assert admin_response.json() == public_response.json()
 
 
 def test_admin_showcase_catalog_products_available(monkeypatch) -> None:
