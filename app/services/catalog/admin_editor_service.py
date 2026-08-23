@@ -281,18 +281,17 @@ class AdminEditorService:
                 }
             )
 
-        designers = [
-            {
-                "id": str(designer.id),
-                "name": self._normalize_text(designer.name),
-                "description": str(designer.description or "").strip(),
-            }
-            for designer in (
-                self.db.query(Designer)
-                .order_by(Designer.name.asc(), Designer.id.asc())
-                .all()
-            )
-        ]
+        designers = sorted(
+            (
+                {
+                    "id": str(designer.id),
+                    "name": self._normalize_text(designer.name),
+                    "description": str(designer.description or "").strip(),
+                }
+                for designer in self.db.query(Designer).all()
+            ),
+            key=lambda item: (str(item["name"]).casefold(), str(item["id"])),
+        )
         return {"rows": result_rows, "designers": designers}
 
     def save_designer_editor_state(self, payload: dict) -> dict:

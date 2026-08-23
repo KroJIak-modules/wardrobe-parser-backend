@@ -82,6 +82,22 @@ def _authorized_client(monkeypatch) -> TestClient:
     return client
 
 
+def test_designer_editor_state_sorts_final_designers_like_public_directory() -> None:
+    db = SessionLocal()
+    try:
+        names = ["Zulu 10", "alpha 2", "Alpha 11"]
+        db.add_all(Designer(name=name, slug=f"designer-sort-{index}") for index, name in enumerate(names))
+        db.flush()
+
+        state = AdminEditorService(db).list_designer_editor_state()
+        ordered_names = [item["name"] for item in state["designers"] if item["name"] in names]
+
+        assert ordered_names == ["Alpha 11", "alpha 2", "Zulu 10"]
+    finally:
+        db.rollback()
+        db.close()
+
+
 def test_active_source_brand_creates_catalog_designer_automatically() -> None:
     db = SessionLocal()
     try:
