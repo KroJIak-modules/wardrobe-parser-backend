@@ -33,6 +33,10 @@ class SyncEnabledPatch(BaseModel):
     sync_enabled: bool
 
 
+class SourceModePatch(BaseModel):
+    mode: str
+
+
 class DedupEnabledPatch(BaseModel):
     dedup_enabled: bool
 
@@ -221,6 +225,13 @@ def patch_sync_enabled(source_key: str, payload: SyncEnabledPatch, db: Session =
         raise NotFoundError("Источник не найден")
     setting = repo.ensure_setting(entity)
     setting.is_sync_enabled = bool(payload.sync_enabled)
+    db.commit()
+    return _source_payload(entity, _source_counts_by_id(db))
+
+
+@router.patch("/sources/{source_key}/mode", dependencies=[Depends(require_permission("control.sources.edit"))])
+def patch_source_mode(source_key: str, payload: SourceModePatch, db: Session = Depends(get_db)) -> dict:
+    entity = SourceRegistryService(db).set_parser_mode(source_key=source_key, mode=payload.mode)
     db.commit()
     return _source_payload(entity, _source_counts_by_id(db))
 

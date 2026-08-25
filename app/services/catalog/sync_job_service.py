@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.exceptions import ValidationError
 from app.models import SyncJob, SyncJobSourceRun
+from app.repositories.catalog_products import CatalogProductRepository
 from app.repositories.catalog_sources import CatalogSourceRepository
 from app.repositories.catalog_sync import CatalogSyncRepository
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
@@ -30,6 +31,7 @@ class SyncJobService:
 
     def __init__(self, db: Session) -> None:
         self.db = db
+        self.products = CatalogProductRepository(db)
         self.sync_repo = CatalogSyncRepository(db)
         self.source_repo = CatalogSourceRepository(db)
 
@@ -308,11 +310,15 @@ class SyncJobService:
                 if source.key in normalized_requested:
                     selected_sources.append(source)
                 continue
-            if source_mode == "auto":
-                selected_sources.append(source)
+            selected_sources.append(source)
         if not selected_sources:
             raise ValueError("Нет доступных источников для синхронизации")
 
+        candidate_urls_by_source = {
+            source.key: self.products.list_source_listing_urls(int(source.id))
+            for source in selected_sources
+            if SourceRegistryService.derive_source_mode(source) == "manual"
+        }
         try:
             response = requests.post(
                 self._service_url("/jobs"),
@@ -320,6 +326,7 @@ class SyncJobService:
                     "triggered_by": "backend",
                     "dry_run": False,
                     "sources": [source.key for source in selected_sources],
+                    "candidate_urls_by_source": candidate_urls_by_source,
                 },
                 timeout=(5, 30),
             )

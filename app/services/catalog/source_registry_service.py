@@ -37,6 +37,21 @@ class SourceRegistryService:
         raw_mode = (config or {}).get("mode") if isinstance(config, dict) else None
         return cls.normalize_parser_mode(raw_mode)
 
+    def set_parser_mode(self, *, source_key: str, mode: str) -> Source:
+        source = self.repo.get_by_key(source_key)
+        if source is None:
+            raise ValidationError("Источник не найден")
+        if self.derive_source_mode(source) == "personal":
+            raise ValidationError("Режим личного источника нельзя изменить")
+        normalized_mode = self.normalize_parser_mode(mode)
+        if str(mode or "").strip().lower() not in {"auto", "manual"}:
+            raise ValidationError("Режим источника должен быть «Авто» или «Ручной»")
+        parser_config = dict(source.parser_config or {})
+        parser_config["mode"] = normalized_mode
+        source.parser_config = parser_config
+        self.db.flush()
+        return source
+
     def ensure_manual_source(self) -> Source:
         source = self.repo.get_by_key(self.MANUAL_SOURCE_KEY)
         if source is None:

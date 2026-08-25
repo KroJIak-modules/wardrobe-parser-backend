@@ -710,6 +710,18 @@ class CatalogProductRepository:
             .all()
         )
 
+    def list_source_listing_urls(self, source_id: int) -> list[str]:
+        rows = (
+            self.session.query(ProductListing.url)
+            .filter(ProductListing.source_id == int(source_id))
+            .filter(ProductListing.url.is_not(None))
+            .filter(func.length(func.trim(ProductListing.url)) > 0)
+            .distinct()
+            .order_by(ProductListing.url.asc())
+            .all()
+        )
+        return [str(url).strip() for url, in rows if str(url or "").strip()]
+
     def list_source_listings(self, source_id: int, *, ingest_mode: str | None = None) -> list[ProductListing]:
         query = self.session.query(ProductListing).filter(ProductListing.source_id == int(source_id))
         if ingest_mode:

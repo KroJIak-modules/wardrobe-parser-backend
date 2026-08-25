@@ -7,7 +7,7 @@ import requests
 from app.api.v1.sources import _source_payload
 from app.core.database import SessionLocal
 from app.core.exceptions import ValidationError
-from app.models import Source, SourceSetting, SourceSyncState, SyncJob, SyncJobSourceRun
+from app.models import ProductListing, Source, SourceSetting, SourceSyncState, SyncJob, SyncJobSourceRun
 from app.services.catalog.sync_error_humanizer import humanize_sync_error
 from app.services.catalog.sync_job_service import SyncJobService
 
@@ -31,6 +31,115 @@ def test_humanize_sync_error_translates_source_configuration_failure() -> None:
     assert humanize_sync_error("Missing source.config.strategy_sequence") == (
         "Настройки источника требуют проверки. Синхронизация этого источника не выполнена."
     )
+
+
+def test_sync_job_passes_saved_urls_for_manual_source(monkeypatch) -> None:
+    db = SessionLocal()
+    source_key = f"manual-sync-{uuid4().hex[:10]}.example"
+    try:
+        source = Source(
+            key=source_key,
+            name=source_key,
+            base_url=f"https://{source_key}",
+            base_url_normalized=source_key,
+            adapter_key="demo__v1",
+            parser_config={"mode": "manual"},
+        )
+        db.add(source)
+        db.flush()
+        db.add(SourceSetting(source_id=int(source.id), is_enabled=True, is_sync_enabled=True))
+        db.add_all(
+            [
+                ProductListing(
+                    source_id=int(source.id),
+                    url="https://example.test/product-b",
+                    url_normalized="example.test/product-b",
+                    host_normalized="example.test",
+                    source_title="B",
+                ),
+                ProductListing(
+                    source_id=int(source.id),
+                    url="https://example.test/product-a",
+                    url_normalized="example.test/product-a",
+                    host_normalized="example.test",
+                    source_title="A",
+                ),
+            ]
+        )
+        db.commit()
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"job_id": "service-job", "status": "queued"}
+
+        captured: dict = {}
+        monkeypatch.setattr(requests, "post", lambda *args, **kwargs: captured.update(kwargs.get("json") or {}) or Response())
+
+        SyncJobService(db).start_job(triggered_by_admin_user_id=None, source_keys=[source_key], trigger_kind="manual")
+
+        assert captured["sources"] == [source_key]
+        assert captured["candidate_urls_by_source"] == {
+            source_key: ["https://example.test/product-a", "https://example.test/product-b"],
+        }
+    finally:
+        db.query(ProductListing).filter(ProductListing.source_id == int(source.id)).delete(synchronize_session=False)
+        db.query(SourceSetting).filter(SourceSetting.source_id == int(source.id)).delete(synchronize_session=False)
+        db.query(SourceSyncState).filter(SourceSyncState.source_id == int(source.id)).delete(synchronize_session=False)
+        db.query(Source).filter(Source.key == source_key).delete(synchronize_session=False)
+        db.commit()
+        db.close()
+
+
+def test_scheduled_sync_includes_manual_sources_with_saved_urls(monkeypatch) -> None:
+    db = SessionLocal()
+    source_key = f"scheduled-manual-{uuid4().hex[:10]}.example"
+    try:
+        source = Source(
+            key=source_key,
+            name=source_key,
+            base_url=f"https://{source_key}",
+            base_url_normalized=source_key,
+            adapter_key="demo__v1",
+            parser_config={"mode": "manual"},
+        )
+        db.add(source)
+        db.flush()
+        db.add(SourceSetting(source_id=int(source.id), is_enabled=True, is_sync_enabled=True))
+        db.add(
+            ProductListing(
+                source_id=int(source.id),
+                url="https://example.test/scheduled-product",
+                url_normalized="example.test/scheduled-product",
+                host_normalized="example.test",
+                source_title="Scheduled product",
+            )
+        )
+        db.commit()
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"job_id": "service-job", "status": "queued"}
+
+        captured: dict = {}
+        monkeypatch.setattr(requests, "post", lambda *args, **kwargs: captured.update(kwargs.get("json") or {}) or Response())
+
+        SyncJobService(db).start_job(triggered_by_admin_user_id=None, trigger_kind="scheduled")
+
+        assert source_key in captured["sources"]
+        assert captured["candidate_urls_by_source"][source_key] == ["https://example.test/scheduled-product"]
+    finally:
+        db.query(ProductListing).filter(ProductListing.source_id == int(source.id)).delete(synchronize_session=False)
+        db.query(SourceSetting).filter(SourceSetting.source_id == int(source.id)).delete(synchronize_session=False)
+        db.query(SourceSyncState).filter(SourceSyncState.source_id == int(source.id)).delete(synchronize_session=False)
+        db.query(Source).filter(Source.key == source_key).delete(synchronize_session=False)
+        db.commit()
+        db.close()
 
 
 def test_sync_job_start_returns_human_message_when_service_unavailable(monkeypatch) -> None:
