@@ -1543,6 +1543,7 @@ class ProductQueryService:
         )
         if normalized_audience == "public":
             base_query = base_query.filter(Product.dedup_status == "independent")
+            base_query = base_query.filter(Product.visibility_status == "visible")
         if needs_listing_join:
             base_query = (
                 base_query
@@ -1694,8 +1695,12 @@ class ProductQueryService:
         if product is None:
             return None
         normalized_audience = str(audience).strip().lower()
-        if normalized_audience == "public" and self._dedup_status(product) != "independent":
-            return None
+        if normalized_audience == "public":
+            if (
+                self._dedup_status(product) != "independent"
+                or str(product.visibility_status or "").strip().lower() != "visible"
+            ):
+                return None
         primary_listing = self._resolved_primary_listing(product)
         effective_orderability_status, _ = self._effective_orderability_state(product, primary_listing)
         if effective_orderability_status == "unavailable":

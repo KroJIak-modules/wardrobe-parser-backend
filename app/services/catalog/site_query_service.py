@@ -824,7 +824,7 @@ class SiteQueryService:
             raise NotFoundError("Товар не найден")
         product_id = int(match.group("id"))
         product = self.products.products.get_product(product_id)
-        if product is None:
+        if product is None or str(product.visibility_status or "").strip().lower() != "visible":
             raise NotFoundError("Товар не найден")
         public_payload = self.products.get_product_payload(product_id, audience="public")
         if public_payload is None:
