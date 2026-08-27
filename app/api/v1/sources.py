@@ -13,12 +13,15 @@ from app.core.database import get_db
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models import ImageAsset, Product, ProductListing, ProductListingMember, Source
+from app.repositories.catalog_sources import CatalogSourceRepository
 from app.services.auth.admin_auth_service import require_permission
 from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.sync_error_humanizer import humanize_sync_error
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.product_visibility_service import ProductVisibilityService
+from app.services.catalog.product_write_service import ProductWriteService
 from app.services.catalog.source_registry_service import SourceRegistryService
+from app.repositories.catalog_sync import CatalogSyncRepository
 from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
 
 
@@ -227,6 +230,26 @@ def patch_sync_enabled(source_key: str, payload: SyncEnabledPatch, db: Session =
     setting.is_sync_enabled = bool(payload.sync_enabled)
     db.commit()
     return _source_payload(entity, _source_counts_by_id(db))
+
+
+@router.delete(
+    "/sources/{source_key}/products",
+    dependencies=[Depends(require_permission("control.sources.edit")), Depends(require_permission("control.products.edit"))],
+)
+def delete_source_products(source_key: str, db: Session = Depends(get_db)) -> dict:
+    source = CatalogSourceRepository(db).get_by_key(source_key)
+    if source is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Источник не найден")
+    if CatalogSyncRepository(db).has_active_job():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Нельзя удалить товары во время синхронизации")
+    deleted_listings, deleted_products = ProductWriteService(db).delete_source_products(source_id=int(source.id))
+    db.commit()
+    return {
+        "ok": True,
+        "source_key": source.key,
+        "deleted_listings": deleted_listings,
+        "deleted_products": deleted_products,
+    }
 
 
 @router.patch("/sources/{source_key}/mode", dependencies=[Depends(require_permission("control.sources.edit"))])

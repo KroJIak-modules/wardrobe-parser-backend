@@ -17,6 +17,7 @@ from app.models import (
     ImageAsset,
     Product,
     ProductDedupDecision,
+    ProductListing,
     ProductListingGalleryImage,
     ProductListingMember,
 )
@@ -322,7 +323,13 @@ class ProductWriteService:
         self._apply_combine_snapshot_to_product(product_id=int(created_product_id), snapshot=node.snapshot or {})
         return int(created_product_id)
 
-    def _rewrite_combine_component_after_delete(self, *, product_id: int, affected_product_ids: set[int]) -> bool:
+    def _rewrite_combine_component_after_delete(
+        self,
+        *,
+        product_id: int,
+        affected_product_ids: set[int],
+        delete_all_listings: bool = False,
+    ) -> bool:
         decisions = self._load_combine_decisions()
         if not decisions:
             return False
@@ -427,7 +434,11 @@ class ProductWriteService:
 
         for deleted_leaf_product_id in deleted_leaf_ids:
             if self.products.get_product(int(deleted_leaf_product_id)) is not None:
-                self._delete_product_storage(product_id=int(deleted_leaf_product_id), affected_product_ids=affected_product_ids)
+                if delete_all_listings:
+                    self.db.delete(self._product_or_error(int(deleted_leaf_product_id)))
+                    self.db.flush()
+                else:
+                    self._delete_product_storage(product_id=int(deleted_leaf_product_id), affected_product_ids=affected_product_ids)
 
         dedup_service = DedupServiceV2(self.db)
         for tree in pruned_trees:
@@ -1318,6 +1329,106 @@ class ProductWriteService:
         DesignerCatalogSyncService(self.db).reconcile(sync_product_links=False)
         self.filter_assignments.enqueue_product_ids_after_commit(sorted(affected_product_ids))
         self.site_sort_prices.enqueue_product_ids_after_commit(sorted(affected_product_ids))
+
+    def delete_source_products(self, *, source_id: int) -> tuple[int, int]:
+        source_listing_ids = {
+            int(listing_id)
+            for listing_id, in (
+                self.db.query(ProductListing.id)
+                .filter(ProductListing.source_id == int(source_id))
+                .all()
+            )
+        }
+        if not source_listing_ids:
+            return 0, 0
+
+        source_owner_product_ids = {
+            int(product_id)
+            for product_id, in (
+                self.db.query(ProductListingMember.product_id)
+                .filter(ProductListingMember.listing_id.in_(source_listing_ids))
+                .filter(ProductListingMember.membership_kind == "owner")
+                .all()
+            )
+        }
+        if not source_owner_product_ids:
+            deleted_listings = (
+                self.db.query(ProductListing)
+                .filter(ProductListing.id.in_(source_listing_ids))
+                .delete(synchronize_session=False)
+            )
+            self.db.flush()
+            DesignerCatalogSyncService(self.db).reconcile(sync_product_links=False)
+            return int(deleted_listings), 0
+
+        surviving_listing_ids_by_product: dict[int, list[int]] = defaultdict(list)
+        for product_id, listing_id in (
+            self.db.query(ProductListingMember.product_id, ProductListingMember.listing_id)
+            .filter(ProductListingMember.product_id.in_(source_owner_product_ids))
+            .filter(~ProductListingMember.listing_id.in_(source_listing_ids))
+            .all()
+        ):
+            surviving_listing_ids_by_product[int(product_id)].append(int(listing_id))
+
+        product_states = {
+            int(product_id): (str(dedup_status), int(primary_listing_id or 0))
+            for product_id, dedup_status, primary_listing_id in (
+                self.db.query(Product.id, Product.dedup_status, Product.primary_listing_id)
+                .filter(Product.id.in_(source_owner_product_ids))
+                .all()
+            )
+        }
+        surviving_product_ids = set(surviving_listing_ids_by_product)
+        for product_id in surviving_product_ids:
+            _dedup_status, primary_listing_id = product_states[product_id]
+            if primary_listing_id in source_listing_ids:
+                self.db.query(Product).filter(Product.id == product_id).update(
+                    {Product.primary_listing_id: min(surviving_listing_ids_by_product[product_id])},
+                    synchronize_session=False,
+                )
+
+        source_only_product_ids = source_owner_product_ids - surviving_product_ids
+        dedup_product_ids = {
+            product_id
+            for product_id in source_only_product_ids
+            if product_states[product_id][0] != "independent"
+        }
+        deleted_product_ids = source_only_product_ids - dedup_product_ids
+        if deleted_product_ids:
+            self.db.query(Product).filter(Product.id.in_(deleted_product_ids)).delete(synchronize_session=False)
+            self.db.flush()
+
+        affected_product_ids = set(source_owner_product_ids)
+        for product_id in sorted(dedup_product_ids):
+            if self.products.get_product(product_id) is not None:
+                self._rewrite_combine_component_after_delete(
+                    product_id=product_id,
+                    affected_product_ids=affected_product_ids,
+                    delete_all_listings=True,
+                )
+                deleted_product_ids.add(product_id)
+
+        self.db.flush()
+        affected_source_brands = [
+            source_brand
+            for source_brand, in (
+                self.db.query(ProductListing.source_designer_raw)
+                .filter(ProductListing.id.in_(source_listing_ids))
+                .filter(ProductListing.source_designer_raw.is_not(None))
+                .distinct()
+                .all()
+            )
+        ]
+        deleted_listings = (
+            self.db.query(ProductListing)
+            .filter(ProductListing.id.in_(source_listing_ids))
+            .delete(synchronize_session=False)
+        )
+        self.db.flush()
+        DesignerCatalogSyncService(self.db).sync_product_links_for_source_brands(affected_source_brands)
+        self.filter_assignments.enqueue_product_ids_after_commit(sorted(surviving_product_ids))
+        self.site_sort_prices.enqueue_product_ids_after_commit(sorted(surviving_product_ids))
+        return int(deleted_listings), len(deleted_product_ids)
 
     def unbind_listing(self, *, product_id: int, listing_id: int) -> int:
         product = self._product_or_error(product_id)

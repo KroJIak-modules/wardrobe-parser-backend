@@ -40,6 +40,14 @@ class CatalogSyncRepository:
     def get_source_run_by_id(self, source_run_id: int) -> SyncJobSourceRun | None:
         return self.session.query(SyncJobSourceRun).filter(SyncJobSourceRun.id == int(source_run_id)).one_or_none()
 
+    def has_active_job(self) -> bool:
+        return (
+            self.session.query(SyncJob.id)
+            .filter(SyncJob.status.in_(("queued", "running")))
+            .first()
+            is not None
+        )
+
     def list_source_runs(self, *, sync_job_id: int) -> list[SyncJobSourceRun]:
         return (
             self.session.query(SyncJobSourceRun)
