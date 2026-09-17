@@ -9,6 +9,7 @@ from sqlalchemy import String, and_, case, cast, func, literal, not_, or_, selec
 from sqlalchemy.orm import Session, joinedload
 
 from app.models import (
+    AdminProductView,
     CustomCatalog,
     CustomCatalogProduct,
     Designer,
@@ -223,7 +224,7 @@ class ProductQueryService:
     def _apply_default_product_sorting(cls, query):
         return query.order_by(*cls._default_product_sorting_expressions())
 
-    def _filtered_product_ids_subquery(
+    def filtered_product_ids_subquery(
         self,
         *,
         query: str = "",
@@ -237,6 +238,8 @@ class ProductQueryService:
         availability_mode: str | None = None,
         orderability_status: str | None = None,
         audience: str = "admin",
+        new_only: bool = False,
+        admin_user_id: int | None = None,
         alias: str = "filtered_products",
     ):
         return (
@@ -252,6 +255,8 @@ class ProductQueryService:
                 availability_mode=availability_mode,
                 orderability_status=orderability_status,
                 audience=audience,
+                new_only=new_only,
+                admin_user_id=admin_user_id,
             )
             .distinct()
             .subquery(alias)
@@ -1517,12 +1522,17 @@ class ProductQueryService:
         availability_mode: str | None = None,
         orderability_status: str | None = None,
         audience: str = "admin",
+        new_only: bool = False,
+        admin_user_id: int | None = None,
     ):
         normalized_source_mode = str(source_mode or "").strip().lower()
         normalized_designer_filter = str(designer_filter or "").strip()
         normalized_query = " ".join(str(query or "").strip().lower().split())
         effective_filter_slug = str(filter_slug or "").strip() or None
         effective_custom_catalog_slug = str(custom_catalog_slug or "").strip() or None
+        if new_only and admin_user_id is None:
+            # Without a known admin there is no "new" scope at all.
+            return self.db.query(Product.id.label("product_id")).filter(False)
 
         needs_listing_join = any(
             (
@@ -1544,6 +1554,14 @@ class ProductQueryService:
         if normalized_audience == "public":
             base_query = base_query.filter(Product.dedup_status == "independent")
             base_query = base_query.filter(Product.visibility_status == "visible")
+        if new_only:
+            viewed_products = select(AdminProductView.product_id).where(
+                and_(
+                    AdminProductView.admin_user_id == int(admin_user_id),
+                    AdminProductView.product_id == Product.id,
+                )
+            )
+            base_query = base_query.filter(~viewed_products.exists())
         if needs_listing_join:
             base_query = (
                 base_query
@@ -1644,7 +1662,7 @@ class ProductQueryService:
         orderability_status: str | None = None,
         audience: str = "admin",
     ) -> dict:
-        filtered_ids = self._filtered_product_ids_subquery(
+        filtered_ids = self.filtered_product_ids_subquery(
             query=query,
             source_id=source_id,
             source_mode=source_mode,
@@ -1836,8 +1854,10 @@ class ProductQueryService:
         visibility_status: str | None = None,
         availability_mode: str | None = None,
         orderability_status: str | None = None,
+        new_only: bool = False,
+        admin_user_id: int | None = None,
     ) -> dict:
-        filtered_ids = self._filtered_product_ids_subquery(
+        filtered_ids = self.filtered_product_ids_subquery(
             query=query,
             source_id=source_id,
             source_mode=source_mode,
@@ -1848,6 +1868,8 @@ class ProductQueryService:
             visibility_status=visibility_status,
             availability_mode=availability_mode,
             orderability_status=orderability_status,
+            new_only=new_only,
+            admin_user_id=admin_user_id,
             alias="admin_table_product_ids",
         )
         total = int(self.db.query(func.count()).select_from(filtered_ids).scalar() or 0)
@@ -1899,9 +1921,11 @@ class ProductQueryService:
         visibility_status: str | None = None,
         availability_mode: str | None = None,
         orderability_status: str | None = None,
+        new_only: bool = False,
+        admin_user_id: int | None = None,
     ) -> dict:
         effective_filter_slug = str(filter_slug or "").strip() or None
-        section_context_ids = self._filtered_product_ids_subquery(
+        section_context_ids = self.filtered_product_ids_subquery(
             query=query,
             source_id=source_id,
             source_mode=source_mode,
@@ -1911,9 +1935,11 @@ class ProductQueryService:
             visibility_status=visibility_status,
             availability_mode=availability_mode,
             orderability_status=orderability_status,
+            new_only=new_only,
+            admin_user_id=admin_user_id,
             alias="facet_section_products",
         )
-        total_ids = self._filtered_product_ids_subquery(
+        total_ids = self.filtered_product_ids_subquery(
             query=query,
             source_id=source_id,
             source_mode=source_mode,
@@ -1924,9 +1950,11 @@ class ProductQueryService:
             visibility_status=visibility_status,
             availability_mode=availability_mode,
             orderability_status=orderability_status,
+            new_only=new_only,
+            admin_user_id=admin_user_id,
             alias="facet_total_products",
         )
-        source_context_ids = self._filtered_product_ids_subquery(
+        source_context_ids = self.filtered_product_ids_subquery(
             query=query,
             source_mode=source_mode,
             designer_filter=designer_filter,
@@ -1936,9 +1964,11 @@ class ProductQueryService:
             visibility_status=visibility_status,
             availability_mode=availability_mode,
             orderability_status=orderability_status,
+            new_only=new_only,
+            admin_user_id=admin_user_id,
             alias="facet_source_products",
         )
-        designer_context_ids = self._filtered_product_ids_subquery(
+        designer_context_ids = self.filtered_product_ids_subquery(
             query=query,
             source_id=source_id,
             source_mode=source_mode,
@@ -1948,9 +1978,11 @@ class ProductQueryService:
             visibility_status=visibility_status,
             availability_mode=availability_mode,
             orderability_status=orderability_status,
+            new_only=new_only,
+            admin_user_id=admin_user_id,
             alias="facet_designer_products",
         )
-        catalog_context_ids = self._filtered_product_ids_subquery(
+        catalog_context_ids = self.filtered_product_ids_subquery(
             query=query,
             source_id=source_id,
             source_mode=source_mode,
@@ -1960,9 +1992,11 @@ class ProductQueryService:
             visibility_status=visibility_status,
             availability_mode=availability_mode,
             orderability_status=orderability_status,
+            new_only=new_only,
+            admin_user_id=admin_user_id,
             alias="facet_catalog_products",
         )
-        gender_context_ids = self._filtered_product_ids_subquery(
+        gender_context_ids = self.filtered_product_ids_subquery(
             query=query,
             source_id=source_id,
             source_mode=source_mode,
@@ -1972,6 +2006,8 @@ class ProductQueryService:
             visibility_status=visibility_status,
             availability_mode=availability_mode,
             orderability_status=orderability_status,
+            new_only=new_only,
+            admin_user_id=admin_user_id,
             alias="facet_gender_products",
         )
         total = int(self.db.query(func.count()).select_from(total_ids).scalar() or 0)

@@ -73,6 +73,7 @@ class AdminDesignerEditorSourceRow(BaseModel):
     source_public_product_count: int = Field(default=0, ge=0)
     designer_name: str = Field(default="")
     include_in_designers: bool = False
+    is_new: bool = False
 
 
 class AdminDesignerSourceEnabledPatch(BaseModel):
@@ -88,6 +89,7 @@ class AdminDesignerEditorDesigner(BaseModel):
     id: str = Field(min_length=1)
     name: str = ""
     description: str = ""
+    is_new: bool = False
 
 
 class AdminDesignerDirectoryItem(BaseModel):

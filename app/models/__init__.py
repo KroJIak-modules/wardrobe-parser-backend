@@ -1,5 +1,7 @@
 from app.models.admin_ui_settings import AdminUiSettings
 from app.models.admin_auth import AdminRole, AdminUser
+from app.models.admin_designer_view import AdminBrandView, AdminDesignerView
+from app.models.admin_product_view import AdminProductView
 from app.models.catalog_dedup import ProductDedupCandidate, ProductDedupDecision, ProductDedupDecisionMember
 from app.models.catalog_product import (
     FilterAssignmentRuntimeState,
@@ -51,6 +53,9 @@ from app.models.catalog_taxonomy import (
 
 __all__ = [
     "AdminUiSettings",
+    "AdminBrandView",
+    "AdminDesignerView",
+    "AdminProductView",
     "AdminRole",
     "AdminUser",
     "CustomCatalog",

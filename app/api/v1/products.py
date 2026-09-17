@@ -13,7 +13,8 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models import ImageAsset, Product, ProductListing, ProductListingMember
-from app.services.auth.admin_auth_service import require_permission
+from app.services.auth.admin_auth_service import AdminAuthContext, require_permission
+from app.services.catalog.admin_product_view_service import AdminProductViewService
 from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.sync_error_humanizer import humanize_sync_error, normalize_sync_error_code
 from app.services.catalog.product_ingest_service import ProductIngestService
@@ -36,6 +37,34 @@ def _get_admin_mutation_payload_or_404(db: Session, product_id: int) -> dict:
     if payload is None:
         raise NotFoundError("Товар не найден")
     return payload
+
+
+def _admin_product_filter_params(
+    q: str = Query(default="", max_length=255),
+    source_id: int | None = Query(default=None),
+    source_mode: str | None = Query(default=None),
+    designer_id: str | None = Query(default=None),
+    gender: str | None = Query(default=None),
+    filter_slug: str | None = Query(default=None),
+    custom_catalog_slug: str | None = Query(default=None),
+    visibility_status: str | None = Query(default=None),
+    availability_mode: str | None = Query(default=None),
+    orderability_status: str | None = Query(default=None),
+    new_only: bool = Query(default=False),
+) -> dict:
+    return {
+        "query": q,
+        "source_id": source_id,
+        "source_mode": source_mode,
+        "designer_filter": designer_id,
+        "gender": gender,
+        "filter_slug": filter_slug,
+        "custom_catalog_slug": custom_catalog_slug,
+        "visibility_status": visibility_status,
+        "availability_mode": availability_mode,
+        "orderability_status": orderability_status,
+        "new_only": new_only,
+    }
 
 
 class ManualVariantRequest(BaseModel):
@@ -355,63 +384,42 @@ def list_products(
     )
 
 
-@router.get("/admin/products/table", dependencies=[Depends(require_permission("control.products.read"))])
+@router.get("/admin/products/table")
 def admin_products_table(
-    q: str = Query(default="", max_length=255),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    source_id: int | None = Query(default=None),
-    source_mode: str | None = Query(default=None),
-    designer_id: str | None = Query(default=None),
-    gender: str | None = Query(default=None),
-    filter_slug: str | None = Query(default=None),
-    custom_catalog_slug: str | None = Query(default=None),
-    visibility_status: str | None = Query(default=None),
-    availability_mode: str | None = Query(default=None),
-    orderability_status: str | None = Query(default=None),
+    filters: dict = Depends(_admin_product_filter_params),
+    admin: AdminAuthContext = Depends(require_permission("control.products.read")),
     db: Session = Depends(get_db),
 ) -> dict:
-    return ProductQueryService(db).list_admin_table_products(
+    payload = ProductQueryService(db).list_admin_table_products(
         limit=limit,
         offset=offset,
-        query=q,
-        source_id=source_id,
-        source_mode=source_mode,
-        designer_filter=designer_id,
-        gender=gender,
-        filter_slug=filter_slug,
-        custom_catalog_slug=custom_catalog_slug,
-        visibility_status=visibility_status,
-        availability_mode=availability_mode,
-        orderability_status=orderability_status,
+        **filters,
+        admin_user_id=admin.user_id,
     )
+    return AdminProductViewService(db, admin.user_id).apply_new_flags_to_table_payload(payload)
 
-@router.get("/admin/products/table/facets", dependencies=[Depends(require_permission("control.products.read"))])
+@router.get("/admin/products/table/facets")
 def admin_products_table_facets(
-    q: str = Query(default="", max_length=255),
-    source_id: int | None = Query(default=None),
-    source_mode: str | None = Query(default=None),
-    designer_id: str | None = Query(default=None),
-    gender: str | None = Query(default=None),
-    filter_slug: str | None = Query(default=None),
-    custom_catalog_slug: str | None = Query(default=None),
-    visibility_status: str | None = Query(default=None),
-    availability_mode: str | None = Query(default=None),
-    orderability_status: str | None = Query(default=None),
+    filters: dict = Depends(_admin_product_filter_params),
+    admin: AdminAuthContext = Depends(require_permission("control.products.read")),
     db: Session = Depends(get_db),
 ) -> dict:
     return ProductQueryService(db).admin_table_facets(
-        query=q,
-        source_id=source_id,
-        source_mode=source_mode,
-        designer_filter=designer_id,
-        gender=gender,
-        filter_slug=filter_slug,
-        custom_catalog_slug=custom_catalog_slug,
-        visibility_status=visibility_status,
-        availability_mode=availability_mode,
-        orderability_status=orderability_status,
+        **filters,
+        admin_user_id=admin.user_id,
     )
+
+
+@router.post("/admin/products/mark-all-viewed")
+def mark_all_admin_products_viewed(
+    filters: dict = Depends(_admin_product_filter_params),
+    admin: AdminAuthContext = Depends(require_permission("control.products.read")),
+    db: Session = Depends(get_db),
+) -> dict:
+    marked = AdminProductViewService(db, admin.user_id).mark_all_products_viewed(**filters)
+    return {"ok": True, "marked": marked}
 
 
 @router.get("/products/pricing-example", dependencies=[Depends(require_permission("control.pricing.read"))])
@@ -436,6 +444,16 @@ def get_product(product_id: int, db: Session = Depends(get_db)) -> dict:
 @router.get("/admin/products/{product_id}", dependencies=[Depends(require_permission("control.products.read"))])
 def get_admin_product(product_id: int, db: Session = Depends(get_db)) -> dict:
     return _get_admin_mutation_payload_or_404(db, product_id)
+
+
+@router.post("/admin/products/{product_id}/view")
+def mark_admin_product_viewed(
+    product_id: int,
+    admin: AdminAuthContext = Depends(require_permission("control.products.read")),
+    db: Session = Depends(get_db),
+) -> dict:
+    AdminProductViewService(db, admin.user_id).mark_products_viewed([product_id])
+    return {"ok": True, "product_id": int(product_id)}
 
 
 @router.patch("/products/{product_id}", dependencies=[Depends(require_permission("control.products.edit"))])
