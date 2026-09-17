@@ -101,10 +101,17 @@ class CatalogProductRepository:
             self.session.query(Product)
             .options(
                 joinedload(Product.designer),
+                joinedload(Product.presentation),
                 selectinload(Product.primary_listing).selectinload(ProductListing.source).selectinload(Source.setting),
                 selectinload(Product.primary_listing).selectinload(ProductListing.variants),
                 selectinload(Product.primary_listing).selectinload(ProductListing.images),
-                selectinload(Product.memberships).selectinload(ProductListingMember.listing),
+                # Table payloads iterate every membership listing (variants, source settings),
+                # keep those preloaded or each listing triggers lazy queries.
+                selectinload(Product.memberships)
+                .selectinload(ProductListingMember.listing)
+                .selectinload(ProductListing.source)
+                .selectinload(Source.setting),
+                selectinload(Product.memberships).selectinload(ProductListingMember.listing).selectinload(ProductListing.variants),
                 joinedload(Product.weight_rule),
                 selectinload(Product.gallery_images).selectinload(ProductListingGalleryImage.listing_image),
             )

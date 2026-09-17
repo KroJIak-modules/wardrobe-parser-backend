@@ -353,6 +353,22 @@ class PricingSettingsService:
         eur_to_rub = max(0.0, float(eur_to_rub_rate))
         return usd_to_rub, eur_to_rub
 
+    @staticmethod
+    def _rate_value_changed(current: object, next_value: float) -> bool:
+        # Rates are stored as Numeric with a fixed scale, so a freshly derived
+        # value usually differs from the stored one by rounding only. A change
+        # counts when it survives quantizing to the stored scale.
+        try:
+            current_decimal = Decimal(str(current))
+        except (TypeError, ValueError):
+            return True
+        exponent = current_decimal.as_tuple().exponent
+        try:
+            candidate = Decimal(str(next_value)).quantize(Decimal(1).scaleb(exponent))
+        except Exception:
+            return True
+        return candidate != current_decimal
+
     @classmethod
     def _coerce_conversion_fields(cls, entity) -> bool:
         changed = False
@@ -375,19 +391,19 @@ class PricingSettingsService:
             jpy_to_usd_rate = seed_jpy_to_usd_rate
         eur_to_rub_rate = max(0.01, usd_to_rub_rate * eur_to_usd_rate)
 
-        if float(getattr(entity, "usd_to_rub_rate", 0.0) or 0.0) != usd_to_rub_rate:
+        if cls._rate_value_changed(getattr(entity, "usd_to_rub_rate", None), usd_to_rub_rate):
             entity.usd_to_rub_rate = usd_to_rub_rate
             changed = True
-        if float(getattr(entity, "eur_to_usd_rate", 0.0) or 0.0) != eur_to_usd_rate:
+        if cls._rate_value_changed(getattr(entity, "eur_to_usd_rate", None), eur_to_usd_rate):
             entity.eur_to_usd_rate = eur_to_usd_rate
             changed = True
-        if float(getattr(entity, "gbp_to_usd_rate", 0.0) or 0.0) != gbp_to_usd_rate:
+        if cls._rate_value_changed(getattr(entity, "gbp_to_usd_rate", None), gbp_to_usd_rate):
             entity.gbp_to_usd_rate = gbp_to_usd_rate
             changed = True
-        if float(getattr(entity, "jpy_to_usd_rate", 0.0) or 0.0) != jpy_to_usd_rate:
+        if cls._rate_value_changed(getattr(entity, "jpy_to_usd_rate", None), jpy_to_usd_rate):
             entity.jpy_to_usd_rate = jpy_to_usd_rate
             changed = True
-        if float(getattr(entity, "eur_to_rub_rate", 0.0) or 0.0) != eur_to_rub_rate:
+        if cls._rate_value_changed(getattr(entity, "eur_to_rub_rate", None), eur_to_rub_rate):
             entity.eur_to_rub_rate = eur_to_rub_rate
             changed = True
         return changed
