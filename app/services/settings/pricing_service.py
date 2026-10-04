@@ -118,6 +118,7 @@ class PricingSettingsService:
             markup_multiplier=float(seed.markup_multiplier),
             weight_tolerance=float(seed.weight_tolerance),
             customs_threshold_eur=float(seed.customs_threshold_eur),
+            shipping_alt_threshold_eur=float(seed.shipping_alt_threshold_eur),
             customs_duty_rate=float(seed.customs_duty_rate),
             eur_to_usd_rate=float(seed.eur_to_usd_rate),
             gbp_to_usd_rate=float(seed.gbp_to_usd_rate),
@@ -157,6 +158,7 @@ class PricingSettingsService:
         pricing.markup_multiplier = float(seed.pricing_settings.markup_multiplier)
         pricing.weight_tolerance = float(seed.pricing_settings.weight_tolerance)
         pricing.customs_threshold_eur = float(seed.pricing_settings.customs_threshold_eur)
+        pricing.shipping_alt_threshold_eur = float(seed.pricing_settings.shipping_alt_threshold_eur)
         pricing.customs_duty_rate = float(seed.pricing_settings.customs_duty_rate)
         pricing.eur_to_usd_rate = float(seed.pricing_settings.eur_to_usd_rate)
         pricing.gbp_to_usd_rate = float(seed.pricing_settings.gbp_to_usd_rate)
@@ -704,6 +706,7 @@ class PricingSettingsService:
             markup_multiplier=float(entity.markup_multiplier),
             weight_tolerance=float(entity.weight_tolerance),
             customs_threshold_eur=float(entity.customs_threshold_eur),
+            shipping_alt_threshold_eur=float(entity.shipping_alt_threshold_eur),
             customs_duty_rate=float(entity.customs_duty_rate),
             eur_to_usd_rate=float(entity.eur_to_usd_rate),
             gbp_to_usd_rate=float(entity.gbp_to_usd_rate),
@@ -937,6 +940,7 @@ class PricingSettingsService:
         supplier_id: int | None,
         billable_kg: float,
         settings: PricingSettingsResponse,
+        price_eur: float | None = None,
     ) -> tuple[float, dict[str, Any]]:
         suppliers = settings.suppliers or []
         selected = next((item for item in suppliers if supplier_id is not None and item.id == supplier_id), None)
@@ -948,9 +952,30 @@ class PricingSettingsService:
                 "shipping_mode": "selected_supplier",
                 "shipping_billable_kg": round(float(billable_kg), 4),
                 "shipping_rate_mode": "missing_supplier",
+                "shipping_alt_applied": False,
             }
 
-        tariff_rows = selected.rates or []
+        alt_threshold_eur = max(0.0, float(settings.shipping_alt_threshold_eur))
+        alt_applied = False
+        rated = selected
+        if (
+            selected.parent_supplier_id is None
+            and price_eur is not None
+            and float(price_eur) > alt_threshold_eur
+        ):
+            alternate = next(
+                (
+                    item
+                    for item in suppliers
+                    if item.parent_supplier_id == selected.id and bool(item.is_enabled)
+                ),
+                None,
+            )
+            if alternate is not None:
+                rated = alternate
+                alt_applied = True
+
+        tariff_rows = rated.rates or []
         normalized_tariff_rows = PricingSettingsService._normalize_shipping_rows(tariff_rows)
         value, meta = PricingSettingsService._resolve_tariff_by_weight(
             rows=normalized_tariff_rows,
@@ -958,11 +983,15 @@ class PricingSettingsService:
         )
 
         return float(value or 0.0), {
-            "supplier_id": selected.id,
-            "supplier_key": selected.key,
-            "supplier_name": selected.name,
-            "shipping_mode": "selected_supplier",
+            "supplier_id": rated.id,
+            "supplier_key": rated.key,
+            "supplier_name": rated.name,
+            "shipping_mode": "alt_threshold" if alt_applied else "selected_supplier",
             "shipping_billable_kg": round(float(billable_kg), 4),
+            "shipping_alt_applied": alt_applied,
+            "shipping_alt_threshold_eur": round(alt_threshold_eur, 4),
+            "shipping_base_supplier_id": selected.id,
+            "shipping_base_supplier_name": selected.name,
             **meta,
         }
 
@@ -1311,6 +1340,7 @@ class PricingSettingsService:
             supplier_id=supplier_id,
             billable_kg=billable_kg,
             settings=settings,
+            price_eur=sp_after_promo_eur,
         )
         shipping_rate_mode = str(supplier_meta.get("shipping_rate_mode") or "").strip().lower()
         if shipping_rate_mode in {"missing_supplier", "missing_tariff"}:
@@ -1374,6 +1404,7 @@ class PricingSettingsService:
                 "insurance_mode": "not_used",
                 "insurance_value": 0.0,
                 "customs_threshold_eur": round(settings.customs_threshold_eur, 4),
+                "shipping_alt_threshold_eur": round(settings.shipping_alt_threshold_eur, 4),
                 "customs_duty_rate": round(settings.customs_duty_rate, 6),
                 "customs_processing_rate": round(float(settings.customs_processing_rate), 6),
                 "customs_duty_eur": round(customs_duty_eur, 4),

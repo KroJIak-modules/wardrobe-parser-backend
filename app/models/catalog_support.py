@@ -185,6 +185,7 @@ class PricingSetting(Base):
     markup_multiplier = Column(Numeric(10, 4), nullable=False)
     weight_tolerance = Column(Numeric(10, 4), nullable=False)
     customs_threshold_eur = Column(Numeric(12, 2), nullable=False)
+    shipping_alt_threshold_eur = Column(Numeric(12, 2), nullable=False)
     customs_duty_rate = Column(Numeric(10, 4), nullable=False)
     eur_to_usd_rate = Column(Numeric(12, 6), nullable=False)
     gbp_to_usd_rate = Column(Numeric(12, 6), nullable=False)

@@ -82,6 +82,7 @@ class PricingSettingsUpdateRequest(BaseModel):
     markup_multiplier: float | None = Field(default=None, ge=0.1, le=20.0)
     weight_tolerance: float | None = Field(default=None, ge=0.1, le=5.0)
     customs_threshold_eur: float | None = Field(default=None, ge=0.0, le=10000.0)
+    shipping_alt_threshold_eur: float | None = Field(default=None, ge=0.0, le=10000.0)
     customs_duty_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     eur_to_usd_rate: float | None = Field(default=None, ge=0.01, le=1000.0)
     gbp_to_usd_rate: float | None = Field(default=None, ge=0.01, le=1000.0)
@@ -149,6 +150,7 @@ class PricingSettingsResponse(BaseModel):
     markup_multiplier: float
     weight_tolerance: float
     customs_threshold_eur: float
+    shipping_alt_threshold_eur: float
     customs_duty_rate: float
     eur_to_usd_rate: float
     gbp_to_usd_rate: float
@@ -182,6 +184,7 @@ class SettingsTransferPricingSettings(BaseModel):
     markup_multiplier: float
     weight_tolerance: float
     customs_threshold_eur: float
+    shipping_alt_threshold_eur: float
     customs_duty_rate: float
     eur_to_usd_rate: float
     gbp_to_usd_rate: float

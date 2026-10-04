@@ -57,6 +57,7 @@ def test_settings_transfer_roundtrip_restores_pricing_ui_supplier_source_and_wei
                 "markup_multiplier": 4.25,
                 "weight_tolerance": 1.7,
                 "customs_threshold_eur": 333.0,
+                "shipping_alt_threshold_eur": 450.0,
                 "customs_duty_rate": 0.21,
                 "eur_to_usd_rate": 1.18,
                 "gbp_to_usd_rate": 1.4,

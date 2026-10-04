@@ -24,6 +24,7 @@ def _build_settings(*, suppliers: list[PricingSupplierResponse], svc_rules: list
         markup_multiplier=1.0,
         weight_tolerance=1.0,
         customs_threshold_eur=200.0,
+        shipping_alt_threshold_eur=300.0,
         customs_duty_rate=0.15,
         eur_to_usd_rate=1.0,
         gbp_to_usd_rate=1.4,
@@ -155,6 +156,64 @@ def test_calculate_for_product_uses_supplier_tariff_ranges_for_uk_supplier() -> 
     assert result.reason is None
     assert result.components["supplier_transport_rub"] == 3400.0
     assert result.components["shipping_rule_label"] == "0-0.5 кг"
+
+
+def test_calculate_for_product_switches_to_alt_tariff_above_threshold() -> None:
+    settings = _build_settings(
+        suppliers=[
+            PricingSupplierResponse(
+                id=1,
+                key="eu",
+                name="ЕС",
+                provider_kind="main",
+                parent_supplier_id=None,
+                rate_currency="RUB",
+                is_enabled=True,
+                rates=[PricingSupplierRateResponse(min_kg=1.5, max_kg=2.0, rub=2300.0)],
+            ),
+            PricingSupplierResponse(
+                id=2,
+                key="eu-alt-1",
+                name="ALT 1 ЕС",
+                provider_kind="alternate",
+                parent_supplier_id=1,
+                rate_currency="RUB",
+                is_enabled=True,
+                rates=[PricingSupplierRateResponse(min_kg=1.5, max_kg=2.0, rub=4800.0)],
+            ),
+        ]
+    )
+
+    below = PricingSettingsService.calculate_for_product(
+        source_price=300.0,
+        source_currency="EUR",
+        weight_grams=1900.0,
+        supplier_id=1,
+        promo_factor=1.0,
+        promo_only_no_discount=False,
+        buyout_surcharge_value=None,
+        buyout_surcharge_currency=None,
+        variants=[],
+        settings=settings,
+    )
+    above = PricingSettingsService.calculate_for_product(
+        source_price=300.01,
+        source_currency="EUR",
+        weight_grams=1900.0,
+        supplier_id=1,
+        promo_factor=1.0,
+        promo_only_no_discount=False,
+        buyout_surcharge_value=None,
+        buyout_surcharge_currency=None,
+        variants=[],
+        settings=settings,
+    )
+
+    assert below.components["supplier_transport_rub"] == 2300.0
+    assert below.components["shipping_alt_applied"] is False
+    assert above.components["supplier_transport_rub"] == 4800.0
+    assert above.components["shipping_alt_applied"] is True
+    assert above.components["supplier_name"] == "ALT 1 ЕС"
 
 
 def test_calculate_for_product_requires_manual_when_supplier_has_no_tariff() -> None:
