@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.admin_editors import router as admin_editors_router
+from app.api.v1.admin_payments import router as admin_payments_router
 from app.api.v1.admin_site_content import router as admin_site_content_router
 from app.api.v1.admin_showcase import router as admin_showcase_router
 from app.api.v1.auth import router as auth_router
@@ -15,6 +16,7 @@ from app.api.v1.sources import router as sources_router
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth_router)
 api_router.include_router(admin_editors_router)
+api_router.include_router(admin_payments_router)
 api_router.include_router(admin_site_content_router)
 api_router.include_router(admin_showcase_router)
 api_router.include_router(categories_router)

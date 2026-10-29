@@ -37,6 +37,13 @@ def _parse_duration_to_seconds(value: object) -> object:
 
 
 class Settings(BaseSettings):
+    antilopay_secret_id: str = Field(default="", repr=False)
+    antilopay_secret_key: str = Field(default="", repr=False)
+    antilopay_callback_public_key: str = Field(default="", repr=False)
+    antilopay_project_id: str = Field(default="", repr=False)
+    antilopay_success_url: str = Field(default="")
+    antilopay_fail_url: str = Field(default="")
+    antilopay_timeout_sec: float = Field(default=8.0, gt=0, le=60)
     database_url: Optional[str] = Field(default=None, validation_alias="DATABASE_URL")
     postgres_user: str = Field(default="postgres", validation_alias="POSTGRES_USER")
     postgres_password: str = Field(default="", validation_alias="POSTGRES_PASSWORD")
