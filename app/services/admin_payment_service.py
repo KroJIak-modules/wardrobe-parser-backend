@@ -55,6 +55,9 @@ class PaymentService:
     def create(self, payload, idempotency_key):
         from sqlalchemy.exc import IntegrityError
 
+        if not all((settings.antilopay_secret_id, settings.antilopay_secret_key, settings.antilopay_project_id, settings.antilopay_callback_public_key)):
+            raise PaymentError("Платежи не настроены: отсутствуют параметры Antilopay", 503)
+
         payment = AdminPayment(
             **payload.model_dump(),
             order_number=self.repo.next_order(),

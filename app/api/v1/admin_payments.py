@@ -3,8 +3,9 @@ import json
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
+from app.core.config import settings
 from app.core.database import SessionLocal, get_db
-from app.schemas.admin_payment import PaymentCreate, PaymentList, PaymentResponse
+from app.schemas.admin_payment import PaymentCreate, PaymentList, PaymentReadiness, PaymentResponse
 from app.services.admin_payment_service import PaymentError, PaymentService
 from app.services.antilopay_client import verify_callback
 from app.services.auth.admin_auth_service import require_permission
@@ -17,6 +18,14 @@ def call(operation, *args):
         return operation(*args)
     except PaymentError as exc:
         raise HTTPException(status_code=exc.code, detail=exc.detail) from exc
+
+
+@router.get("/admin/payments/readiness", response_model=PaymentReadiness, dependencies=[Depends(require_permission("control.settings.read"))])
+def payment_readiness():
+    return {
+        "configured": all((settings.antilopay_secret_id, settings.antilopay_secret_key, settings.antilopay_project_id, settings.antilopay_callback_public_key)),
+        "callback_configured": bool(settings.antilopay_callback_public_key),
+    }
 
 
 @router.get("/admin/payments", response_model=PaymentList, dependencies=[Depends(require_permission("control.settings.read"))])

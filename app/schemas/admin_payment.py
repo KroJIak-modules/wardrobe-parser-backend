@@ -60,6 +60,11 @@ class PaymentResponse(BaseModel):
     created_at: datetime
 
 
+class PaymentReadiness(BaseModel):
+    configured: bool
+    callback_configured: bool
+
+
 class PaymentList(BaseModel):
     items: list[PaymentResponse]
     total: int

@@ -51,6 +51,15 @@ class Client:
         return self.data
 
 
+def test_payment_readiness_requires_callback_key(monkeypatch):
+    from app.api.v1.admin_payments import payment_readiness
+    monkeypatch.setattr(settings, "antilopay_secret_id", "id")
+    monkeypatch.setattr(settings, "antilopay_secret_key", "key")
+    monkeypatch.setattr(settings, "antilopay_project_id", "project")
+    monkeypatch.setattr(settings, "antilopay_callback_public_key", "")
+    assert payment_readiness() == {"configured": False, "callback_configured": False}
+
+
 def test_reconciliation_rejects_unowned_or_wrong_amount():
     p = payment()
     service = PaymentService(DB(), Client({}))
