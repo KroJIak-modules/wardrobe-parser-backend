@@ -69,6 +69,24 @@ class CatalogProductRepository:
             .one_or_none()
         )
 
+    def get_site_product(self, product_id: int) -> Product | None:
+        return (
+            self.session.query(Product)
+            .options(
+                joinedload(Product.designer),
+                joinedload(Product.presentation),
+                joinedload(Product.weight_rule),
+                selectinload(Product.primary_listing).selectinload(ProductListing.source).selectinload(Source.setting),
+                selectinload(Product.memberships).selectinload(ProductListingMember.listing).selectinload(ProductListing.source).selectinload(Source.setting),
+                selectinload(Product.memberships).selectinload(ProductListingMember.listing).selectinload(ProductListing.variants),
+                selectinload(Product.memberships).selectinload(ProductListingMember.listing).selectinload(ProductListing.images),
+                selectinload(Product.gallery_images).selectinload(ProductListingGalleryImage.image_asset),
+                selectinload(Product.gallery_images).selectinload(ProductListingGalleryImage.listing_image),
+            )
+            .filter(Product.id == int(product_id))
+            .one_or_none()
+        )
+
     def list_products_by_ids(self, product_ids: Iterable[int], *, include_merged: bool = True) -> list[Product]:
         normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
         if not normalized_ids:
@@ -467,17 +485,36 @@ class CatalogProductRepository:
             .all()
         )
 
-    def list_dedup_candidate_rows(self) -> list:
+    def list_dedup_candidate_rows(self, *, product_ids: Iterable[int] | None = None) -> list:
+        from app.services.catalog.public_product_policy import effective_public_orderability_expression
+
+        normalized_product_ids = (
+            sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
+            if product_ids is not None
+            else None
+        )
+        primary_listing_ids = (
+            self.session.query(Product.primary_listing_id)
+            .filter(Product.id.in_(normalized_product_ids))
+            .filter(Product.primary_listing_id.is_not(None))
+            if normalized_product_ids is not None
+            else None
+        )
         dedup_enabled_product_ids_sq = (
             self.session.query(ProductListingMember.product_id.label("product_id"))
             .join(ProductListing, ProductListing.id == ProductListingMember.listing_id)
             .join(Source, Source.id == ProductListing.source_id)
             .outerjoin(SourceSetting, SourceSetting.source_id == Source.id)
             .filter(func.coalesce(SourceSetting.dedup_enabled, True).is_(True))
+            .filter(
+                ProductListingMember.product_id.in_(normalized_product_ids)
+                if normalized_product_ids is not None
+                else True
+            )
             .group_by(ProductListingMember.product_id)
             .subquery()
         )
-        first_image_sq = (
+        first_image_query = (
             self.session.query(
                 ProductListingImage.listing_id.label("listing_id"),
                 ProductListingImage.url.label("image_url"),
@@ -488,9 +525,8 @@ class CatalogProductRepository:
                 )
                 .label("rn"),
             )
-            .subquery()
         )
-        first_priced_variant_sq = (
+        first_priced_variant_query = (
             self.session.query(
                 ProductListingVariant.listing_id.label("listing_id"),
                 ProductListingVariant.price_amount.label("price_amount"),
@@ -503,9 +539,15 @@ class CatalogProductRepository:
                 .label("rn"),
             )
             .filter(ProductListingVariant.price_amount.is_not(None))
-            .subquery()
         )
-        return (
+        if primary_listing_ids is not None:
+            first_image_query = first_image_query.filter(ProductListingImage.listing_id.in_(primary_listing_ids))
+            first_priced_variant_query = first_priced_variant_query.filter(
+                ProductListingVariant.listing_id.in_(primary_listing_ids)
+            )
+        first_image_sq = first_image_query.subquery()
+        first_priced_variant_sq = first_priced_variant_query.subquery()
+        query = (
             self.session.query(
                 Product.id.label("product_id"),
                 Product.visibility_status.label("visibility_status"),
@@ -545,11 +587,14 @@ class CatalogProductRepository:
                 ),
             )
             .filter(Product.lifecycle_status == "active")
+            .filter(Product.visibility_status == "visible")
             .filter(Product.dedup_status == "independent")
+            .filter(effective_public_orderability_expression() == "orderable")
             .filter(Product.id.in_(self.session.query(dedup_enabled_product_ids_sq.c.product_id)))
-            .order_by(Product.updated_at.desc(), Product.id.desc())
-            .all()
         )
+        if normalized_product_ids is not None:
+            query = query.filter(Product.id.in_(normalized_product_ids))
+        return query.order_by(Product.updated_at.desc(), Product.id.desc()).all()
 
     def get_dedup_candidate_fingerprint(self) -> tuple[int, str | None, str | None]:
         row = (

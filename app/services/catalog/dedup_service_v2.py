@@ -342,25 +342,41 @@ class DedupServiceV2:
         )
         return candidates
 
-    def list_candidates(self, *, limit: int, offset: int) -> dict:
-        rows = self.decisions.list_candidates(limit=max(1, int(limit)) + 1, offset=offset)
-        has_more = len(rows) > int(limit)
-        page_rows = rows[: max(1, int(limit))]
-        total = self.decisions.count_candidates()
+    def _recompute_related_candidates(self, product_ids: list[int], neighbor_ids: set[int]) -> None:
+        ids = set(product_ids) | neighbor_ids
+        if len(ids) < 2:
+            return
+        rows = self.products.list_dedup_candidate_rows(product_ids=ids)
+        payloads = [self._candidate_payload_from_row(row) for row in rows]
+        targets = set(product_ids)
+        for candidate in self._compute_candidate_rows_from_payloads(payloads):
+            if candidate["left_product_id"] not in targets and candidate["right_product_id"] not in targets:
+                continue
+            self.decisions.restore_candidate(**self._serialize_candidate_snapshot(
+                left_product_id=candidate["left_product_id"],
+                right_product_id=candidate["right_product_id"],
+                score=candidate["score"],
+                reasons=candidate["reasons"],
+            ))
+
+    def _candidate_items_from_rows(self, rows: list) -> list[dict]:
         product_ids = sorted(
             {
                 int(row.left_product_id)
-                for row in page_rows
+                for row in rows
             }
             | {
                 int(row.right_product_id)
-                for row in page_rows
+                for row in rows
             }
         )
         products = self.products.list_products_for_dedup_by_ids(product_ids)
-        payloads_by_id = {int(product.id): self._candidate_payload_from_product(product) for product in products}
+        payloads_by_id = {
+            int(product.id): self._candidate_payload_from_product(product)
+            for product in products
+        }
         items: list[dict] = []
-        for row in page_rows:
+        for row in rows:
             left_id = int(row.left_product_id)
             right_id = int(row.right_product_id)
             left = payloads_by_id.get(left_id)
@@ -376,6 +392,20 @@ class DedupServiceV2:
                     "right": right,
                 }
             )
+        items.sort(key=lambda item: (-float(item["score"]), item["pair_key"]))
+        return items
+
+    def list_related_candidates(self, *, product_id: int) -> list[dict]:
+        return self._candidate_items_from_rows(
+            self.decisions.candidates_for_product_ids(product_ids=[int(product_id)])
+        )
+
+    def list_candidates(self, *, limit: int, offset: int) -> dict:
+        rows = self.decisions.list_candidates(limit=max(1, int(limit)) + 1, offset=offset)
+        has_more = len(rows) > int(limit)
+        page_rows = rows[: max(1, int(limit))]
+        total = self.decisions.count_candidates()
+        items = self._candidate_items_from_rows(page_rows)
         return {
             "items": items,
             "total": int(total),
@@ -556,6 +586,13 @@ class DedupServiceV2:
             ),
         }
         candidate = self.decisions.get_candidate_by_pair(product_ids=unique_product_ids)
+        related_candidates = self.decisions.candidates_for_product_ids(product_ids=unique_product_ids)
+        neighbor_ids = {
+            int(product_id)
+            for row in related_candidates
+            for product_id in (row.left_product_id, row.right_product_id)
+            if int(product_id) not in unique_product_ids
+        }
 
         created_product_id: int | None = None
         affected_products = list(products)
@@ -569,6 +606,7 @@ class DedupServiceV2:
             "version": 2,
             "decision_action": decision_kind,
             "products": [self._product_snapshot(product) for product in affected_products],
+            "neighbor_ids": sorted(neighbor_ids),
         }
         if candidate is not None:
             undo_payload["candidate"] = self._serialize_candidate_snapshot(
@@ -649,7 +687,13 @@ class DedupServiceV2:
                     dedup_target_product_id=target_product_id,
                 )
 
-        self.decisions.delete_candidates_for_product_ids(product_ids=unique_product_ids)
+        if decision_kind == "combine":
+            self.decisions.delete_candidates_for_product_ids(product_ids=unique_product_ids)
+            self.db.flush()
+            self.site_sort_prices.refresh_product_ids([created_product_id], commit=False)
+            self._recompute_related_candidates([created_product_id], neighbor_ids)
+        else:
+            self.decisions.delete_candidates_for_product_ids(product_ids=[int(product.id) for product in hidden_products])
         affected_ids = set(unique_product_ids)
         if created_product_id is not None:
             affected_ids.add(created_product_id)
@@ -739,16 +783,19 @@ class DedupServiceV2:
         for snapshot in product_snapshots:
             self._restore_product_snapshot(snapshot)
 
-        candidate_snapshot = undo_payload.get("candidate") if isinstance(undo_payload, dict) else None
-        if isinstance(candidate_snapshot, dict):
-            self.decisions.restore_candidate(
-                left_product_id=int(candidate_snapshot["left_product_id"]),
-                right_product_id=int(candidate_snapshot["right_product_id"]),
-                score=float(candidate_snapshot.get("score") or 0.0),
-                reasons=[str(item) for item in list(candidate_snapshot.get("reasons") or [])],
-            )
         self.decisions.delete_decision(decision)
+        self.db.flush()
         affected_ids = {int(snapshot["product_id"]) for snapshot in product_snapshots}
+        neighbor_ids = {int(product_id) for product_id in undo_payload.get("neighbor_ids", [])}
+        if decision_kind == "combine" and decision.created_product_id is not None:
+            related = self.decisions.candidates_for_product_ids(product_ids=[int(decision.created_product_id)])
+            neighbor_ids.update(
+                int(product_id)
+                for row in related
+                for product_id in (row.left_product_id, row.right_product_id)
+                if int(product_id) != int(decision.created_product_id)
+            )
+        self._recompute_related_candidates(sorted(affected_ids), neighbor_ids)
         if decision_kind == "combine":
             created_product_id = int(decision.created_product_id or 0)
             if created_product_id <= 0:

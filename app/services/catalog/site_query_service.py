@@ -823,13 +823,14 @@ class SiteQueryService:
         if match is None:
             raise NotFoundError("Товар не найден")
         product_id = int(match.group("id"))
-        product = self.products.products.get_product(product_id)
+        product = self.products.products.get_site_product(product_id)
         if product is None or str(product.visibility_status or "").strip().lower() != "visible":
             raise NotFoundError("Товар не найден")
-        public_payload = self.products.get_product_payload(product_id, audience="public")
-        if public_payload is None:
+        if str(product.dedup_status or "").strip().lower() != "independent":
             raise NotFoundError("Товар не найден")
-        admin_payload = self.products.get_admin_mutation_payload(product_id) or {}
+        public_payload = self.products.build_public_product_payload(product)
+        if str(public_payload.get("orderability_status") or "").strip().lower() == "unavailable":
+            raise NotFoundError("Товар не найден")
         listing_by_id = {
             int(membership.listing.id): membership.listing
             for membership in product.memberships
@@ -848,12 +849,21 @@ class SiteQueryService:
                 content=description_content,
             )
         variants: list[SiteProductVariantResponse] = []
+        gallery_by_listing_id: dict[int, list[str]] = {}
         for variant in public_payload.get("variants") or []:
             if not isinstance(variant, dict) or not bool(variant.get("available")):
                 continue
             source_id = int(variant.get("source_id")) if variant.get("source_id") is not None else 0
             listing = listing_by_id.get(int(variant.get("listing_id") or 0))
             source = getattr(listing, "source", None) if listing is not None else None
+            listing_id = int(listing.id) if listing is not None else 0
+            if listing_id not in gallery_by_listing_id:
+                listing_gallery = ProductQueryService._gallery_state(product, listing)
+                gallery_by_listing_id[listing_id] = [
+                    str(url)
+                    for url in listing_gallery.get("display_image_urls") or []
+                    if str(url or "").strip()
+                ]
             logo_asset_id = int(source.logo_image_asset_id) if source is not None and getattr(source, "logo_image_asset_id", None) is not None else None
             if source is not None and getattr(source, "logo_image_asset_id", None) is not None:
                 logo_asset_id = int(source.logo_image_asset_id)
@@ -880,12 +890,12 @@ class SiteQueryService:
                             if logo_asset_id is not None and logo_asset_id > 0
                             else None
                         ),
+                        image_urls=gallery_by_listing_id[listing_id],
                     ),
                 )
             )
-        taxonomy = admin_payload.get("taxonomy") if isinstance(admin_payload.get("taxonomy"), dict) else {}
         section_slug = None
-        filter_slugs = taxonomy.get("filter_slugs") if isinstance(taxonomy.get("filter_slugs"), list) else []
+        filter_slugs = self.products._matched_filter_slugs(product)
         if filter_slugs:
             section_slug = str(filter_slugs[0] or "").strip() or None
         return SiteProductResponse(

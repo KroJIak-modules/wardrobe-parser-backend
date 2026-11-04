@@ -95,14 +95,26 @@ def list_dedup_candidates(
 
 @router.post("/dedup/merge", dependencies=[Depends(require_permission("control.dedup.edit"))])
 def merge_dedup_pair(payload: MergeRequest, db: Session = Depends(get_db)) -> dict:
-    product_id = DedupServiceV2(db).merge(
+    service = DedupServiceV2(db)
+    product_id = service.merge(
         product_ids=[int(product_id) for product_id in payload.product_ids],
         primary_product_id=(int(payload.primary_product_id) if payload.primary_product_id is not None else None),
         primary_listing_id=(int(payload.primary_listing_id) if payload.primary_listing_id is not None else None),
         merge_mode=payload.merge_mode,
     )
+    related_candidates = (
+        service.list_related_candidates(product_id=product_id)
+        if str(payload.merge_mode or "").strip().lower() == "combine"
+        else []
+    )
     db.commit()
-    return {"ok": True, "created_product_id": product_id}
+    product_payload = ProductQueryService(db).get_dedup_payloads_by_ids([int(product_id)]).get(int(product_id))
+    return {
+        "ok": True,
+        "created_product_id": product_id,
+        "created_product": product_payload,
+        "related_candidates": related_candidates,
+    }
 
 
 @router.post("/dedup/reject", dependencies=[Depends(require_permission("control.dedup.edit"))])

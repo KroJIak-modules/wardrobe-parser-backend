@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from sqlalchemy import delete as sa_delete, func, or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, aliased, joinedload
 
-from app.models import ProductDedupCandidate, ProductDedupDecision, ProductDedupDecisionMember
+from app.models import Product, ProductListing, ProductDedupCandidate, ProductDedupDecision, ProductDedupDecisionMember, SourceSetting
 
 
 class CatalogDedupRepository:
@@ -21,9 +21,34 @@ class CatalogDedupRepository:
         self.session.flush()
         return entity
 
-    def list_candidates(self, *, limit: int, offset: int) -> list[ProductDedupCandidate]:
+    def _eligible_candidates(self):
+        from app.services.catalog.public_product_policy import effective_public_orderability_expression
+
+        left = aliased(Product)
+        right = aliased(Product)
+        left_listing = aliased(ProductListing)
+        right_listing = aliased(ProductListing)
+        left_setting = aliased(SourceSetting)
+        right_setting = aliased(SourceSetting)
         return (
             self.session.query(ProductDedupCandidate)
+            .join(left, left.id == ProductDedupCandidate.left_product_id)
+            .join(right, right.id == ProductDedupCandidate.right_product_id)
+            .join(left_listing, left_listing.id == left.primary_listing_id)
+            .join(right_listing, right_listing.id == right.primary_listing_id)
+            .outerjoin(left_setting, left_setting.source_id == left_listing.source_id)
+            .outerjoin(right_setting, right_setting.source_id == right_listing.source_id)
+            .filter(effective_public_orderability_expression(left, left_listing, left_setting) == "orderable")
+            .filter(effective_public_orderability_expression(right, right_listing, right_setting) == "orderable")
+            .filter(left.lifecycle_status == "active", right.lifecycle_status == "active")
+            .filter(left.visibility_status == "visible", right.visibility_status == "visible")
+            .filter(left.dedup_status == "independent", right.dedup_status == "independent")
+            .filter(left_listing.orderability_status == "orderable", right_listing.orderability_status == "orderable")
+        )
+
+    def list_candidates(self, *, limit: int, offset: int) -> list[ProductDedupCandidate]:
+        return (
+            self._eligible_candidates()
             .order_by(
                 ProductDedupCandidate.score.desc(),
                 ProductDedupCandidate.right_product_id.desc(),
@@ -36,19 +61,12 @@ class CatalogDedupRepository:
         )
 
     def count_candidates(self) -> int:
-        return int(self.session.query(ProductDedupCandidate.id).count())
+        return int(self._eligible_candidates().count())
 
     def replace_candidates(self, *, candidates: list[dict]) -> None:
         self.session.execute(sa_delete(ProductDedupCandidate))
-        for item in candidates:
-            self.session.add(
-                ProductDedupCandidate(
-                    left_product_id=int(item["left_product_id"]),
-                    right_product_id=int(item["right_product_id"]),
-                    score=float(item["score"]),
-                    reasons=list(item.get("reasons") or []),
-                )
-            )
+        if candidates:
+            self.session.bulk_insert_mappings(ProductDedupCandidate, candidates)
         self.session.flush()
 
     def get_candidate_by_pair(self, *, product_ids: Iterable[int]) -> ProductDedupCandidate | None:
@@ -98,6 +116,14 @@ class CatalogDedupRepository:
             .delete(synchronize_session=False)
         )
         self.session.flush()
+
+    def candidates_for_product_ids(self, *, product_ids: Iterable[int]) -> list[ProductDedupCandidate]:
+        ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
+        if not ids:
+            return []
+        return self.session.query(ProductDedupCandidate).filter(
+            or_(ProductDedupCandidate.left_product_id.in_(ids), ProductDedupCandidate.right_product_id.in_(ids))
+        ).all()
 
     def delete_candidates_for_product_ids(self, *, product_ids: Iterable[int]) -> None:
         normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})

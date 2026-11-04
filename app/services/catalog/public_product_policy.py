@@ -5,39 +5,39 @@ from sqlalchemy import and_, case, func, literal, not_, select
 from app.models import Product, ProductListing, ProductListingGalleryImage, ProductListingImage, SourceSetting
 
 
-def effective_public_orderability_expression():
+def effective_public_orderability_expression(product=Product, listing=ProductListing, source_setting=SourceSetting):
     """Return the public listing state for a query joined to primary listing and source settings."""
     primary_listing_has_gallery_scope = select(ProductListingGalleryImage.id).where(
-        ProductListingGalleryImage.product_id == Product.id,
-        ProductListingGalleryImage.listing_id == Product.primary_listing_id,
+        ProductListingGalleryImage.product_id == product.id,
+        ProductListingGalleryImage.listing_id == product.primary_listing_id,
     ).exists()
     primary_listing_has_visible_gallery_image = select(ProductListingGalleryImage.id).where(
-        ProductListingGalleryImage.product_id == Product.id,
-        ProductListingGalleryImage.listing_id == Product.primary_listing_id,
+        ProductListingGalleryImage.product_id == product.id,
+        ProductListingGalleryImage.listing_id == product.primary_listing_id,
         ProductListingGalleryImage.is_hidden.is_(False),
         (
             ProductListingGalleryImage.image_asset_id.is_not(None)
             | (
                 ProductListingGalleryImage.listing_image_id.is_not(None)
-                & func.coalesce(SourceSetting.show_images, True).is_(True)
+                & func.coalesce(source_setting.show_images, True).is_(True)
             )
         ),
     ).exists()
     primary_listing_has_source_image = select(ProductListingImage.id).where(
-        ProductListingImage.listing_id == Product.primary_listing_id,
+        ProductListingImage.listing_id == product.primary_listing_id,
     ).exists()
     has_visible_images = case(
         (primary_listing_has_gallery_scope, primary_listing_has_visible_gallery_image),
         else_=and_(
-            func.coalesce(SourceSetting.show_images, True).is_(True),
+            func.coalesce(source_setting.show_images, True).is_(True),
             primary_listing_has_source_image,
         ),
     )
     return case(
-        (Product.dedup_status != "independent", literal("unavailable")),
-        (Product.site_sort_price_rub.is_(None), literal("unavailable")),
+        (product.dedup_status != "independent", literal("unavailable")),
+        (product.site_sort_price_rub.is_(None), literal("unavailable")),
         (not_(has_visible_images), literal("unavailable")),
-        else_=func.coalesce(ProductListing.orderability_status, literal("unavailable")),
+        else_=func.coalesce(listing.orderability_status, literal("unavailable")),
     )
 
 

@@ -44,6 +44,9 @@ class _FakeProductsRepo:
         self.owner_memberships: list[tuple[int, int]] = []
         self.deleted_product_ids: list[int] = []
 
+    def list_dedup_candidate_rows(self, *, product_ids=None):
+        return []
+
     def get_product(self, product_id: int):
         return self.products.get(int(product_id))
 
@@ -131,6 +134,9 @@ class _FakeDecisionsRepo:
         self.decision_by_id: dict[int, SimpleNamespace] = {}
         self.blocked_created_product_ids: set[int] = set()
 
+    def candidates_for_product_ids(self, *, product_ids):
+        return []
+
     def get_candidate_by_pair(self, *, product_ids):
         normalized = sorted(int(product_id) for product_id in product_ids)
         if normalized == [1, 2]:
@@ -208,6 +214,7 @@ def _service() -> tuple[DedupServiceV2, _FakeProductsRepo, _FakeDecisionsRepo, _
     service.products = products
     service.decisions = decisions
     service.filter_assignments = filter_assignments
+    service.site_sort_prices = SimpleNamespace(refresh_product_ids=lambda *args, **kwargs: None, enqueue_product_ids_after_commit=lambda *args: None)
     return service, products, decisions, filter_assignments
 
 
@@ -228,6 +235,47 @@ def test_merge_combine_creates_new_product_and_hides_originals() -> None:
     assert filter_assignments.enqueued[-1] == [1, 2, 4]
 
 
+def test_merge_recomputes_neighbors_and_undo_restores_original_neighbors() -> None:
+    service, products, decisions, _ = _service()
+    decisions.candidates_for_product_ids = lambda *, product_ids: [
+        SimpleNamespace(left_product_id=1, right_product_id=2),
+        SimpleNamespace(left_product_id=1, right_product_id=3),
+        SimpleNamespace(left_product_id=2, right_product_id=3),
+    ] if 1 in product_ids else [SimpleNamespace(left_product_id=3, right_product_id=4)]
+    calls = []
+    service._recompute_related_candidates = lambda ids, neighbors: calls.append((ids, neighbors))
+
+    service.merge(product_ids=[1, 2], merge_mode="combine")
+    assert calls == [([4], {3})]
+    assert decisions.deleted_candidates_for == [[1, 2]]
+    service.undo(decision_id=1)
+    assert calls[-1] == ([1, 2], {3})
+
+
+def test_recompute_related_candidates_restores_only_candidates_touching_target() -> None:
+    service, _products, decisions, _ = _service()
+    service.products.list_dedup_candidate_rows = lambda *, product_ids: [
+        SimpleNamespace(id=3),
+        SimpleNamespace(id=4),
+    ]
+    service._candidate_payload_from_row = lambda row: {"id": int(row.id)}
+    service._compute_candidate_rows_from_payloads = lambda _payloads: [
+        {"left_product_id": 3, "right_product_id": 4, "score": 0.91, "reasons": ["same_title"]},
+        {"left_product_id": 1, "right_product_id": 3, "score": 0.88, "reasons": ["same_designer"]},
+    ]
+
+    service._recompute_related_candidates([4], {3})
+
+    assert decisions.restored_candidates == [
+        {
+            "left_product_id": 3,
+            "right_product_id": 4,
+            "score": 0.91,
+            "reasons": ["same_title"],
+        }
+    ]
+
+
 def test_merge_keep_left_hides_only_right_product() -> None:
     service, products, decisions, filter_assignments = _service()
 
@@ -241,6 +289,7 @@ def test_merge_keep_left_hides_only_right_product() -> None:
     assert products.products[2].dedup_target_product_id == 1
     assert filter_assignments.enqueued[-1] == [1, 2]
     assert products.created_products == []
+    assert decisions.deleted_candidates_for == [[2]]
 
 
 def test_undo_combine_restores_products_and_deletes_created_product() -> None:
@@ -256,14 +305,7 @@ def test_undo_combine_restores_products_and_deletes_created_product() -> None:
     assert products.products[2].dedup_target_product_id is None
     assert products.deleted_product_ids == [4]
     assert decisions.deleted_decision_ids == [1]
-    assert decisions.restored_candidates == [
-        {
-            "left_product_id": 1,
-            "right_product_id": 2,
-            "score": 0.98,
-            "reasons": ["same_title"],
-        }
-    ]
+    assert decisions.restored_candidates == []
     assert filter_assignments.enqueued[-1] == [1, 2, 4]
 
 

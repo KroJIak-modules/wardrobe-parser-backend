@@ -256,6 +256,7 @@ class SiteProductSourceResponse(BaseModel):
     name: str
     url: str | None = None
     logo_url: str | None = None
+    image_urls: list[str] = Field(default_factory=list)
 
 
 class SiteProductVariantResponse(BaseModel):
