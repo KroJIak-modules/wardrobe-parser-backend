@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+from uuid import uuid4
 
 import app.api.v1.auth as auth_module
 from app.core.database import SessionLocal
@@ -124,6 +125,38 @@ def test_active_source_brand_creates_catalog_designer_automatically() -> None:
         assert int(persisted_mapping.designer_id or 0) == int(persisted_designer.id)
         assert persisted_designer.origin_kind == "auto"
         assert persisted_designer.is_admin_touched is False
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_real_designer_brand_disappearance_and_return_produces_again() -> None:
+    from app.repositories.catalog_again import AdminAgainViewRepository
+    from app.services.catalog.admin_designer_view_service import AdminDesignerViewService
+
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key=f"again-designer-{uuid4().hex[:10]}")
+        brand = f"Again Scenario {uuid4().hex[:10]}"
+        _, listing = _create_sync_product(db, source=source, brand=brand, suffix="again")
+        sync = DesignerCatalogSyncService(db)
+        sync.reconcile(sync_product_links=True, track_reappearance=True)
+        db.flush()
+        listing.orderability_status = "sold_out"
+        sync.reconcile(sync_product_links=True, track_reappearance=True)
+        mapping = db.query(DesignerSourceName).filter_by(source_name=brand).one()
+        assert mapping.is_enabled is False
+        listing.orderability_status = "orderable"
+        sync.reconcile(sync_product_links=True, track_reappearance=True)
+        payload = AdminDesignerViewService(db, 1).apply_new_flags_to_editor_payload(
+            AdminEditorService(db).list_designer_editor_state()
+        )
+        assert next(row for row in payload["rows"] if row["source_brand"] == brand)["is_again"] is True
+        assert next(row for row in payload["designers"] if row["name"] == brand)["is_again"] is True
+        views = AdminAgainViewRepository(db)
+        views.mark_viewed(admin_user_id=1, entity_kind="brand", entity_key=brand)
+        assert views.filter_again_keys(admin_user_id=1, entity_kind="brand", entity_keys=[brand]) == set()
+        assert views.filter_again_keys(admin_user_id=1, entity_kind="designer", entity_keys=[brand]) == {brand}
     finally:
         db.rollback()
         db.close()

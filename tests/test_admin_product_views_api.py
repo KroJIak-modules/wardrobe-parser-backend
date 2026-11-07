@@ -139,6 +139,42 @@ def test_admin_table_marks_new_product_and_view_endpoint_clears_flag(monkeypatch
         db.close()
 
 
+def test_again_product_appears_in_new_filter_until_acknowledged(monkeypatch) -> None:
+    from app.repositories.catalog_again import AdminAgainViewRepository
+
+    client = _login_client(monkeypatch, login="superadmin", password="Q7m2Lx9pRt")
+    db = SessionLocal()
+    marker = uuid4().hex[:12]
+    try:
+        source = _create_source(db, marker)
+        product = _ingest_product(db, source_id=source.id, marker=marker)
+        listing = db.query(ProductListing).filter_by(id=product.primary_listing_id).one()
+        item = {
+            "url": listing.url, "handle": listing.handle, "title": listing.source_title,
+            "designer": "Views Test Designer", "source_weight_grams": 500,
+            "orderability_status": "sold_out",
+            "variants": [{"title": "UNI", "price": 120, "currency": "RUB", "available": False}],
+            "images": ["https://images.example/again.jpg"],
+        }
+        db.commit()
+        assert client.post(f"/api/v1/admin/products/{product.id}/view").status_code == 200
+        ProductIngestService(db).apply_batch(source_id=source.id, items=[item], track_reappearance=True)
+        item["orderability_status"] = "orderable"
+        item["variants"][0]["available"] = True
+        ProductIngestService(db).apply_batch(source_id=source.id, items=[item], track_reappearance=True)
+        db.commit()
+        response = client.get(f"/api/v1/admin/products/table?new_only=1&source_id={source.id}")
+        assert response.status_code == 200
+        row = next(row for row in response.json()["items"] if row["id"] == product.id)
+        assert row["is_new"] is False and row["is_again"] is True
+        assert client.post(f"/api/v1/admin/products/{product.id}/again-view").status_code == 200
+        response = client.get(f"/api/v1/admin/products/table?new_only=1&source_id={source.id}")
+        assert all(row["id"] != product.id for row in response.json()["items"])
+    finally:
+        db.rollback()
+        db.close()
+
+
 def test_view_endpoint_unknown_product_returns_404(monkeypatch) -> None:
     client = _login_client(monkeypatch, login="superadmin", password="Q7m2Lx9pRt")
     response = client.post("/api/v1/admin/products/999999999/view")
