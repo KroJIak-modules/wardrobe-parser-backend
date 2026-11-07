@@ -120,8 +120,8 @@ def upgrade() -> None:
                 """
                 UPDATE suppliers
                 SET parent_supplier_id = CASE
-                        WHEN :parent_supplier_id IS NULL THEN NULL
-                        WHEN parent_supplier_id IS NULL THEN :parent_supplier_id
+                        WHEN CAST(:parent_supplier_id AS BIGINT) IS NULL THEN NULL
+                        WHEN parent_supplier_id IS NULL THEN CAST(:parent_supplier_id AS BIGINT)
                         ELSE parent_supplier_id
                     END,
                     provider_kind = CASE

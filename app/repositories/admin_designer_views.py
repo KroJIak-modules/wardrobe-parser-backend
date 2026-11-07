@@ -60,9 +60,10 @@ class AdminDesignerViewRepository:
                 ),
             )
             .on_conflict_do_nothing()
+            .returning(AdminBrandView.source_name)
         )
         result = self.session.execute(statement)
-        return int(getattr(result, "rowcount", 0) or 0)
+        return len(result.scalars().all())
 
     def mark_all_designers_viewed(self, *, admin_user_id: int) -> int:
         # Designers use viewed_at-based NEW semantics (a brand arriving after the
@@ -89,5 +90,6 @@ class AdminDesignerViewRepository:
                 where=new_brand_arrival,
             )
         )
+        statement = statement.returning(AdminDesignerView.designer_id)
         result = self.session.execute(statement)
-        return int(getattr(result, "rowcount", 0) or 0)
+        return len(result.scalars().all())

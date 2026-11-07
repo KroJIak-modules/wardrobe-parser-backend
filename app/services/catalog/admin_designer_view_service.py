@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import NotFoundError
 from app.models import Designer, DesignerSourceName
 from app.repositories.admin_designer_views import AdminDesignerViewRepository
+from app.repositories.catalog_again import AdminAgainViewRepository
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.designer_support import normalize_designer_text
 
@@ -16,6 +17,7 @@ class AdminDesignerViewService:
         self.db = db
         self.admin_user_id = int(admin_user_id)
         self.views = AdminDesignerViewRepository(db)
+        self.again_views = AdminAgainViewRepository(db)
 
     def apply_new_flags_to_editor_payload(self, payload: dict) -> dict:
         rows = payload.get("rows") if isinstance(payload, dict) else None
@@ -26,12 +28,31 @@ class AdminDesignerViewService:
         viewed_source_names = self.views.filter_viewed_source_names(admin_user_id=self.admin_user_id)
         designer_viewed_at = self.views.list_designer_viewed_at(admin_user_id=self.admin_user_id)
         latest_brand_arrival = self._latest_brand_arrival_by_designer_id()
+        again_brands = self.again_views.filter_again_keys(
+            admin_user_id=self.admin_user_id,
+            entity_kind="brand",
+            entity_keys=[
+                normalize_designer_text(row.get("source_brand"))
+                for row in rows
+                if isinstance(row, dict)
+            ],
+        )
+        again_designers = self.again_views.filter_again_keys(
+            admin_user_id=self.admin_user_id,
+            entity_kind="designer",
+            entity_keys=[
+                normalize_designer_text(designer.get("name"))
+                for designer in designers
+                if isinstance(designer, dict)
+            ],
+        )
 
         for row in rows:
             if not isinstance(row, dict):
                 continue
             source_brand = normalize_designer_text(row.get("source_brand"))
             row["is_new"] = bool(source_brand) and source_brand not in viewed_source_names
+            row["is_again"] = bool(source_brand) and source_brand in again_brands
 
         for designer in designers:
             if not isinstance(designer, dict) or not str(designer.get("id", "") or "").isdigit():
@@ -42,6 +63,7 @@ class AdminDesignerViewService:
             designer["is_new"] = viewed_at is None or (
                 latest_arrival is not None and viewed_at < latest_arrival
             )
+            designer["is_again"] = normalize_designer_text(designer.get("name")) in again_designers
         return payload
 
     def _latest_brand_arrival_by_designer_id(self) -> dict[int, object]:

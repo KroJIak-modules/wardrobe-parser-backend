@@ -11,6 +11,7 @@ from app.core.exceptions import ValidationError
 from app.models import Product, ProductListing, WeightRule, WeightRuleKeyword
 from app.repositories.catalog_products import CatalogProductRepository
 from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
+from app.services.catalog.catalog_presence_service import CatalogPresenceService
 from app.services.catalog.product_visibility_service import ProductVisibilityService
 from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
 from app.services.settings.weight_rule_matcher import WeightRuleMatcherEntry, WeightRuleMatcherField, resolve_match_for_fields
@@ -318,6 +319,7 @@ class ProductIngestService:
         target_product_id: int | None = None,
         force_primary_listing: bool = False,
         refresh_visibility: bool = True,
+        track_reappearance: bool = False,
     ) -> BatchApplyResult:
         result = BatchApplyResult(listings_seen=0, listings_applied=0)
         seen_listing_ids: set[int] = set()
@@ -375,6 +377,8 @@ class ProductIngestService:
                 listing.last_synced_at = self._utcnow()
 
             previous_owner = self.products.get_product_by_listing(int(listing.id))
+            if track_reappearance and previous_owner is not None:
+                CatalogPresenceService(self.db).initialize_product_if_missing(int(previous_owner.id))
             product = self._resolve_product(listing_id=int(listing.id), target_product_id=target_product_id)
             normalized_gender = self._normalize_gender(item.get("gender"))
             if product is None:
@@ -433,12 +437,16 @@ class ProductIngestService:
             for listing in stale_listings:
                 if int(listing.id) in seen_listing_ids:
                     continue
+                product = self.products.get_product_by_listing(int(listing.id))
+                if product is None:
+                    continue
+                if track_reappearance:
+                    CatalogPresenceService(self.db).initialize_product_if_missing(int(product.id))
                 listing.orderability_status = "unavailable"
                 listing.status_reason = "source_removed"
-                product = self.products.get_product_by_listing(int(listing.id))
-                if product is None or int(product.primary_listing_id or 0) != int(listing.id):
-                    continue
                 affected_product_ids.add(int(product.id))
+                if int(product.primary_listing_id or 0) != int(listing.id):
+                    continue
                 siblings = [
                     member_listing
                     for member_listing in self.products.list_product_listings(int(product.id))
@@ -448,6 +456,8 @@ class ProductIngestService:
                     product.primary_listing_id = int(siblings[0].id)
 
         self.db.flush()
+        if track_reappearance:
+            CatalogPresenceService(self.db).refresh_product_ids(affected_product_ids)
         if refresh_visibility:
             ProductVisibilityService(self.db).refresh_product_ids(affected_product_ids)
         ProductFilterAssignmentService(self.db).enqueue_product_ids_after_commit(affected_product_ids)

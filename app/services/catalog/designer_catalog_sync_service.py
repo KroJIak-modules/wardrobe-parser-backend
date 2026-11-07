@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.models import Designer, DesignerSourceName, Product, ProductListing, ProductPresentation, SourceSetting
 from app.services.catalog.designer_support import normalize_designer_text, slugify_designer_name
+from app.services.catalog.catalog_presence_service import CatalogPresenceService
 from app.services.catalog.public_product_policy import public_product_candidate_condition, public_product_condition
 from app.services.catalog.product_visibility_service import ProductVisibilityService
 
@@ -112,7 +113,13 @@ class DesignerCatalogSyncService:
                 product.designer_id = designer_ids[source_brand_name]
         self.db.flush()
 
-    def reconcile(self, *, sync_product_links: bool = True, refresh_visibility: bool = True) -> None:
+    def reconcile(
+        self,
+        *,
+        sync_product_links: bool = True,
+        refresh_visibility: bool = True,
+        track_reappearance: bool = False,
+    ) -> None:
         self.db.flush()
         source_counts = self.source_brand_counts(public_candidates_only=False)
         public_candidate_source_counts = self.source_brand_counts(public_candidates_only=True)
@@ -301,3 +308,15 @@ class DesignerCatalogSyncService:
                 designers_by_name.pop(normalized_name, None)
 
         self.db.flush()
+        if track_reappearance:
+            presence = CatalogPresenceService(self.db)
+            presence.refresh_brands(
+                public_candidate_source_counts,
+                ignored_keys={
+                    mapping.source_name
+                    for mapping in mappings
+                    if bool(mapping.is_admin_touched)
+                },
+                emit_reappearance=True,
+            )
+            presence.refresh_designers(presence.current_public_designer_counts(), emit_reappearance=True)

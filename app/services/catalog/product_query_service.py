@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.models import (
     AdminProductView,
+    AdminAgainView,
+    CatalogPresenceState,
     CustomCatalog,
     CustomCatalogProduct,
     Designer,
@@ -33,6 +35,7 @@ from app.repositories.catalog_taxonomy import CatalogTaxonomyRepository
 from app.schemas.admin_settings import PricingSettingsResponse, PricingSupplierRateResponse, PricingSupplierResponse
 from app.services.catalog.public_product_policy import effective_public_orderability_expression
 from app.services.catalog.product_title_service import ProductTitleService
+from app.services.catalog.source_gender_policy import effective_gender_expression, effective_gender_for_product
 from app.services.catalog.source_registry_service import SourceRegistryService
 from app.services.settings.pricing_service import PricingSettingsService
 
@@ -1333,7 +1336,7 @@ class ProductQueryService:
                 and str(getattr(product.presentation, "brand_override_name", "") or "").strip()
             ),
             "primary_listing_id": int(primary_listing.id) if primary_listing is not None else None,
-            "gender": str(product.gender),
+            "gender": effective_gender_for_product(product),
             "gender_is_manual": bool(getattr(product, "gender_is_manual", False)),
             "availability_mode": str(product.availability_mode),
             "visibility_status": str(product.visibility_status),
@@ -1561,7 +1564,19 @@ class ProductQueryService:
                     AdminProductView.product_id == Product.id,
                 )
             )
-            base_query = base_query.filter(~viewed_products.exists())
+            acknowledged_again = select(AdminAgainView.admin_user_id).where(
+                AdminAgainView.admin_user_id == int(admin_user_id),
+                AdminAgainView.entity_kind == "product",
+                AdminAgainView.entity_key == CatalogPresenceState.entity_key,
+                AdminAgainView.viewed_event_at >= CatalogPresenceState.last_reappeared_at,
+            )
+            unseen_again = select(CatalogPresenceState.entity_key).where(
+                CatalogPresenceState.entity_kind == "product",
+                CatalogPresenceState.entity_key == cast(Product.id, String),
+                CatalogPresenceState.last_reappeared_at.isnot(None),
+                ~acknowledged_again.exists(),
+            )
+            base_query = base_query.filter(or_(~viewed_products.exists(), unseen_again.exists()))
         if needs_listing_join:
             base_query = (
                 base_query
@@ -1596,7 +1611,9 @@ class ProductQueryService:
         if visibility_status:
             base_query = base_query.filter(Product.visibility_status == str(visibility_status).strip().lower())
         if gender:
-            base_query = base_query.filter(Product.gender == str(gender).strip().lower())
+            base_query = base_query.filter(
+                effective_gender_expression(product=Product) == str(gender).strip().lower()
+            )
         if availability_mode:
             base_query = base_query.filter(Product.availability_mode == str(availability_mode).strip().lower())
         if orderability_status:
@@ -1798,7 +1815,7 @@ class ProductQueryService:
             ),
             "source_sort_priority": self._source_sort_priority_for_listing(primary_listing),
             "title": self._effective_title(product, primary_listing),
-            "gender": str(product.gender),
+            "gender": effective_gender_for_product(product),
             "designer_name": str(getattr(product.designer, "name", "") or "") or None,
             "source_designer_name": str(primary_listing.source_designer_raw) if primary_listing is not None and primary_listing.source_designer_raw else None,
             "display_designer_name": (
@@ -2042,13 +2059,16 @@ class ProductQueryService:
             )
             if str(slug or "").strip()
         }
+        gender_expression = effective_gender_expression(product=Product, source_key_expr=Source.key)
         gender_count_map = {
             str(value): int(count)
             for value, count in (
-                self.db.query(Product.gender, func.count())
+                self.db.query(gender_expression, func.count())
                 .select_from(gender_context_ids)
                 .join(Product, Product.id == gender_context_ids.c.product_id)
-                .group_by(Product.gender)
+                .outerjoin(ProductListing, ProductListing.id == Product.primary_listing_id)
+                .outerjoin(Source, Source.id == ProductListing.source_id)
+                .group_by(gender_expression)
                 .all()
             )
             if str(value or "").strip()

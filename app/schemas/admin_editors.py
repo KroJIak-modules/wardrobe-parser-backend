@@ -74,6 +74,7 @@ class AdminDesignerEditorSourceRow(BaseModel):
     designer_name: str = Field(default="")
     include_in_designers: bool = False
     is_new: bool = False
+    is_again: bool = False
 
 
 class AdminDesignerSourceEnabledPatch(BaseModel):
@@ -90,6 +91,7 @@ class AdminDesignerEditorDesigner(BaseModel):
     name: str = ""
     description: str = ""
     is_new: bool = False
+    is_again: bool = False
 
 
 class AdminDesignerDirectoryItem(BaseModel):

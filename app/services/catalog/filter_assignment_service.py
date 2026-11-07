@@ -13,6 +13,7 @@ from app.repositories.catalog_products import CatalogProductRepository
 from app.repositories.catalog_taxonomy import CatalogTaxonomyRepository
 from app.services.catalog.filter_assignment_queue import ProductFilterAssignmentQueue
 from app.services.settings.weight_rule_matcher import keyword_matches, keyword_pattern, normalize_haystack, normalize_keyword
+from app.services.catalog.source_gender_policy import effective_gender_for_product
 
 
 LOGGER = logging.getLogger(__name__)
@@ -201,7 +202,7 @@ class ProductFilterAssignmentService:
 
     @staticmethod
     def _normalized_product_gender(product: Product) -> str:
-        normalized = str(getattr(product, "gender", "") or "").strip().lower()
+        normalized = effective_gender_for_product(product)
         if normalized in {"male", "female", "unisex"}:
             return normalized
         return "unisex"

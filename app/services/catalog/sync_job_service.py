@@ -415,6 +415,7 @@ class SyncJobService:
             source_id=int(source.id),
             items=items,
             reconcile_missing=bool(reconcile_missing),
+            track_reappearance=True,
         )
         source_run.products_received = int(source_run.products_received or 0) + int(applied.listings_seen)
         source_run.products_applied = int(source_run.products_applied or 0) + int(applied.listings_applied)
@@ -601,7 +602,7 @@ class SyncJobService:
                     job.current_stage_label = "Синхронизация завершена"
                     job.current_stage_detail = "Все выбранные источники обработаны"
                 job.current_stage_updated_at = cls._utcnow()
-            DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
+            DesignerCatalogSyncService(db).reconcile(sync_product_links=True, track_reappearance=True)
             db.commit()
         except Exception as exc:
             db.rollback()

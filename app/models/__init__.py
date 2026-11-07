@@ -2,6 +2,7 @@ from app.models.admin_ui_settings import AdminUiSettings
 from app.models.admin_auth import AdminRole, AdminUser
 from app.models.admin_designer_view import AdminBrandView, AdminDesignerView
 from app.models.admin_product_view import AdminProductView
+from app.models.catalog_again import AdminAgainView, CatalogPresenceState
 from app.models.admin_payment import AdminPayment
 from app.models.catalog_dedup import ProductDedupCandidate, ProductDedupDecision, ProductDedupDecisionMember
 from app.models.catalog_product import (
@@ -57,6 +58,8 @@ __all__ = [
     "AdminBrandView",
     "AdminDesignerView",
     "AdminProductView",
+    "AdminAgainView",
+    "CatalogPresenceState",
     "AdminRole",
     "AdminUser",
     "CustomCatalog",

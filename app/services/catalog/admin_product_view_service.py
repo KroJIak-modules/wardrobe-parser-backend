@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import NotFoundError
 from app.models import Product
 from app.repositories.admin_product_views import AdminProductViewRepository
+from app.repositories.catalog_again import AdminAgainViewRepository
 from app.services.catalog.product_query_service import ProductQueryService
 
 
@@ -17,6 +18,7 @@ class AdminProductViewService:
         self.db = db
         self.admin_user_id = int(admin_user_id)
         self.views = AdminProductViewRepository(db)
+        self.again_views = AdminAgainViewRepository(db)
 
     def apply_new_flags_to_table_payload(self, payload: dict) -> dict:
         items = payload.get("items") if isinstance(payload, dict) else None
@@ -31,9 +33,15 @@ class AdminProductViewService:
             admin_user_id=self.admin_user_id,
             product_ids=product_ids,
         )
+        again_ids = self.again_views.filter_again_keys(
+            admin_user_id=self.admin_user_id,
+            entity_kind="product",
+            entity_keys=[str(product_id) for product_id in product_ids],
+        )
         for item in items:
             if isinstance(item, dict) and isinstance(item.get("id"), int):
                 item["is_new"] = item["id"] not in viewed_ids
+                item["is_again"] = str(item["id"]) in again_ids
         return payload
 
     def mark_products_viewed(self, product_ids: Iterable[int]) -> None:

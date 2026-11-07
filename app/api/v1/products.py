@@ -15,6 +15,7 @@ from app.core.exceptions import NotFoundError, ValidationError
 from app.models import ImageAsset, Product, ProductListing, ProductListingMember
 from app.services.auth.admin_auth_service import AdminAuthContext, require_permission
 from app.services.catalog.admin_product_view_service import AdminProductViewService
+from app.services.catalog.admin_again_view_service import AdminAgainViewService
 from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.sync_error_humanizer import humanize_sync_error, normalize_sync_error_code
 from app.services.catalog.product_ingest_service import ProductIngestService
@@ -453,6 +454,16 @@ def mark_admin_product_viewed(
     db: Session = Depends(get_db),
 ) -> dict:
     AdminProductViewService(db, admin.user_id).mark_products_viewed([product_id])
+    return {"ok": True, "product_id": int(product_id)}
+
+
+@router.post("/admin/products/{product_id}/again-view")
+def mark_admin_product_again_viewed(
+    product_id: int,
+    admin: AdminAuthContext = Depends(require_permission("control.products.read")),
+    db: Session = Depends(get_db),
+) -> dict:
+    AdminAgainViewService(db, admin.user_id).mark_product_viewed(product_id)
     return {"ok": True, "product_id": int(product_id)}
 
 

@@ -49,6 +49,7 @@ class AdminProductViewRepository:
                 ),
             )
             .on_conflict_do_nothing()
+            .returning(AdminProductView.product_id)
         )
         result = self.session.execute(statement)
-        return int(getattr(result, "rowcount", 0) or 0)
+        return len(result.scalars().all())

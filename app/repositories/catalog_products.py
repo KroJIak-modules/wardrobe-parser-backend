@@ -423,6 +423,10 @@ class CatalogProductRepository:
                     ProductListing.source_category_raw,
                     ProductListing.source_tags,
                 ),
+                selectinload(Product.memberships)
+                .selectinload(ProductListingMember.listing)
+                .selectinload(ProductListing.source)
+                .load_only(Source.id, Source.key),
             )
             .filter(Product.id.in_(normalized_ids))
             .filter(Product.lifecycle_status == "active")

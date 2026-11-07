@@ -13,6 +13,7 @@ from app.schemas.admin_editors import (
 )
 from app.services.auth.admin_auth_service import AdminAuthContext, require_permission
 from app.services.catalog.admin_designer_view_service import AdminDesignerViewService
+from app.services.catalog.admin_again_view_service import AdminAgainViewService
 from app.services.catalog.admin_editor_service import AdminEditorService
 
 
@@ -47,6 +48,16 @@ def mark_admin_brand_view_viewed(
     return {"ok": True, "source_brand": source_brand}
 
 
+@router.post("/admin/designers/brands/{source_brand}/again-view")
+def mark_admin_brand_again_viewed(
+    source_brand: str,
+    admin: AdminAuthContext = Depends(require_permission("control.designers.read")),
+    db: Session = Depends(get_db),
+) -> dict:
+    AdminAgainViewService(db, admin.user_id).mark_brand_viewed(source_brand)
+    return {"ok": True, "source_brand": source_brand}
+
+
 @router.post("/admin/designers/designers/mark-all-viewed")
 def mark_all_admin_designer_views_viewed(
     admin: AdminAuthContext = Depends(require_permission("control.designers.edit")),
@@ -63,6 +74,16 @@ def mark_admin_designer_view_viewed(
     db: Session = Depends(get_db),
 ) -> dict:
     AdminDesignerViewService(db, admin.user_id).mark_designer_viewed(designer_id)
+    return {"ok": True, "designer_id": int(designer_id)}
+
+
+@router.post("/admin/designers/designers/{designer_id}/again-view")
+def mark_admin_designer_again_viewed(
+    designer_id: int,
+    admin: AdminAuthContext = Depends(require_permission("control.designers.read")),
+    db: Session = Depends(get_db),
+) -> dict:
+    AdminAgainViewService(db, admin.user_id).mark_designer_viewed(designer_id)
     return {"ok": True, "designer_id": int(designer_id)}
 
 
