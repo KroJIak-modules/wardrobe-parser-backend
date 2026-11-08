@@ -25,22 +25,22 @@ logger = logging.getLogger("backend.bybit_worker")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
-def _run_refresh_once() -> bool:
+def _run_refresh_once() -> str:
     db = SessionLocal()
     try:
         service = PricingSettingsService(db)
         response = service.get_settings(refresh_bybit=True)
-        ok = str(response.bybit_rate_status or "").lower() not in {"fallback_stored", "unknown"}
+        refresh_status = str(response.bybit_rate_status or "").lower()
         logger.info(
             "Bybit refresh done: status=%s buckets=%s warning=%s",
             response.bybit_rate_status,
             len(response.bybit_bucket_rates or []),
             response.bybit_rate_warning or "-",
         )
-        return ok
+        return refresh_status
     except Exception as exc:  # pragma: no cover - worker runtime guard
         logger.exception("Bybit refresh failed: %s", exc)
-        return False
+        return "unknown"
     finally:
         db.close()
 
@@ -233,7 +233,8 @@ def _run_site_sort_price_refresh_once(batch_size: int) -> int:
 
 def run_forever() -> None:
     bybit_interval_sec = max(30, int(settings.pricing_bybit_worker_interval_sec))
-    bybit_retry_sec = max(10, min(30, bybit_interval_sec // 2))
+    bybit_transport_retry_sec = max(10, min(30, bybit_interval_sec // 2))
+    bybit_market_retry_sec = max(60, min(300, bybit_interval_sec // 4))
     weight_recalc_idle_sec = max(1, int(settings.weight_recalc_worker_idle_sec))
     weight_recalc_batch_size = max(1, int(settings.weight_recalc_worker_batch_size))
     weight_recalc_debounce_sec = max(0, int(settings.weight_recalc_worker_debounce_sec))
@@ -264,10 +265,15 @@ def run_forever() -> None:
     while True:
         now = time.time()
         if now >= next_bybit_at:
-            ok = _run_refresh_once()
-            next_bybit_at = now + (bybit_interval_sec if ok else bybit_retry_sec)
-            if not ok:
-                logger.warning("Bybit refresh not successful. retry in %ss", bybit_retry_sec)
+            refresh_status = _run_refresh_once()
+            if refresh_status in {"live_updated", "live_cached", "disabled"}:
+                next_bybit_at = now + bybit_interval_sec
+            elif refresh_status == "fallback_market":
+                next_bybit_at = now + bybit_market_retry_sec
+                logger.info("Bybit P2P market is empty. retry in %ss", bybit_market_retry_sec)
+            else:
+                next_bybit_at = now + bybit_transport_retry_sec
+                logger.warning("Bybit transport/API refresh failed. retry in %ss", bybit_transport_retry_sec)
         if now >= next_auto_sync_at:
             _, delay_sec = _run_auto_sync_once()
             next_auto_sync_at = now + max(1, int(delay_sec))

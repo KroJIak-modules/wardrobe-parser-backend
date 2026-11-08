@@ -12,6 +12,27 @@ import requests
 
 
 _BYBIT_P2P_ONLINE_URL = "https://api2.bybit.com/fiat/otc/item/online"
+_BYBIT_REQUEST_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    "Origin": "https://www.bybit.com",
+    "Referer": "https://www.bybit.com/",
+    "User-Agent": "WardrobeParserPlatform/1.0",
+}
+_FETCH_ATTEMPTS = 3
+_RETRY_DELAYS_SEC = (0.25, 0.75)
+
+
+class BybitRateError(RuntimeError):
+    """Base class for an unavailable P2P snapshot."""
+
+
+class BybitMarketUnavailable(BybitRateError):
+    """The endpoint responded correctly but the requested P2P market is empty."""
+
+
+class BybitTransportUnavailable(BybitRateError):
+    """The endpoint could not be safely read due to transport/API failure."""
 
 
 def _safe_float(value: Any, *, default: float = 0.0) -> float:
@@ -69,6 +90,7 @@ class CachedSnapshot:
     snapshot: BybitRateSnapshot | None
     expires_at: float
     error_message: str | None = None
+    error: BybitRateError | None = None
 
 
 class BybitP2PRateProvider:
@@ -79,6 +101,12 @@ class BybitP2PRateProvider:
     _ADEQUATE_MIN_RANGE_RUB = 5_000.0
     _ADEQUATE_MIN_MAX_RUB = 20_000.0
     _ADEQUATE_MIN_USDT_LIQUIDITY = 100.0
+
+    @staticmethod
+    def _error_cache_sec(*, cache_sec: int) -> float:
+        # Do not pin a transient empty orderbook for half of the regular cache TTL.
+        # The worker will make a new bounded attempt on its next short retry cycle.
+        return min(15.0, max(3.0, float(cache_sec) / 20.0))
 
     @classmethod
     def get_rate(
@@ -144,7 +172,9 @@ class BybitP2PRateProvider:
             cached = cls._cache.get(key)
             if cached and cached.expires_at > now:
                 if cached.snapshot is None:
-                    raise RuntimeError(cached.error_message or "Bybit snapshot is temporarily unavailable")
+                    raise cached.error or BybitTransportUnavailable(
+                        cached.error_message or "Bybit snapshot is temporarily unavailable"
+                    )
                 return cached.snapshot
 
         try:
@@ -158,19 +188,26 @@ class BybitP2PRateProvider:
                 outlier_max_deviation_ratio=max(0.0, float(outlier_max_deviation_ratio)),
             )
         except Exception as exc:
+            error = (
+                exc
+                if isinstance(exc, BybitRateError)
+                else BybitTransportUnavailable(str(exc) or "Bybit fetch failed")
+            )
             with cls._lock:
                 cls._cache[key] = CachedSnapshot(
                     snapshot=None,
-                    expires_at=now + max(30.0, float(cache_sec) / 2.0),
-                    error_message=str(exc) or "Bybit fetch failed",
+                    expires_at=now + cls._error_cache_sec(cache_sec=cache_sec),
+                    error_message=str(error),
+                    error=error,
                 )
-            raise
+            raise error
 
         with cls._lock:
             cls._cache[key] = CachedSnapshot(
                 snapshot=snapshot,
                 expires_at=now + float(cache_sec),
                 error_message=None,
+                error=None,
             )
         return snapshot
 
@@ -186,24 +223,68 @@ class BybitP2PRateProvider:
         bucket_max_usdt: int,
         outlier_max_deviation_ratio: float,
     ) -> BybitRateSnapshot:
-        response = requests.post(
-            _BYBIT_P2P_ONLINE_URL,
-            json={
-                "tokenId": asset.upper(),
-                "currencyId": fiat.upper(),
-                "side": "1",  # buy
-                "size": str(max(10, ads_limit)),
-                "page": "1",
-                "amount": "",
-            },
-            timeout=timeout_sec,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        rows = ((payload.get("result") or {}).get("items") or [])
-        ads = cls._normalize_ads(rows)
+        ads: list[BybitAd] = []
+        last_error: BybitRateError | None = None
+        started_at = time.monotonic()
+        for attempt in range(_FETCH_ATTEMPTS):
+            remaining_timeout = float(timeout_sec) - (time.monotonic() - started_at)
+            if remaining_timeout <= 0:
+                break
+            try:
+                response = requests.post(
+                    _BYBIT_P2P_ONLINE_URL,
+                    json={
+                        "tokenId": asset.upper(),
+                        "currencyId": fiat.upper(),
+                        "side": "1",  # buy USDT for fiat
+                        "size": str(max(10, ads_limit)),
+                        "page": "1",
+                        "amount": "",
+                    },
+                    headers=_BYBIT_REQUEST_HEADERS,
+                    timeout=max(0.1, remaining_timeout),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise BybitTransportUnavailable("Bybit returned malformed P2P payload")
+                return_code = _safe_float(payload.get("ret_code"), default=-1)
+                if return_code != 0:
+                    message = str(payload.get("ret_msg") or "unknown API error").strip()
+                    raise BybitTransportUnavailable(f"Bybit P2P API error: {message}")
+                result = payload.get("result")
+                if not isinstance(result, dict):
+                    raise BybitTransportUnavailable("Bybit returned malformed P2P result")
+                rows = result.get("items")
+                if not isinstance(rows, list):
+                    raise BybitTransportUnavailable("Bybit returned malformed P2P offers")
+                if not rows:
+                    last_error = BybitMarketUnavailable(
+                        f"Bybit P2P has no USDT/{fiat.upper()} offers at the moment"
+                    )
+                else:
+                    ads = cls._normalize_ads(rows)
+                    if ads:
+                        break
+                    last_error = BybitTransportUnavailable(
+                        "Bybit P2P returned offers with no valid prices or limits"
+                    )
+            except BybitRateError as exc:
+                last_error = exc
+            except (requests.RequestException, ValueError) as exc:
+                last_error = BybitTransportUnavailable(
+                    f"Bybit P2P request failed: {exc.__class__.__name__}"
+                )
+
+            if attempt < _FETCH_ATTEMPTS - 1:
+                delay = _RETRY_DELAYS_SEC[min(attempt, len(_RETRY_DELAYS_SEC) - 1)]
+                if time.monotonic() + delay - started_at < float(timeout_sec):
+                    time.sleep(delay)
+
         if not ads:
-            raise RuntimeError("Bybit P2P returned no valid ads")
+            raise last_error or BybitMarketUnavailable(
+                f"Bybit P2P has no USDT/{fiat.upper()} offers at the moment"
+            )
 
         filtered_ads, outliers_dropped = cls._drop_price_outliers(
             ads=ads,

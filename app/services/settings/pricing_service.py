@@ -27,7 +27,10 @@ from app.schemas.admin_settings import (
     PricingSupplierUpdateRequest,
 )
 from app.services.settings.default_admin_settings import DefaultAdminSettingsLoader
-from app.services.settings.bybit_rate_provider import BybitP2PRateProvider
+from app.services.settings.bybit_rate_provider import (
+    BybitMarketUnavailable,
+    BybitP2PRateProvider,
+)
 
 _FORMULA_LINES = [
     "BFX = BBR + BEX",
@@ -530,6 +533,14 @@ class PricingSettingsService:
         return result
 
     @staticmethod
+    def _is_bybit_market_empty_error(value: object) -> bool:
+        normalized = str(value or "").strip().lower()
+        return (
+            "bybit p2p has no " in normalized
+            or "bybit p2p returned no valid ads" in normalized
+        )
+
+    @staticmethod
     def _refresh_bybit_rate(entity) -> tuple[bool, str, Any | None, str | None]:
         if not app_settings.pricing_bybit_rate_auto_enabled:
             return False, "disabled", None, None
@@ -545,6 +556,12 @@ class PricingSettingsService:
                 outlier_max_deviation_ratio=app_settings.pricing_bybit_outlier_max_deviation_ratio,
             )
             rate = float(snapshot.representative_rate)
+        except BybitMarketUnavailable as exc:
+            error_text = str(exc) or "Bybit P2P market is temporarily empty"
+            if getattr(entity, "bybit_last_error", None) != error_text:
+                entity.bybit_last_error = error_text[:1024]
+                return True, "fallback_market", None, error_text
+            return False, "fallback_market", None, error_text
         except Exception as exc:
             error_text = str(exc) or "Bybit fetch failed"
             if getattr(entity, "bybit_last_error", None) != error_text:
@@ -608,14 +625,17 @@ class PricingSettingsService:
             bybit_changed, bybit_status, bybit_snapshot, bybit_error = self._refresh_bybit_rate(entity)
             if bybit_status == "fallback_stored":
                 bybit_warning = "WARN: Bybit временно недоступен, используется сохраненный курс."
-                if bybit_error:
-                    bybit_warning = f"{bybit_warning} Причина: {bybit_error}"
         else:
             bybit_changed = False
             bybit_snapshot = None
             bybit_error = str(getattr(entity, "bybit_last_error", "") or "") or None
-            if bybit_error:
-                bybit_warning = f"WARN: Bybit временно недоступен, используется сохраненный курс. Причина: {bybit_error}"
+            bybit_status = (
+                "fallback_market"
+                if bybit_error and self._is_bybit_market_empty_error(bybit_error)
+                else "fallback_stored"
+                if bybit_error
+                else "skipped"
+            )
         if created or svc_rules_changed or conversion_changed or bybit_changed:
             self.db.commit()
             self.db.refresh(entity)
