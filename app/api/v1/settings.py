@@ -30,7 +30,7 @@ from app.services.settings.filter_weight_rule_service import FilterWeightRuleSer
 from app.services.settings.pricing_service import PricingSettingsService
 from app.services.settings.settings_transfer_service import SettingsTransferService
 from app.services.settings.weight_rule_service import WeightRuleService
-from app.services.auth.admin_auth_service import require_permission
+from app.services.auth.admin_auth_service import require_any_permission, require_permission
 from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSortPriceService
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -47,12 +47,20 @@ def update_pricing_settings(payload: PricingSettingsUpdateRequest, db: Session =
     return PricingSettingsService(db).update_settings(payload)
 
 
-@router.get("/admin-ui", response_model=AdminUiSettingsResponse, dependencies=[Depends(require_permission("control.settings.read"))])
+@router.get(
+    "/admin-ui",
+    response_model=AdminUiSettingsResponse,
+    dependencies=[Depends(require_any_permission("control.sync.read", "control.settings.read"))],
+)
 def get_admin_ui_settings(db: Session = Depends(get_db)):
     return PricingSettingsService(db).get_admin_ui_settings()
 
 
-@router.patch("/admin-ui", response_model=AdminUiSettingsResponse, dependencies=[Depends(require_permission("control.settings.edit"))])
+@router.patch(
+    "/admin-ui",
+    response_model=AdminUiSettingsResponse,
+    dependencies=[Depends(require_any_permission("control.sync.edit", "control.settings.edit"))],
+)
 def update_admin_ui_settings(payload: AdminUiSettingsUpdateRequest, db: Session = Depends(get_db)):
     return PricingSettingsService(db).update_admin_ui_settings(payload)
 
@@ -138,19 +146,31 @@ def remove_weight_rule_keyword(rule_id: int, keyword: str, db: Session = Depends
     return WeightRuleService(db).remove_keyword(rule_id, keyword)
 
 
-@router.get("/export", response_model=SettingsTransferPayload, dependencies=[Depends(require_permission("control.settings.read"))])
+@router.get(
+    "/export",
+    response_model=SettingsTransferPayload,
+    dependencies=[Depends(require_any_permission("control.settings_transfer.read", "control.settings.read"))],
+)
 def export_settings(db: Session = Depends(get_db)):
     return SettingsTransferService(db).export_payload()
 
 
-@router.post("/import", response_model=SettingsTransferResponse, dependencies=[Depends(require_permission("control.settings.edit"))])
+@router.post(
+    "/import",
+    response_model=SettingsTransferResponse,
+    dependencies=[Depends(require_any_permission("control.settings_transfer.edit", "control.settings.edit"))],
+)
 def import_settings(payload: SettingsTransferPayload, db: Session = Depends(get_db)):
     response = SettingsTransferService(db).import_payload(payload)
     SiteCatalogSortPriceService(db).enqueue_all_active_products()
     return response
 
 
-@router.post("/reset", response_model=SettingsTransferResponse, dependencies=[Depends(require_permission("control.settings.edit"))])
+@router.post(
+    "/reset",
+    response_model=SettingsTransferResponse,
+    dependencies=[Depends(require_any_permission("control.settings_transfer.edit", "control.settings.edit"))],
+)
 def reset_settings(db: Session = Depends(get_db)):
     response = SettingsTransferService(db).reset_all()
     SiteCatalogSortPriceService(db).enqueue_all_active_products()

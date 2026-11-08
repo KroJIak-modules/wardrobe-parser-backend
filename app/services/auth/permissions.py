@@ -22,7 +22,15 @@ PERMISSION_SCOPES: tuple[PermissionScope, ...] = (
     PermissionScope(key="control.pricing", read="control.pricing.read", edit="control.pricing.edit"),
     PermissionScope(key="control.weight", read="control.weight.read", edit="control.weight.edit"),
     PermissionScope(key="control.settings", read="control.settings.read", edit="control.settings.edit"),
-    PermissionScope(key="accounts", read="accounts.read", edit="accounts.edit"),
+    PermissionScope(key="control.payments", read="control.payments.read", edit="control.payments.edit"),
+    PermissionScope(key="control.content", read="control.content.read", edit="control.content.edit"),
+    PermissionScope(key="control.sync", read="control.sync.read", edit="control.sync.edit"),
+    PermissionScope(
+        key="control.settings_transfer",
+        read="control.settings_transfer.read",
+        edit="control.settings_transfer.edit",
+    ),
+    PermissionScope(key="control.site_access", read="control.site_access.read", edit="control.site_access.edit"),
 )
 
 ALL_PERMISSION_KEYS = {scope.read for scope in PERMISSION_SCOPES} | {scope.edit for scope in PERMISSION_SCOPES}

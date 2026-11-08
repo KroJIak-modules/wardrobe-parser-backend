@@ -8,7 +8,7 @@ from app.core.database import get_db
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models import ImageAsset
 from app.schemas.showcase_media import ShowcaseMediaUploadResponse, ShowcaseStateResponse, ShowcaseStateUpdateRequest
-from app.services.auth.admin_auth_service import require_permission
+from app.services.auth.admin_auth_service import require_any_permission
 from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.showcase_service import ShowcaseService
 
@@ -40,7 +40,7 @@ def get_showcase_media_file(asset_id: int, db: Session = Depends(get_db)) -> Fil
 @router.post(
     "/showcase/media/upload",
     response_model=ShowcaseMediaUploadResponse,
-    dependencies=[Depends(require_permission("showcase.edit"))],
+    dependencies=[Depends(require_any_permission("control.content.edit", "showcase.edit"))],
 )
 def upload_showcase_media(file: UploadFile = File(...), db: Session = Depends(get_db)) -> ShowcaseMediaUploadResponse:
     try:
@@ -57,7 +57,7 @@ def upload_showcase_media(file: UploadFile = File(...), db: Session = Depends(ge
 @router.put(
     "/showcase/state",
     response_model=ShowcaseStateResponse,
-    dependencies=[Depends(require_permission("showcase.edit"))],
+    dependencies=[Depends(require_any_permission("control.content.edit", "showcase.edit"))],
 )
 def update_showcase_state(payload: ShowcaseStateUpdateRequest, db: Session = Depends(get_db)) -> ShowcaseStateResponse:
     state = ShowcaseService(db).replace_state(payload)

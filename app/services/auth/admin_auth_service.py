@@ -215,3 +215,16 @@ def require_permission(permission: str) -> Callable[[AdminAuthContext], AdminAut
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Недостаточно прав")
 
     return dependency
+
+
+def require_any_permission(*permissions: str) -> Callable[[AdminAuthContext], AdminAuthContext]:
+    required = tuple(str(permission or "").strip() for permission in permissions if str(permission or "").strip())
+    if not required:
+        raise ValueError("At least one permission is required")
+
+    def dependency(context: AdminAuthContext = Depends(require_admin_access)) -> AdminAuthContext:
+        if any(context.has_permission(permission) for permission in required):
+            return context
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Недостаточно прав")
+
+    return dependency

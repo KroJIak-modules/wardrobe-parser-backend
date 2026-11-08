@@ -17,7 +17,7 @@ from app.schemas.admin_site_content import (
     AdminSiteQuestionsResponse,
     AdminSiteQuestionsUpdateRequest,
 )
-from app.services.auth.admin_auth_service import require_permission
+from app.services.auth.admin_auth_service import require_any_permission
 from app.services.catalog.media_asset_service import MediaAssetService
 from app.services.catalog.site_access_service import SiteAccessService
 from app.services.catalog.site_content_service import SiteContentService
@@ -28,7 +28,7 @@ router = APIRouter(prefix="/admin/site-content", tags=["admin-site-content"])
 
 @router.get(
     "/media/{asset_id}/file",
-    dependencies=[Depends(require_permission("showcase.read"))],
+    dependencies=[Depends(require_any_permission("control.content.read", "showcase.read"))],
 )
 def get_admin_site_content_media(asset_id: int, db: Session = Depends(get_db)) -> FileResponse:
     asset = SiteContentService(db).admin_media_asset(asset_id)
@@ -38,7 +38,7 @@ def get_admin_site_content_media(asset_id: int, db: Session = Depends(get_db)) -
 @router.get(
     "/access",
     response_model=AdminSiteAccessSettingsResponse,
-    dependencies=[Depends(require_permission("control.settings"))],
+    dependencies=[Depends(require_any_permission("control.site_access.read", "control.settings.read"))],
 )
 def get_admin_site_access(db: Session = Depends(get_db)) -> AdminSiteAccessSettingsResponse:
     return SiteAccessService(db).get_admin_settings()
@@ -47,7 +47,7 @@ def get_admin_site_access(db: Session = Depends(get_db)) -> AdminSiteAccessSetti
 @router.put(
     "/access",
     response_model=AdminSiteAccessSettingsResponse,
-    dependencies=[Depends(require_permission("control.settings"))],
+    dependencies=[Depends(require_any_permission("control.site_access.edit", "control.settings.edit"))],
 )
 def put_admin_site_access(
     payload: AdminSiteAccessSettingsUpdateRequest,
@@ -61,7 +61,7 @@ def put_admin_site_access(
 @router.post(
     "/access/generate-password",
     response_model=AdminSiteAccessPasswordGenerateResponse,
-    dependencies=[Depends(require_permission("control.settings"))],
+    dependencies=[Depends(require_any_permission("control.site_access.edit", "control.settings.edit"))],
 )
 def generate_admin_site_access_password() -> AdminSiteAccessPasswordGenerateResponse:
     return SiteAccessService.generate_password()
@@ -70,7 +70,7 @@ def generate_admin_site_access_password() -> AdminSiteAccessPasswordGenerateResp
 @router.get(
     "/about",
     response_model=AdminSiteAboutResponse,
-    dependencies=[Depends(require_permission("showcase.read"))],
+    dependencies=[Depends(require_any_permission("control.content.read", "showcase.read"))],
 )
 def get_admin_site_about(db: Session = Depends(get_db)) -> AdminSiteAboutResponse:
     return SiteContentService(db).get_admin_about()
@@ -79,7 +79,7 @@ def get_admin_site_about(db: Session = Depends(get_db)) -> AdminSiteAboutRespons
 @router.put(
     "/about",
     response_model=AdminSiteAboutResponse,
-    dependencies=[Depends(require_permission("showcase.edit"))],
+    dependencies=[Depends(require_any_permission("control.content.edit", "showcase.edit"))],
 )
 def put_admin_site_about(payload: AdminSiteAboutUpdateRequest, db: Session = Depends(get_db)) -> AdminSiteAboutResponse:
     result = SiteContentService(db).update_about(payload)
@@ -90,7 +90,7 @@ def put_admin_site_about(payload: AdminSiteAboutUpdateRequest, db: Session = Dep
 @router.get(
     "/questions",
     response_model=AdminSiteQuestionsResponse,
-    dependencies=[Depends(require_permission("showcase.read"))],
+    dependencies=[Depends(require_any_permission("control.content.read", "showcase.read"))],
 )
 def get_admin_site_questions(db: Session = Depends(get_db)) -> AdminSiteQuestionsResponse:
     return SiteContentService(db).get_admin_questions()
@@ -99,7 +99,7 @@ def get_admin_site_questions(db: Session = Depends(get_db)) -> AdminSiteQuestion
 @router.put(
     "/questions",
     response_model=AdminSiteQuestionsResponse,
-    dependencies=[Depends(require_permission("showcase.edit"))],
+    dependencies=[Depends(require_any_permission("control.content.edit", "showcase.edit"))],
 )
 def put_admin_site_questions(
     payload: AdminSiteQuestionsUpdateRequest,
@@ -113,7 +113,7 @@ def put_admin_site_questions(
 @router.get(
     "/notification",
     response_model=AdminSiteNotificationsResponse,
-    dependencies=[Depends(require_permission("showcase.read"))],
+    dependencies=[Depends(require_any_permission("control.content.read", "showcase.read"))],
 )
 def get_admin_site_notification(db: Session = Depends(get_db)) -> AdminSiteNotificationsResponse:
     return SiteContentService(db).get_admin_notifications()
@@ -122,7 +122,7 @@ def get_admin_site_notification(db: Session = Depends(get_db)) -> AdminSiteNotif
 @router.post(
     "/notification",
     response_model=AdminSiteNotificationsResponse,
-    dependencies=[Depends(require_permission("showcase.edit"))],
+    dependencies=[Depends(require_any_permission("control.content.edit", "showcase.edit"))],
 )
 def create_admin_site_notification(
     payload: AdminSiteNotificationCreateRequest,
@@ -134,7 +134,7 @@ def create_admin_site_notification(
 @router.post(
     "/notification/{notification_id}/reset",
     response_model=AdminSiteNotificationsResponse,
-    dependencies=[Depends(require_permission("showcase.edit"))],
+    dependencies=[Depends(require_any_permission("control.content.edit", "showcase.edit"))],
 )
 def reset_admin_site_notification(notification_id: int, db: Session = Depends(get_db)) -> AdminSiteNotificationsResponse:
     return SiteContentService(db).reset_notification_seen_state(notification_id)
@@ -143,7 +143,7 @@ def reset_admin_site_notification(notification_id: int, db: Session = Depends(ge
 @router.delete(
     "/notification/{notification_id}",
     response_model=AdminSiteNotificationsResponse,
-    dependencies=[Depends(require_permission("showcase.edit"))],
+    dependencies=[Depends(require_any_permission("control.content.edit", "showcase.edit"))],
 )
 def delete_admin_site_notification(notification_id: int, db: Session = Depends(get_db)) -> AdminSiteNotificationsResponse:
     return SiteContentService(db).delete_notification(notification_id)
@@ -152,7 +152,7 @@ def delete_admin_site_notification(notification_id: int, db: Session = Depends(g
 @router.post(
     "/media/upload",
     response_model=AdminSiteContentMediaUploadResponse,
-    dependencies=[Depends(require_permission("showcase.edit"))],
+    dependencies=[Depends(require_any_permission("control.content.edit", "showcase.edit"))],
 )
 def upload_admin_site_content_media(
     file: UploadFile = File(...),
