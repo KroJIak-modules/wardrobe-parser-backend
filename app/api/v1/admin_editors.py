@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.schemas.admin_editors import (
     AdminDesignerEditorPayload,
+    AdminDesignerBrandActionRequest,
     AdminDesignerSourceEnabledPatch,
     AdminFilterAssignmentRebuildStartResponse,
     AdminFilterAssignmentRebuildStatus,
@@ -38,22 +39,24 @@ def mark_all_admin_brand_views_viewed(
     return {"ok": True, "marked": marked}
 
 
-@router.post("/admin/designers/brands/{source_brand}/view")
-def mark_admin_brand_view_viewed(
-    source_brand: str,
+@router.post("/admin/designers/brands/view")
+def mark_admin_brand_viewed_by_payload(
+    payload: AdminDesignerBrandActionRequest,
     admin: AdminAuthContext = Depends(require_permission("control.designers.read")),
     db: Session = Depends(get_db),
 ) -> dict:
+    source_brand = payload.source_brand
     AdminDesignerViewService(db, admin.user_id).mark_brand_viewed(source_brand)
     return {"ok": True, "source_brand": source_brand}
 
 
-@router.post("/admin/designers/brands/{source_brand}/again-view")
-def mark_admin_brand_again_viewed(
-    source_brand: str,
+@router.post("/admin/designers/brands/again-view")
+def mark_admin_brand_again_viewed_by_payload(
+    payload: AdminDesignerBrandActionRequest,
     admin: AdminAuthContext = Depends(require_permission("control.designers.read")),
     db: Session = Depends(get_db),
 ) -> dict:
+    source_brand = payload.source_brand
     AdminAgainViewService(db, admin.user_id).mark_brand_viewed(source_brand)
     return {"ok": True, "source_brand": source_brand}
 
@@ -98,18 +101,28 @@ def save_admin_designers_editor_state(
     return AdminDesignerViewService(db, admin.user_id).apply_new_flags_to_editor_payload(result)
 
 
+@router.delete("/admin/designers/{designer_id}", response_model=AdminDesignerEditorPayload)
+def delete_admin_designer(
+    designer_id: int,
+    admin: AdminAuthContext = Depends(require_permission("control.designers.edit")),
+    db: Session = Depends(get_db),
+) -> dict:
+    result = AdminEditorService(db).delete_designer(designer_id)
+    db.commit()
+    return AdminDesignerViewService(db, admin.user_id).apply_new_flags_to_editor_payload(result)
+
+
 @router.patch(
-    "/admin/designers/editor/sources/{source_brand}/enabled",
+    "/admin/designers/editor/sources/enabled",
     response_model=AdminDesignerSourceEnabledPatch,
     dependencies=[Depends(require_permission("control.designers.edit"))],
 )
-def set_admin_designer_source_enabled(
-    source_brand: str,
+def set_admin_designer_source_enabled_by_payload(
     payload: AdminDesignerSourceEnabledPatch,
     db: Session = Depends(get_db),
 ) -> dict:
     result = AdminEditorService(db).set_designer_source_enabled(
-        source_brand=source_brand,
+        source_brand=payload.source_brand,
         include_in_designers=payload.include_in_designers,
     )
     db.commit()

@@ -84,6 +84,12 @@ class AdminDesignerSourceEnabledPatch(BaseModel):
     include_in_designers: bool
 
 
+class AdminDesignerBrandActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_brand: str = Field(min_length=1)
+
+
 class AdminDesignerEditorDesigner(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

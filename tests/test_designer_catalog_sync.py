@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+import pytest
 from uuid import uuid4
 
 import app.api.v1.auth as auth_module
@@ -125,6 +126,68 @@ def test_active_source_brand_creates_catalog_designer_automatically() -> None:
         assert int(persisted_mapping.designer_id or 0) == int(persisted_designer.id)
         assert persisted_designer.origin_kind == "auto"
         assert persisted_designer.is_admin_touched is False
+    finally:
+        db.rollback()
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("source_brand", "designer_name"),
+    [
+        ("ZZ TEST Source Brand", "ZZ TEST Final Designer"),
+        ("ZZ TEST Source/Brand", "ZZ TEST Final/Designer"),
+    ],
+)
+def test_delete_designer_unlinks_source_brands_and_restores_their_auto_designer(
+    source_brand: str,
+    designer_name: str,
+) -> None:
+    db = SessionLocal()
+    try:
+        source = _create_source(db, key=f"source-delete-designer-{uuid4().hex[:8]}")
+        product, _ = _create_sync_product(
+            db,
+            source=source,
+            brand=source_brand,
+            suffix=f"delete-designer-{uuid4().hex[:8]}",
+        )
+        service = AdminEditorService(db)
+        initial_state = service.list_designer_editor_state()
+        row = next(item for item in initial_state["rows"] if item["source_brand"] == source_brand)
+        row["designer_name"] = designer_name
+        initial_state["designers"].append(
+            {
+                "id": "new-designer",
+                "name": designer_name,
+                "description": "",
+            }
+        )
+        service.save_designer_editor_state(initial_state)
+
+        deleted_designer = db.query(Designer).filter(Designer.name == designer_name).one()
+        deleted_designer_id = int(deleted_designer.id)
+        ProductWriteService(db).update_product(
+            product_id=int(product.id),
+            payload={"brand_override_name": designer_name},
+        )
+        db.refresh(product)
+        assert product.presentation is not None
+        assert product.presentation.brand_override_name == designer_name
+        result = service.delete_designer(deleted_designer_id)
+
+        mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == source_brand).one()
+        db.refresh(product)
+        assert db.query(Designer).filter(Designer.id == deleted_designer_id).one_or_none() is None
+        assert mapping.designer_name == source_brand
+        assert mapping.is_admin_touched is False
+        assert mapping.designer_id is not None
+        assert int(mapping.designer_id) != deleted_designer_id
+        assert product.designer_id == mapping.designer_id
+        assert product.designer is not None
+        assert product.designer.name == source_brand
+        assert product.presentation is not None
+        assert product.presentation.brand_override_name is None
+        assert all(item["name"] != designer_name for item in result["designers"])
     finally:
         db.rollback()
         db.close()

@@ -7,10 +7,11 @@ from fastapi.testclient import TestClient
 import app.api.v1.auth as auth_module
 from app.core.database import SessionLocal
 from app.main import app
-from app.models import AdminRole, AdminUser, DesignerSourceName, Product, ProductListing, ProductListingImage, ProductListingMember, Source, SourceSetting
+from app.models import AdminRole, AdminUser, Designer, DesignerSourceName, Product, ProductListing, ProductListingImage, ProductListingMember, Source, SourceSetting
 from app.schemas.auth import AdminRoleCreateRequest, AdminUserCreateRequest
 from app.services.auth.admin_accounts_service import AdminAccountsService
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
+from app.services.catalog.admin_editor_service import AdminEditorService
 from app.services.catalog.product_ingest_service import ProductIngestService
 
 
@@ -251,12 +252,18 @@ def test_single_brand_and_designer_view_endpoints(monkeypatch) -> None:
         assert row is not None and row["is_new"] is True
         assert designer is not None and designer["is_new"] is True
 
-        unknown_brand = client.post("/api/v1/admin/designers/brands/does-not-exist/view")
+        unknown_brand = client.post(
+            "/api/v1/admin/designers/brands/view",
+            json={"source_brand": "does-not-exist"},
+        )
         assert unknown_brand.status_code == 404
         unknown_designer = client.post("/api/v1/admin/designers/designers/999999999/view")
         assert unknown_designer.status_code == 404
 
-        brand_view = client.post(f"/api/v1/admin/designers/brands/{brand}/view")
+        brand_view = client.post(
+            "/api/v1/admin/designers/brands/view",
+            json={"source_brand": brand},
+        )
         assert brand_view.status_code == 200
         row, designer = _editor_row_and_designer(client, brand)
         assert row is not None and row["is_new"] is False
@@ -271,5 +278,87 @@ def test_single_brand_and_designer_view_endpoints(monkeypatch) -> None:
     finally:
         _cleanup_products(db, product_ids, listing_ids, source_id)
         db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).delete(synchronize_session=False)
+        db.commit()
+        db.close()
+
+
+def test_designer_source_enabled_payload_endpoint_supports_slash_in_brand_name(monkeypatch) -> None:
+    client = _login_client(monkeypatch, login="superadmin", password="Q7m2Lx9pRt")
+    db = SessionLocal()
+    marker = uuid4().hex[:12]
+    brand = f"Slash/{marker}"
+    source_id: int | None = None
+    product_ids: list[int] = []
+    listing_ids: list[int] = []
+    try:
+        source = _create_source(db, marker)
+        source_id = int(source.id)
+        product = _ingest_product(db, source_id=source_id, marker=marker, brand=brand)
+        product_ids.append(int(product.id))
+        listing_ids.append(int(product.primary_listing_id or 0))
+        db.commit()
+        DesignerCatalogSyncService(db).reconcile(sync_product_links=True)
+        db.commit()
+
+        response = client.patch(
+            "/api/v1/admin/designers/editor/sources/enabled",
+            json={"source_brand": brand, "include_in_designers": False},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"source_brand": brand, "include_in_designers": False}
+        mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).one()
+        assert mapping.is_enabled is False
+
+        viewed = client.post("/api/v1/admin/designers/brands/view", json={"source_brand": brand})
+        assert viewed.status_code == 200
+        assert viewed.json() == {"ok": True, "source_brand": brand}
+    finally:
+        _cleanup_products(db, product_ids, listing_ids, source_id)
+        db.query(DesignerSourceName).filter(DesignerSourceName.source_name == brand).delete(synchronize_session=False)
+        db.commit()
+        db.close()
+
+
+def test_delete_linked_designer_endpoint_unlinks_slash_named_brand(monkeypatch) -> None:
+    client = _login_client(monkeypatch, login="superadmin", password="Q7m2Lx9pRt")
+    db = SessionLocal()
+    marker = uuid4().hex[:12]
+    source_brand = f"Source/{marker}"
+    designer_name = f"Designer/{marker}"
+    source_id: int | None = None
+    product_ids: list[int] = []
+    listing_ids: list[int] = []
+    try:
+        source = _create_source(db, marker)
+        source_id = int(source.id)
+        product = _ingest_product(db, source_id=source_id, marker=marker, brand=source_brand)
+        product_ids.append(int(product.id))
+        listing_ids.append(int(product.primary_listing_id or 0))
+        db.commit()
+
+        service = AdminEditorService(db)
+        state = service.list_designer_editor_state()
+        row = next(item for item in state["rows"] if item["source_brand"] == source_brand)
+        row["designer_name"] = designer_name
+        state["designers"].append({"id": "new-designer", "name": designer_name, "description": ""})
+        service.save_designer_editor_state(state)
+        db.commit()
+        designer = db.query(Designer).filter(Designer.name == designer_name).one()
+
+        response = client.delete(f"/api/v1/admin/designers/{int(designer.id)}")
+
+        assert response.status_code == 200
+        assert all(item["name"] != designer_name for item in response.json()["designers"])
+        mapping = db.query(DesignerSourceName).filter(DesignerSourceName.source_name == source_brand).one()
+        db.refresh(product)
+        assert mapping.designer_name == source_brand
+        assert mapping.designer_id is not None
+        assert product.designer_id == mapping.designer_id
+        assert db.query(Designer).filter(Designer.id == int(designer.id)).one_or_none() is None
+    finally:
+        _cleanup_products(db, product_ids, listing_ids, source_id)
+        db.query(DesignerSourceName).filter(DesignerSourceName.source_name == source_brand).delete(synchronize_session=False)
+        db.query(Designer).filter(Designer.name == designer_name).delete(synchronize_session=False)
         db.commit()
         db.close()

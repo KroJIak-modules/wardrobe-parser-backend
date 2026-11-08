@@ -5,7 +5,7 @@ from collections import defaultdict
 from sqlalchemy import func, inspect, or_
 from sqlalchemy.orm import Session, joinedload
 
-from app.core.exceptions import ValidationError
+from app.core.exceptions import NotFoundError, ValidationError
 from app.models import (
     CustomCatalog,
     CustomCatalogProduct,
@@ -426,6 +426,54 @@ class AdminEditorService:
             self.db.delete(entity)
             existing_designers.pop(designer_id, None)
 
+        self.db.flush()
+        return self.list_designer_editor_state(reconcile=False)
+
+    def delete_designer(self, designer_id: int) -> dict:
+        designer = self.db.query(Designer).filter(Designer.id == int(designer_id)).one_or_none()
+        if designer is None:
+            raise NotFoundError("Дизайнер не найден")
+
+        designer_name = self._normalize_text(designer.name)
+        linked_mappings = (
+            self.db.query(DesignerSourceName)
+            .filter(DesignerSourceName.designer_id == int(designer.id))
+            .all()
+        )
+        affected_source_brands = {
+            self._normalize_text(mapping.source_name)
+            for mapping in linked_mappings
+            if self._normalize_text(mapping.source_name)
+        }
+
+        for mapping in linked_mappings:
+            source_name = self._normalize_text(mapping.source_name)
+            mapping.designer_id = None
+            mapping.designer = None
+            mapping.designer_name = source_name or None
+            mapping.is_admin_touched = False
+
+        affected_products = (
+            self.db.query(Product)
+            .options(joinedload(Product.presentation))
+            .filter(Product.designer_id == int(designer.id))
+            .all()
+        )
+        for product in affected_products:
+            product.designer_id = None
+            presentation = product.presentation
+            if (
+                presentation is not None
+                and self._normalize_text(presentation.brand_override_name) == designer_name
+            ):
+                presentation.brand_override_name = None
+
+        self.db.flush()
+        self.db.delete(designer)
+        self.db.flush()
+
+        DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
+        ProductVisibilityService(self.db).refresh_source_brands(affected_source_brands)
         self.db.flush()
         return self.list_designer_editor_state(reconcile=False)
 
