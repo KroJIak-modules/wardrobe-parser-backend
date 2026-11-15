@@ -178,11 +178,25 @@ def get_site_questions(db: Session = Depends(get_db)) -> SiteQuestionsResponse:
 @router.get("/media/{asset_id}/file")
 def get_site_media_file(
     asset_id: int,
+    w: int | None = Query(default=None, ge=64, le=4000),
+    q: int = Query(default=82, ge=40, le=100),
+    fm: str | None = Query(default=None),
     site_access_token: str | None = Cookie(default=None, alias=SITE_ACCESS_COOKIE_NAME),
     db: Session = Depends(get_db),
 ) -> FileResponse:
     SiteAccessService(db).require_media_access(asset_id, site_access_token)
     service = SiteQueryService(db)
     asset = service.site_media_asset(asset_id)
-    file_path = MediaAssetService(db).resolve_file_path(asset)
+    media_service = MediaAssetService(db)
+    if w is not None or fm is not None:
+        variant = media_service.render_variant_file(asset, width=w, quality=q, fmt=fm)
+        if variant is not None:
+            variant_path, variant_mime = variant
+            return FileResponse(
+                variant_path,
+                media_type=variant_mime,
+                headers={"Cache-Control": "private, max-age=604800"},
+            )
+
+    file_path = media_service.resolve_file_path(asset)
     return FileResponse(file_path, media_type=asset.mime_type)

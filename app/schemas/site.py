@@ -214,6 +214,7 @@ class SiteCatalogProductResponse(BaseModel):
     name: str
     price_rub: int | None = None
     old_price_rub: int | None = None
+    price_has_range: bool = False
     status: Literal["in_stock", "preorder", "sold_out"]
     image_url: str | None = None
 
@@ -289,6 +290,8 @@ class SiteProductResponse(BaseModel):
     status: Literal["in_stock", "preorder", "sold_out"]
     photos: list[str] = Field(default_factory=list)
     variants: list[SiteProductVariantResponse] = Field(default_factory=list)
+    price_has_range: bool = False
+    size_label: str = "РАЗМЕР"
     primary_source_url: str | None = None
     recommendation_context: SiteProductRecommendationContextResponse
 

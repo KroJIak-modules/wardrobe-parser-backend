@@ -316,6 +316,7 @@ class CatalogProductRepository:
             self.session.query(
                 Product.id.label("product_id"),
                 Product.site_sort_price_rub.label("site_sort_price_rub"),
+                Product.site_sort_price_has_range.label("site_sort_price_has_range"),
                 representative_variant_sq.c.listing_id.label("representative_listing_id"),
                 representative_variant_sq.c.compare_at_price_amount.label("compare_at_price_amount"),
                 representative_variant_sq.c.price_amount.label("price_amount"),
@@ -383,7 +384,12 @@ class CatalogProductRepository:
             for product_id, in (
                 self.session.query(Product.id)
                 .filter(Product.lifecycle_status == "active")
-                .filter(Product.site_sort_price_synced_at.is_(None))
+                .filter(
+                    or_(
+                        Product.site_sort_price_synced_at.is_(None),
+                        Product.site_sort_price_has_range.is_(None),
+                    )
+                )
                 .order_by(Product.id.asc())
                 .limit(safe_limit)
                 .all()

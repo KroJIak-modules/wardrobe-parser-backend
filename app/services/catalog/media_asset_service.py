@@ -5,6 +5,7 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
+import logging
 import mimetypes
 import secrets
 import json
@@ -13,12 +14,15 @@ import subprocess
 import tempfile
 
 from fastapi import UploadFile
-from PIL import Image
+from PIL import Image, ImageOps
 import requests
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import ValidationError
 from app.models import ImageAsset
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -287,3 +291,174 @@ class MediaAssetService:
 
     def resolve_file_path(self, asset: ImageAsset) -> Path:
         return self._ROOT_DIR / str(asset.storage_key or "").strip()
+
+    # ------------------------------------------------------------------
+    # Выдача оптимизированных копий для витрины
+    # ------------------------------------------------------------------
+
+    _RESIZABLE_MIME_TYPES = {
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }
+    _VARIANT_CACHE_DIR = Path(".cache") / "site-media"
+    _VARIANT_MIN_WIDTH = 64
+    _VARIANT_MAX_WIDTH = 4000
+    _VARIANT_MIN_QUALITY = 40
+    _VARIANT_MAX_QUALITY = 100
+    _VARIANT_FORMATS = {"webp", "jpeg", "jpg", "png"}
+
+    @classmethod
+    def _normalize_variant_width(cls, width: int | None) -> int | None:
+        if width is None:
+            return None
+        return max(cls._VARIANT_MIN_WIDTH, min(cls._VARIANT_MAX_WIDTH, int(width)))
+
+    @classmethod
+    def _normalize_variant_quality(cls, quality: int | None) -> int:
+        if quality is None:
+            return 82
+        return max(cls._VARIANT_MIN_QUALITY, min(cls._VARIANT_MAX_QUALITY, int(quality)))
+
+    @classmethod
+    def _normalize_variant_format(cls, fmt: str | None, *, has_alpha: bool) -> str:
+        normalized = str(fmt or "").strip().lower()
+        if normalized not in cls._VARIANT_FORMATS:
+            # WebP умеет альфа-канал, поэтому подходит для всех растровых картинок.
+            return "webp"
+        if normalized == "jpg":
+            return "jpeg"
+        if normalized == "jpeg" and has_alpha:
+            return "jpeg"
+        return normalized
+
+    def _variant_cache_path(
+        self,
+        *,
+        asset: ImageAsset,
+        source_path: Path,
+        width: int | None,
+        quality: int,
+        fmt: str,
+    ) -> Path:
+        try:
+            stat = source_path.stat()
+            source_signature = f"{int(stat.st_mtime)}-{stat.st_size}"
+        except OSError:
+            source_signature = "missing"
+        return (
+            self._ROOT_DIR
+            / self._VARIANT_CACHE_DIR
+            / f"{int(asset.id)}-w{width or 0}-q{quality}.{fmt}-{source_signature}"
+        )
+
+    @staticmethod
+    def _encode_variant(image: Image.Image, *, fmt: str, quality: int) -> bytes:
+        buffer = BytesIO()
+        if fmt == "webp":
+            image.save(buffer, "WEBP", quality=quality, method=4)
+        elif fmt == "jpeg":
+            if image.mode in {"RGBA", "LA", "P"}:
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                converted = image.convert("RGBA")
+                background.paste(converted, mask=converted.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+            image.save(buffer, "JPEG", quality=quality, optimize=True, progressive=True)
+        else:
+            image.save(buffer, "PNG", optimize=True)
+        return buffer.getvalue()
+
+    def render_variant_file(
+        self,
+        asset: ImageAsset,
+        *,
+        width: int | None = None,
+        quality: int | None = None,
+        fmt: str | None = None,
+    ) -> tuple[Path, str] | None:
+        """Готовит оптимизированную копию файла.
+
+        Оригинал не меняется. Возвращает (путь, mime-тип) либо None, если
+        ресайз неприменим (SVG, анимированный GIF, отсутствующий файл).
+        """
+        mime_type = str(asset.mime_type or "").strip().lower()
+        if mime_type not in self._RESIZABLE_MIME_TYPES:
+            return None
+
+        source_path = self.resolve_file_path(asset)
+        if not source_path.is_file():
+            return None
+
+        try:
+            with Image.open(source_path) as opened:
+                if getattr(opened, "is_animated", False):
+                    return None
+                opened.load()
+                image = ImageOps.exif_transpose(opened)
+                if image is None:
+                    return None
+                source_width, source_height = image.size
+                has_alpha = image.mode in {"RGBA", "LA", "P"} and (
+                    image.mode == "P" or image.getchannel("A").getextrema()[0] < 255
+                )
+                target_width = self._normalize_variant_width(width)
+                normalized_quality = self._normalize_variant_quality(quality)
+                normalized_format = self._normalize_variant_format(fmt, has_alpha=has_alpha)
+
+                if target_width and target_width < source_width:
+                    target_height = max(1, round(source_height * target_width / source_width))
+                    image = image.resize((target_width, target_height), Image.LANCZOS)
+                elif target_width and target_width > source_width:
+                    # Увеличивать нельзя: это потеря качества, а не экономия.
+                    target_width = source_width
+
+                cache_path = self._variant_cache_path(
+                    asset=asset,
+                    source_path=source_path,
+                    width=target_width,
+                    quality=normalized_quality,
+                    fmt=normalized_format,
+                )
+                if cache_path.is_file() and cache_path.stat().st_size > 0:
+                    return cache_path, self._variant_mime_type(normalized_format)
+
+                content = self._encode_variant(image, fmt=normalized_format, quality=normalized_quality)
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = cache_path.with_suffix(f"{cache_path.suffix}.tmp")
+                temp_path.write_bytes(content)
+                temp_path.replace(cache_path)
+                self._cleanup_stale_variants(asset=asset, keep_path=cache_path)
+                return cache_path, self._variant_mime_type(normalized_format)
+        except (OSError, ValueError):
+            LOGGER.exception("Failed to render media variant for asset %s", asset.id)
+            return None
+
+    def _cleanup_stale_variants(self, *, asset: ImageAsset, keep_path: Path) -> None:
+        """Удаляет варианты ассета, устаревшие после перезаливки файла.
+
+        Подпись файла в кэше заканчивается отпечатком исходника, поэтому
+        варианты других размеров и качеств не затрагиваются.
+        """
+        cache_dir = self._ROOT_DIR / self._VARIANT_CACHE_DIR
+        pattern = keep_path.name.rsplit("-", 1)[0] + "-*"
+        try:
+            candidates = list(cache_dir.glob(pattern))
+        except OSError:
+            return
+        for candidate in candidates:
+            if candidate == keep_path or not candidate.is_file():
+                continue
+            try:
+                candidate.unlink()
+            except OSError:
+                continue
+
+    @staticmethod
+    def _variant_mime_type(fmt: str) -> str:
+        if fmt == "webp":
+            return "image/webp"
+        if fmt == "jpeg":
+            return "image/jpeg"
+        return "image/png"

@@ -383,17 +383,26 @@ class PricingSettingsService:
         seed_gbp_to_usd_rate = max(0.01, float(seed.gbp_to_usd_rate))
         seed_jpy_to_usd_rate = max(0.000001, float(seed.jpy_to_usd_rate))
         usdt_to_rub_rate = max(0.01, float(getattr(entity, "usdt_to_rub_rate", seed_usdt_to_rub_rate) or seed_usdt_to_rub_rate))
-        usd_to_rub_rate = max(0.01, float(getattr(entity, "usd_to_rub_rate", usdt_to_rub_rate) or usdt_to_rub_rate))
+        usdt_extra_rub = max(0.0, float(getattr(entity, "usdt_extra_rub", 0.0) or 0.0))
         eur_to_usd_rate = float(getattr(entity, "eur_to_usd_rate", 0.0) or 0.0)
         if eur_to_usd_rate <= 0:
-            eur_to_rub_current = float(getattr(entity, "eur_to_rub_rate", 0.0) or 0.0)
-            eur_to_usd_rate = (eur_to_rub_current / usd_to_rub_rate) if eur_to_rub_current > 0 and usd_to_rub_rate > 0 else seed_eur_to_usd_rate
+            stored_eur_to_rub_rate = float(getattr(entity, "eur_to_rub_rate", 0.0) or 0.0)
+            stored_usd_to_rub_rate = float(getattr(entity, "usd_to_rub_rate", 0.0) or 0.0)
+            eur_to_usd_rate = (
+                (stored_eur_to_rub_rate / stored_usd_to_rub_rate)
+                if stored_eur_to_rub_rate > 0 and stored_usd_to_rub_rate > 0
+                else seed_eur_to_usd_rate
+            )
         gbp_to_usd_rate = float(getattr(entity, "gbp_to_usd_rate", 0.0) or 0.0)
         if gbp_to_usd_rate <= 0:
             gbp_to_usd_rate = seed_gbp_to_usd_rate
         jpy_to_usd_rate = float(getattr(entity, "jpy_to_usd_rate", 0.0) or 0.0)
         if jpy_to_usd_rate <= 0:
             jpy_to_usd_rate = seed_jpy_to_usd_rate
+        # BFX = BBR + BEX: the effective RUB rate the formula actually applies.
+        # usd_to_rub_rate and eur_to_rub_rate stay in the API/transfer contract as derived
+        # mirrors, so BBR and BEX remain the only sources of truth for the RUB rate.
+        usd_to_rub_rate = max(0.01, usdt_to_rub_rate + usdt_extra_rub)
         eur_to_rub_rate = max(0.01, usd_to_rub_rate * eur_to_usd_rate)
 
         if cls._rate_value_changed(getattr(entity, "usd_to_rub_rate", None), usd_to_rub_rate):
@@ -657,22 +666,24 @@ class PricingSettingsService:
         if "svc_rules" in patch:
             patch["svc_rules"] = self._normalize_svc_rules(patch.get("svc_rules"))
             self._validate_svc_rules_no_overlap(patch["svc_rules"])
-        if "usdt_to_rub_rate" in patch and "usd_to_rub_rate" not in patch:
-            patch["usd_to_rub_rate"] = patch["usdt_to_rub_rate"]
+        # The effective USD->RUB rate is BFX = BBR + BEX, and the effective EUR->RUB rate is
+        # E2U * BFX. Both legacy fields are derived, so a direct patch of them is translated
+        # back into the editable sources (BBR/BEX/E2U) instead of silently doing nothing.
+        if "usd_to_rub_rate" in patch and "usdt_to_rub_rate" not in patch and "usdt_extra_rub" not in patch:
+            target_rate = float(patch["usd_to_rub_rate"])
+            base_rate = float(getattr(entity, "usdt_to_rub_rate", 0.0) or 0.0)
+            if target_rate >= base_rate:
+                patch["usdt_extra_rub"] = target_rate - base_rate
+            else:
+                patch["usdt_to_rub_rate"] = target_rate
+                patch["usdt_extra_rub"] = 0.0
+        patch.pop("usd_to_rub_rate", None)
         if "eur_to_rub_rate" in patch and "eur_to_usd_rate" not in patch:
-            seed = self._seed_pricing_settings()
-            current_usd_to_rub = float(getattr(entity, "usd_to_rub_rate", 0.0) or 0.0)
-            current_usdt_to_rub = float(getattr(entity, "usdt_to_rub_rate", 0.0) or 0.0)
-            next_usd_to_rub = max(
-                0.0001,
-                float(
-                    patch.get("usd_to_rub_rate")
-                    or current_usd_to_rub
-                    or current_usdt_to_rub
-                    or float(seed.usd_to_rub_rate)
-                ),
-            )
+            base_rate = float(patch.get("usdt_to_rub_rate") or getattr(entity, "usdt_to_rub_rate", 0.0) or 0.0)
+            extra_rate = float(patch.get("usdt_extra_rub", getattr(entity, "usdt_extra_rub", 0.0) or 0.0))
+            next_usd_to_rub = max(0.0001, base_rate + extra_rate)
             patch["eur_to_usd_rate"] = max(0.01, float(patch["eur_to_rub_rate"])) / next_usd_to_rub
+        patch.pop("eur_to_rub_rate", None)
         if "final_rounding_mode" in patch:
             patch["final_rounding_mode"] = self._normalize_final_rounding_mode(
                 patch.get("final_rounding_mode"),
@@ -1264,12 +1275,10 @@ class PricingSettingsService:
 
         base_usdt_to_rub = max(0.0, float(settings.usdt_to_rub_rate))
         usdt_extra_rub = max(0.0, float(settings.usdt_extra_rub))
-        usd_to_rub_rate = max(0.0001, float(settings.usd_to_rub_rate))
-        eur_to_rub_rate = max(0.0001, float(settings.eur_to_rub_rate))
         eur_to_usd_rate = max(0.0001, float(settings.eur_to_usd_rate))
         gbp_to_usd_rate = max(0.0001, float(settings.gbp_to_usd_rate))
         jpy_to_usd_rate = max(0.000001, float(settings.jpy_to_usd_rate))
-        if base_usdt_to_rub <= 0 or usd_to_rub_rate <= 0 or eur_to_rub_rate <= 0:
+        if base_usdt_to_rub <= 0:
             return ProductPricingComputation(
                 None,
                 True,
@@ -1286,7 +1295,7 @@ class PricingSettingsService:
         elif currency == "JPY":
             sp_usd = float(source_price) * jpy_to_usd_rate
         elif currency == "RUB":
-            sp_usd = float(source_price) / usd_to_rub_rate
+            sp_usd = float(source_price) / base_usdt_to_rub
         else:
             return ProductPricingComputation(
                 None,
@@ -1301,8 +1310,10 @@ class PricingSettingsService:
         )
         if bybit_bucket_rate <= 0:
             bybit_bucket_rate = base_usdt_to_rub
+        # BFX = BBR + BEX: итоговый курс USDT/RUB, которым цена товара переводится в рубли.
         effective_usdt_to_rub = bybit_bucket_rate + usdt_extra_rub
-        eur_to_rub_effective = eur_to_rub_rate
+        # E2U * BFX: курс EUR -> RUB для таможни и валютных надбавок.
+        eur_to_rub_effective = eur_to_usd_rate * effective_usdt_to_rub
         if effective_usdt_to_rub <= 0 or eur_to_rub_effective <= 0:
             return ProductPricingComputation(
                 None,
@@ -1311,9 +1322,9 @@ class PricingSettingsService:
                 {"source_price": float(source_price), "source_currency": currency or None},
             )
         if currency == "RUB":
-            sp_usd = float(source_price) / usd_to_rub_rate
+            sp_usd = float(source_price) / effective_usdt_to_rub
 
-        sp_rub = sp_usd * usd_to_rub_rate
+        sp_rub = sp_usd * effective_usdt_to_rub
         sp_eur = sp_usd / eur_to_usd_rate
 
         effective_weight_grams = max(1.0, float(weight_grams) * settings.weight_tolerance)

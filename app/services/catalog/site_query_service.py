@@ -60,6 +60,35 @@ from app.services.catalog.taxonomy_service import TaxonomyService
 
 _PRODUCT_PATH_RE = re.compile(r"^(?P<id>\d+)(?:-(?P<handle>.*))?$")
 
+_SIZE_LABEL_SIZE = "РАЗМЕР"
+_SIZE_LABEL_VARIANT = "ВАРИАНТЫ"
+
+# Значения вариантов, которые считаются размером.
+_SIZE_LABEL_LETTER_TOKENS = {
+    "XXS",
+    "XS",
+    "S",
+    "M",
+    "L",
+    "XL",
+    "XXL",
+    "XXXL",
+    "XXXXL",
+    "XXXXXL",
+    "ONESIZE",
+    "OS",
+    "FREESIZE",
+    "UNISIZE",
+    "DEFAULT",
+    "DEFAULTTITLE",
+    "БАЗОВЫЙВАРИАНТ",
+}
+
+_SIZE_LABEL_SHOE_TOKENS = {
+    "F",
+    "FR",
+}
+
 
 class SiteQueryService:
     def __init__(self, db: Session) -> None:
@@ -123,6 +152,71 @@ class SiteQueryService:
         if title.casefold() == "default title":
             return "Базовый вариант"
         return title or "ONE SIZE"
+
+    @staticmethod
+    def _size_token_family(value: object | None) -> str | None:
+        """Возвращает семейство размера (letter/numeric/shoe) или None, если это не размер."""
+        token = re.sub(r"\s+", "", str(value or "").strip().upper())
+        if not token:
+            return None
+        if token in _SIZE_LABEL_LETTER_TOKENS:
+            return "letter"
+        if re.fullmatch(r"\d{1,2}XS", token):
+            return "letter"
+        if token.isdigit():
+            return "numeric" if 20 <= int(token) <= 60 else None
+        if token in _SIZE_LABEL_SHOE_TOKENS:
+            return "shoe"
+        if re.fullmatch(r"(?:EU|US|UK|FR|IT)\d{2}(?:\.5)?", token):
+            return "shoe"
+        return None
+
+    @classmethod
+    def _size_label(cls, variant_titles: list[object | None]) -> str:
+        """Подпись селектора вариантов: РАЗМЕР, когда значения — размеры, иначе ВАРИАНТЫ.
+
+        Источники вроде 14thaddiction.com отдают комбинации нескольких осей
+        (размер / цвет / кастомизация) одной строкой через " / ". Если значения
+        вариантов — настоящие размеры, подпись остаётся "РАЗМЕР", иначе её надо
+        переименовать, иначе размером называют модели и бандлы.
+        """
+        titles = [str(title or "").strip() for title in variant_titles]
+        titles = [title for title in titles if title]
+        if not titles:
+            return _SIZE_LABEL_SIZE
+        parts = [tuple(part.strip() for part in title.split("/")) for title in titles]
+        counts = {len(items) for items in parts}
+        if len(counts) != 1:
+            return _SIZE_LABEL_VARIANT
+        count = counts.pop()
+        if count == 1:
+            return _SIZE_LABEL_SIZE if cls._single_size_family(parts) else _SIZE_LABEL_VARIANT
+        if count == 2:
+            # "0 / 3XS" — числовой индекс варианта и сам размер.
+            if all(items[0].isdigit() for items in parts) and cls._single_size_family(
+                [(items[1],) for items in parts]
+            ):
+                return _SIZE_LABEL_SIZE
+        return _SIZE_LABEL_VARIANT
+
+    @classmethod
+    def _single_size_family(cls, parts: list[tuple[str, ...]]) -> bool:
+        families = {
+            family
+            for items in parts
+            for family in [cls._size_token_family(items[0])]
+            if family is not None
+        }
+        if not families or len(families) > 1:
+            return False
+        return all(cls._size_token_family(items[0]) is not None for items in parts)
+
+    @staticmethod
+    def _prices_have_range(prices: list[float | int | None]) -> bool:
+        normalized = sorted({round(float(price), 2) for price in prices if price is not None})
+        if len(normalized) < 2:
+            return False
+        return (normalized[-1] - normalized[0]) >= 0.01
 
     @staticmethod
     def _normalize_catalog_sort(value: object | None) -> str:
@@ -785,6 +879,12 @@ class SiteQueryService:
             availability_mode=getattr(row, "availability_mode", None),
             orderability_status=effective_orderability_status,
         )
+        price_rub = (
+            int(round(float(getattr(row, "site_sort_price_rub"))))
+            if getattr(row, "site_sort_price_rub", None) is not None
+            else None
+        )
+        price_has_range = bool(getattr(row, "site_sort_price_has_range", False))
         return SiteCatalogProductResponse(
             id=int(getattr(row, "product_id")),
             path=self.build_product_path(int(getattr(row, "product_id")), title),
@@ -793,12 +893,9 @@ class SiteQueryService:
                 slug=(str(getattr(row, "designer_slug", "") or "") or None),
             ),
             name=title,
-            price_rub=(
-                int(round(float(getattr(row, "site_sort_price_rub"))))
-                if getattr(row, "site_sort_price_rub", None) is not None
-                else None
-            ),
+            price_rub=price_rub,
             old_price_rub=self._site_catalog_old_price_rub(row, product=product),
+            price_has_range=price_has_range,
             status=status,  # type: ignore[arg-type]
             image_url=self._site_catalog_image_url(row),
         )
@@ -898,6 +995,8 @@ class SiteQueryService:
         filter_slugs = self.products._matched_filter_slugs(product)
         if filter_slugs:
             section_slug = str(filter_slugs[0] or "").strip() or None
+        variant_titles = [str(variant.size or "") for variant in variants]
+        price_has_range = self._prices_have_range([variant.price_rub for variant in variants])
         return SiteProductResponse(
             id=product_id,
             path=self.build_product_path(product_id, public_payload.get("title")),
@@ -911,6 +1010,8 @@ class SiteQueryService:
             status=status,  # type: ignore[arg-type]
             photos=[str(url) for url in public_payload.get("image_urls") or []],
             variants=variants,
+            price_has_range=price_has_range,
+            size_label=self._size_label(variant_titles),
             primary_source_url=(str(public_payload.get("url")) if public_payload.get("url") else None),
             recommendation_context=SiteProductRecommendationContextResponse(
                 designer_slug=(str(getattr(product.designer, "slug", "") or "") or None),

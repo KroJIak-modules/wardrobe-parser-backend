@@ -49,6 +49,9 @@ class SiteCatalogSortPriceService:
                 else None
             )
             product.site_sort_price_rub = self._normalize_price(final_display_price)
+            product.site_sort_price_has_range = bool(
+                isinstance(price_summary, dict) and price_summary.get("final_has_range")
+            )
             product.site_sort_price_synced_at = synced_at
         self.db.flush()
         if commit:
