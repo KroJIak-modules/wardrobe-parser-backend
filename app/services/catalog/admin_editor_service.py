@@ -35,6 +35,7 @@ class AdminEditorService:
         self.db = db
         self.taxonomy = TaxonomyService(db)
         self.products = ProductQueryService(db)
+        self._designer_editor_state_cache: dict | None = None
 
     @staticmethod
     def _normalize_text(value: object | None) -> str:
@@ -163,6 +164,7 @@ class AdminEditorService:
         products = query.order_by(Product.id.asc()).all()
         product_ids = [int(product.id) for product in products]
         catalog_titles_by_product_id = self._custom_catalog_titles_by_product_ids(product_ids)
+        assigned_labels_by_product_id = self.products._assigned_filter_labels_by_product_ids(product_ids)
         result: dict[int, dict] = {}
         for product in products:
             primary_listing = self.products._resolved_primary_listing(product)
@@ -171,7 +173,8 @@ class AdminEditorService:
             if primary_listing is not None and primary_listing.images:
                 first_image = sorted(primary_listing.images, key=lambda item: int(item.position or 0))[0]
                 image_url = str(first_image.url or "").strip() or None
-            assigned_titles = self.products._matched_filter_labels(product)
+            assigned_label = assigned_labels_by_product_id.get(int(product.id), "")
+            assigned_titles = [assigned_label] if assigned_label else []
             for title in catalog_titles_by_product_id.get(int(product.id), []):
                 if title not in assigned_titles:
                     assigned_titles.append(title)
@@ -252,6 +255,11 @@ class AdminEditorService:
         return items
 
     def list_designer_editor_state(self, *, reconcile: bool = False) -> dict:
+        if not reconcile and self._designer_editor_state_cache is not None:
+            # Состояние дизайнеров считается один раз на экземпляр сервиса:
+            # и таксономия, и шапка витрины запрашивают его в одном запросе,
+            # а расчёт строится по всему каталогу.
+            return self._designer_editor_state_cache
         sync = DesignerCatalogSyncService(self.db)
         if reconcile:
             sync.reconcile(sync_product_links=False)
@@ -292,7 +300,9 @@ class AdminEditorService:
             ),
             key=lambda item: (str(item["name"]).casefold(), str(item["id"])),
         )
-        return {"rows": result_rows, "designers": designers}
+        state = {"rows": result_rows, "designers": designers}
+        self._designer_editor_state_cache = state
+        return state
 
     def save_designer_editor_state(self, payload: dict) -> dict:
         rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
@@ -427,6 +437,7 @@ class AdminEditorService:
             existing_designers.pop(designer_id, None)
 
         self.db.flush()
+        self._designer_editor_state_cache = None
         return self.list_designer_editor_state(reconcile=False)
 
     def delete_designer(self, designer_id: int) -> dict:
@@ -475,6 +486,7 @@ class AdminEditorService:
         DesignerCatalogSyncService(self.db).reconcile(sync_product_links=True)
         ProductVisibilityService(self.db).refresh_source_brands(affected_source_brands)
         self.db.flush()
+        self._designer_editor_state_cache = None
         return self.list_designer_editor_state(reconcile=False)
 
     def set_designer_source_enabled(self, *, source_brand: str, include_in_designers: bool) -> dict:
@@ -502,6 +514,7 @@ class AdminEditorService:
             DesignerCatalogSyncService(self.db).sync_product_links_for_source_brands(source_names)
         ProductVisibilityService(self.db).refresh_source_brands(source_names)
         self.db.flush()
+        self._designer_editor_state_cache = None
         return {
             "source_brand": normalized_source_brand,
             "include_in_designers": bool(include_in_designers),
@@ -904,4 +917,6 @@ class AdminEditorService:
                 .update({Product.visibility_status: "hidden"}, synchronize_session=False)
             )
         self.db.flush()
+        # Скрытие товаров меняет публичные счётчики брендов.
+        self._designer_editor_state_cache = None
         return self.list_taxonomy_editor_state()

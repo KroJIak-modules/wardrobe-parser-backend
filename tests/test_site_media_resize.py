@@ -3,7 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageFile
 
 from app.core.database import SessionLocal
 from app.models import ImageAsset
@@ -154,6 +154,33 @@ def test_render_variant_keeps_variants_of_other_sizes() -> None:
             assert wide[0].is_file()
             assert narrow[0].is_file()
         finally:
+            service.resolve_file_path(asset).unlink(missing_ok=True)
+            db.delete(asset)
+            db.commit()
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_render_variant_serves_cache_without_decoding_source(monkeypatch) -> None:
+    db = SessionLocal()
+    try:
+        service = MediaAssetService(db)
+        asset = _create_asset(service, name="resize-cache.png", content=_make_png_bytes())
+        try:
+            variant = service.render_variant_file(asset, width=300, quality=82, fmt="webp")
+            assert variant is not None
+
+            def _fail(*args, **kwargs):
+                raise AssertionError("оригинал не должен декодироваться при попадании в кэш")
+
+            monkeypatch.setattr(Image.Image, "load", _fail)
+            monkeypatch.setattr(ImageFile.ImageFile, "load", _fail)
+            cached = service.render_variant_file(asset, width=300, quality=82, fmt="webp")
+            assert cached is not None
+            assert cached[0] == variant[0]
+        finally:
+            monkeypatch.undo()
             service.resolve_file_path(asset).unlink(missing_ok=True)
             db.delete(asset)
             db.commit()

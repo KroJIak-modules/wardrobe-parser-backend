@@ -371,6 +371,22 @@ class MediaAssetService:
             image.save(buffer, "PNG", optimize=True)
         return buffer.getvalue()
 
+    @staticmethod
+    def _oriented_size(opened: Image.Image) -> tuple[int, int]:
+        """Размер исходника с учётом EXIF-поворота.
+
+        Достаточно заголовка файла, поэтому ради вычисления ключа кэша
+        картинку декодировать не нужно.
+        """
+        width, height = opened.size
+        try:
+            orientation = int(opened.getexif().get(0x0112, 1) or 1)
+        except Exception:  # pragma: no cover - битый EXIF
+            orientation = 1
+        if orientation in {5, 6, 7, 8}:
+            return height, width
+        return width, height
+
     def render_variant_file(
         self,
         asset: ImageAsset,
@@ -396,24 +412,11 @@ class MediaAssetService:
             with Image.open(source_path) as opened:
                 if getattr(opened, "is_animated", False):
                     return None
-                opened.load()
-                image = ImageOps.exif_transpose(opened)
-                if image is None:
-                    return None
-                source_width, source_height = image.size
-                has_alpha = image.mode in {"RGBA", "LA", "P"} and (
-                    image.mode == "P" or image.getchannel("A").getextrema()[0] < 255
-                )
+                source_width, source_height = self._oriented_size(opened)
                 target_width = self._normalize_variant_width(width)
                 normalized_quality = self._normalize_variant_quality(quality)
-                normalized_format = self._normalize_variant_format(fmt, has_alpha=has_alpha)
-
-                if target_width and target_width < source_width:
-                    # thumbnail с reducing_gap уменьшает изображение быстрым
-                    # JPEG-ресайзом, а не перебором всех пикселей LANCZOS.
-                    target_height = max(1, round(source_height * target_width / source_width))
-                    image.thumbnail((target_width, target_height), Image.LANCZOS, reducing_gap=2.0)
-                elif target_width and target_width > source_width:
+                normalized_format = self._normalize_variant_format(fmt, has_alpha=False)
+                if target_width and target_width > source_width:
                     # Увеличивать нельзя: это потеря качества, а не экономия.
                     target_width = source_width
 
@@ -425,7 +428,24 @@ class MediaAssetService:
                     fmt=normalized_format,
                 )
                 if cache_path.is_file() and cache_path.stat().st_size > 0:
+                    # Копия уже готова: декодировать и уменьшать оригинал
+                    # не нужно, иначе результат всё равно будет выброшен.
                     return cache_path, self._variant_mime_type(normalized_format)
+
+                opened.load()
+                image = ImageOps.exif_transpose(opened)
+                if image is None:
+                    return None
+                has_alpha = image.mode in {"RGBA", "LA", "P"} and (
+                    image.mode == "P" or image.getchannel("A").getextrema()[0] < 255
+                )
+                normalized_format = self._normalize_variant_format(fmt, has_alpha=has_alpha)
+
+                if target_width and target_width < source_width:
+                    # thumbnail с reducing_gap уменьшает изображение быстрым
+                    # JPEG-ресайзом, а не перебором всех пикселей LANCZOS.
+                    target_height = max(1, round(source_height * target_width / source_width))
+                    image.thumbnail((target_width, target_height), Image.LANCZOS, reducing_gap=2.0)
 
                 content = self._encode_variant(image, fmt=normalized_format, quality=normalized_quality)
                 cache_path.parent.mkdir(parents=True, exist_ok=True)

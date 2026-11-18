@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from decimal import Decimal
 from html import unescape
 from html.parser import HTMLParser
@@ -287,6 +288,37 @@ class ProductQueryService:
         if self._assigned_filter_label_by_product_id_cache is None:
             self._load_assignment_caches()
         return dict(self._assigned_filter_label_by_product_id_cache)
+
+    def _assigned_filter_labels_by_product_ids(self, product_ids: Sequence[int]) -> dict[int, str]:
+        """Вернуть подписи разделов только для указанных товаров.
+
+        Полная таблица назначений содержит десятки тысяч строк, а для
+        вручную закреплённых товаров нужны единицы, поэтому общий кэш
+        назначений здесь не загружается.
+        """
+        revision = self._applied_filter_revision()
+        if revision <= 0:
+            return {}
+        normalized_ids = sorted({int(product_id) for product_id in product_ids if int(product_id) > 0})
+        if not normalized_ids:
+            return {}
+        rows = (
+            self.db.query(
+                ProductFilterAssignment.product_id,
+                ProductFilterAssignment.filter_slug,
+                ProductFilterAssignment.filter_label,
+            )
+            .filter(ProductFilterAssignment.revision == revision)
+            .filter(ProductFilterAssignment.product_id.in_(normalized_ids))
+            .all()
+        )
+        result: dict[int, str] = {}
+        for product_id, slug, label in rows:
+            normalized_slug = str(slug or "").strip()
+            if product_id is None or not normalized_slug:
+                continue
+            result[int(product_id)] = str(label or "").strip() or normalized_slug
+        return result
 
     def _applied_filter_revision(self) -> int:
         if self._applied_filter_revision_cache is None:
