@@ -12,20 +12,34 @@ from app.repositories.catalog_filter_assignments import CatalogFilterAssignmentR
 from app.repositories.catalog_products import CatalogProductRepository
 from app.repositories.catalog_taxonomy import CatalogTaxonomyRepository
 from app.services.catalog.filter_assignment_queue import ProductFilterAssignmentQueue
-from app.services.settings.weight_rule_matcher import keyword_matches, keyword_pattern, normalize_haystack, normalize_keyword
+from app.services.settings.weight_rule_matcher import keyword_pattern, normalize_haystack, normalize_keyword
 from app.services.catalog.source_gender_policy import effective_gender_for_product
 
 
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(slots=True)
+class _KeywordSpec:
+    """Ключевое слово вместе с готовым шаблоном поиска.
+
+    Шаблон собирается один раз на правило, а не на каждый товар: иначе
+    регулярное выражение компилируется тысячи раз за проход по каталогу.
+    """
+
+    __slots__ = ("pattern", "text")
+
+    def __init__(self, keyword: str) -> None:
+        self.text = keyword
+        self.pattern = keyword_pattern(keyword)
+
+
+@dataclass
 class _FilterSpec:
     id: int
     slug: str
     label: str
-    local_keywords: list[str]
-    title_keywords: list[str]
+    local_keywords: list[_KeywordSpec]
+    title_keywords: list[_KeywordSpec]
     manual_product_ids: set[int]
     restrict_by_gender: bool
     allowed_genders: set[str] | None
@@ -162,35 +176,27 @@ class ProductFilterAssignmentService:
         return title_texts, category_and_tag_texts
 
     @staticmethod
-    def _keyword_matches_any(*, keyword: str, texts: list[str]) -> bool:
-        normalized_keyword = normalize_keyword(str(keyword or "").strip())
-        if not normalized_keyword:
-            return False
-        return any(
-            keyword_matches(haystack=str(text or ""), keyword=normalized_keyword)
-            for text in texts
-            if str(text or "").strip()
-        )
+    def _keyword_matches_any(*, keyword: _KeywordSpec, texts: list[str]) -> bool:
+        for text in texts:
+            if str(text or "").strip() and keyword.pattern.search(str(text)):
+                return True
+        return False
 
     @staticmethod
-    def _keyword_tail_distance(*, keyword: str, texts: list[str]) -> int | None:
-        normalized_keyword = normalize_keyword(str(keyword or "").strip())
-        if not normalized_keyword:
-            return None
-        pattern = keyword_pattern(normalized_keyword)
+    def _keyword_tail_distance(*, keyword: _KeywordSpec, texts: list[str]) -> int | None:
         best_distance: int | None = None
         for text in texts:
             normalized_text = str(text or "").strip()
             if not normalized_text:
                 continue
-            for match in pattern.finditer(normalized_text):
+            for match in keyword.pattern.finditer(normalized_text):
                 distance = len(normalized_text) - int(match.end())
                 if best_distance is None or distance < best_distance:
                     best_distance = distance
         return best_distance
 
     @classmethod
-    def _best_title_tail_distance(cls, *, matched_keywords: list[str], texts: list[str]) -> int | None:
+    def _best_title_tail_distance(cls, *, matched_keywords: list[_KeywordSpec], texts: list[str]) -> int | None:
         best_distance: int | None = None
         for keyword in matched_keywords:
             distance = cls._keyword_tail_distance(keyword=keyword, texts=texts)
@@ -291,7 +297,7 @@ class ProductFilterAssignmentService:
                     slug=slug,
                     label=label or slug,
                     local_keywords=[
-                        normalized
+                        _KeywordSpec(normalized)
                         for normalized in (
                             normalize_keyword(str(row.keyword or "").strip())
                             for row in entity.local_category_keywords
@@ -299,7 +305,7 @@ class ProductFilterAssignmentService:
                         if normalized
                     ],
                     title_keywords=[
-                        normalized
+                        _KeywordSpec(normalized)
                         for normalized in (
                             normalize_keyword(str(row.keyword or "").strip())
                             for row in entity.title_keywords
@@ -353,8 +359,8 @@ class ProductFilterAssignmentService:
                 manual_rank=manual_rank,
                 match_score=match_score,
                 title_tail_distance=title_tail_distance,
-                matched_local_keywords=matched_local_keywords,
-                matched_title_keywords=matched_title_keywords,
+                matched_local_keywords=[keyword.text for keyword in matched_local_keywords],
+                matched_title_keywords=[keyword.text for keyword in matched_title_keywords],
             )
             if best is None:
                 best = candidate

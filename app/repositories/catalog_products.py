@@ -420,7 +420,12 @@ class CatalogProductRepository:
         return (
             self.session.query(Product)
             .options(
-                load_only(Product.id, Product.lifecycle_status, Product.dedup_status),
+                # gender нужен для подбора раздела, primary_listing — для пола источника.
+                # Без них каждая строка порождает отдельный запрос на товар.
+                load_only(Product.id, Product.lifecycle_status, Product.dedup_status, Product.gender),
+                joinedload(Product.primary_listing)
+                .joinedload(ProductListing.source)
+                .load_only(Source.id, Source.key),
                 selectinload(Product.memberships)
                 .selectinload(ProductListingMember.listing)
                 .load_only(

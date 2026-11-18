@@ -356,7 +356,8 @@ class MediaAssetService:
     def _encode_variant(image: Image.Image, *, fmt: str, quality: int) -> bytes:
         buffer = BytesIO()
         if fmt == "webp":
-            image.save(buffer, "WEBP", quality=quality, method=4)
+            # method=2 — заметно быстрее method=4 при том же размере файла.
+            image.save(buffer, "WEBP", quality=quality, method=2)
         elif fmt == "jpeg":
             if image.mode in {"RGBA", "LA", "P"}:
                 background = Image.new("RGB", image.size, (255, 255, 255))
@@ -408,8 +409,10 @@ class MediaAssetService:
                 normalized_format = self._normalize_variant_format(fmt, has_alpha=has_alpha)
 
                 if target_width and target_width < source_width:
+                    # thumbnail с reducing_gap уменьшает изображение быстрым
+                    # JPEG-ресайзом, а не перебором всех пикселей LANCZOS.
                     target_height = max(1, round(source_height * target_width / source_width))
-                    image = image.resize((target_width, target_height), Image.LANCZOS)
+                    image.thumbnail((target_width, target_height), Image.LANCZOS, reducing_gap=2.0)
                 elif target_width and target_width > source_width:
                     # Увеличивать нельзя: это потеря качества, а не экономия.
                     target_width = source_width

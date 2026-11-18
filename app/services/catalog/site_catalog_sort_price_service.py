@@ -55,7 +55,10 @@ class SiteCatalogSortPriceService:
             product.site_sort_price_synced_at = synced_at
         self.db.flush()
         if commit:
-            DesignerCatalogSyncService(self.db).reconcile(sync_product_links=False)
+            # Реконсиляция дизайнеров и видимости здесь не нужна: цена не влияет
+            # ни на связи товар↔дизайнер, ни на скрытие товара, а её пересчёт
+            # стоит целого прохода по каталогу на каждую пачку цен.
+            # Связи и видимость поддерживаются при импорте, правке товара и в админке.
             self.db.commit()
         return len(products)
 
