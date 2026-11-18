@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from sqlalchemy import func, inspect, or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models import (
@@ -152,15 +152,18 @@ class AdminEditorService:
         query = (
             self.db.query(Product)
             .options(
+                # Связи-множества грузятся отдельными запросами: совместный
+                # JOIN размножил бы строки по числу картинок, вариантов и
+                # листингов, а это десятки тысяч строк на одну выдачу.
                 joinedload(Product.designer),
                 joinedload(Product.presentation),
-                joinedload(Product.gallery_images),
                 joinedload(Product.primary_listing).joinedload(ProductListing.source).joinedload(Source.setting),
-                joinedload(Product.primary_listing).joinedload(ProductListing.images),
-                joinedload(Product.primary_listing).joinedload(ProductListing.variants),
-                joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.source).joinedload(Source.setting),
-                joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.images),
-                joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.variants),
+                joinedload(Product.primary_listing).selectinload(ProductListing.images),
+                joinedload(Product.primary_listing).selectinload(ProductListing.variants),
+                selectinload(Product.gallery_images),
+                selectinload(Product.memberships).selectinload(ProductListingMember.listing).joinedload(ProductListing.source).joinedload(Source.setting),
+                selectinload(Product.memberships).selectinload(ProductListingMember.listing).selectinload(ProductListing.images),
+                selectinload(Product.memberships).selectinload(ProductListingMember.listing).selectinload(ProductListing.variants),
             )
             .filter(Product.lifecycle_status == "active")
         )
