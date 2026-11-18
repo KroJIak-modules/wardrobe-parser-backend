@@ -153,9 +153,14 @@ class AdminEditorService:
             self.db.query(Product)
             .options(
                 joinedload(Product.designer),
-                joinedload(Product.primary_listing).joinedload(ProductListing.source),
+                joinedload(Product.presentation),
+                joinedload(Product.gallery_images),
+                joinedload(Product.primary_listing).joinedload(ProductListing.source).joinedload(Source.setting),
                 joinedload(Product.primary_listing).joinedload(ProductListing.images),
-                joinedload(Product.memberships).joinedload(ProductListingMember.listing),
+                joinedload(Product.primary_listing).joinedload(ProductListing.variants),
+                joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.source).joinedload(Source.setting),
+                joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.images),
+                joinedload(Product.memberships).joinedload(ProductListingMember.listing).joinedload(ProductListing.variants),
             )
             .filter(Product.lifecycle_status == "active")
         )
