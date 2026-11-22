@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import timezone
+from email.utils import formatdate, parsedate_to_datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Cookie, Depends, Header, Query, Request, Response
@@ -186,6 +188,7 @@ def get_site_questions(db: Session = Depends(get_db)) -> SiteQuestionsResponse:
 @router.get("/media/{asset_id}/file")
 def get_site_media_file(
     asset_id: int,
+    request: Request,
     w: int | None = Query(default=None, ge=64, le=4000),
     q: int = Query(default=82, ge=40, le=100),
     fm: str | None = Query(default=None),
@@ -205,6 +208,7 @@ def get_site_media_file(
                 path=variant_path,
                 mime_type=variant_mime,
                 via_nginx=str(x_accel_enabled or "").strip() == "1",
+                request=request,
             )
 
     file_path = media_service.resolve_file_path(asset)
@@ -212,17 +216,28 @@ def get_site_media_file(
         path=file_path,
         mime_type=asset.mime_type,
         via_nginx=str(x_accel_enabled or "").strip() == "1",
+        request=request,
     )
 
 
-def _media_file_response(*, path: Path, mime_type: str, via_nginx: bool) -> Response:
+def _media_file_response(
+    *,
+    path: Path,
+    mime_type: str,
+    via_nginx: bool,
+    request: Request | None = None,
+) -> Response:
     """Отдать файл витрины.
 
     Когда запрос прошёл через nginx, файл отдаёт сам nginx: приложение только
     проверяет доступ и отвечает внутренним редиректом. Так изображение не
     проходит через Python и уходит клиенту напрямую с диска.
+
+    Кэш короткий: фото в админке меняют, и старая картинка не должна жить в
+    браузере неделями. Вместо долгого срока отдаём ETag, поэтому браузер
+    после истечения кэша спрашивает условным запросом и получает 304 без тела.
     """
-    cache_control = {"Cache-Control": "private, max-age=604800"}
+    cache_control = {"Cache-Control": "private, max-age=300, must-revalidate"}
     if via_nginx:
         internal_path = MediaAssetService.internal_media_path(path)
         if internal_path is not None:
@@ -233,4 +248,36 @@ def _media_file_response(*, path: Path, mime_type: str, via_nginx: bool) -> Resp
                 media_type=mime_type,
                 headers={"X-Accel-Redirect": internal_path},
             )
-    return FileResponse(path, media_type=mime_type, headers=cache_control)
+
+    stat = path.stat()
+    etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+    headers = {
+        **cache_control,
+        "ETag": etag,
+        "Last-Modified": formatdate(stat.st_mtime, usegmt=True),
+    }
+    if request is not None and _media_not_modified(request, etag=etag, mtime=stat.st_mtime):
+        return Response(status_code=304, headers=headers)
+
+    return FileResponse(path, media_type=mime_type, headers=headers)
+
+
+def _media_not_modified(request: Request, *, etag: str, mtime: float) -> bool:
+    """Проверить условный запрос клиента: файл не менялся — отвечаем 304."""
+    if_none_match = str(request.headers.get("if-none-match") or "").strip()
+    if if_none_match:
+        candidates = {item.strip() for item in if_none_match.split(",")}
+        return etag in candidates or "*" in candidates
+
+    if_modified_since = str(request.headers.get("if-modified-since") or "").strip()
+    if not if_modified_since:
+        return False
+
+    try:
+        since = parsedate_to_datetime(if_modified_since)
+    except (TypeError, ValueError):
+        return False
+
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    return int(mtime) <= int(since.timestamp())
