@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 import logging
 import mimetypes
 import secrets
@@ -291,6 +291,23 @@ class MediaAssetService:
 
     def resolve_file_path(self, asset: ImageAsset) -> Path:
         return self._ROOT_DIR / str(asset.storage_key or "").strip()
+
+    @classmethod
+    def internal_media_path(cls, path: Path) -> str | None:
+        """Внутренний путь файла для отдачи через nginx.
+
+        nginx отдаёт такой файл сам, без участия приложения. Возвращаем
+        None, если файл лежит вне каталога загрузок: отдать его через
+        nginx тогда нельзя.
+        """
+        try:
+            relative = Path(path).resolve().relative_to(cls._ROOT_DIR.resolve())
+        except (ValueError, OSError):
+            return None
+        parts = [quote(part) for part in relative.parts if part not in ("", ".")]
+        if not parts:
+            return None
+        return "/internal/site-media/" + "/".join(parts)
 
     # ------------------------------------------------------------------
     # Выдача оптимизированных копий для витрины

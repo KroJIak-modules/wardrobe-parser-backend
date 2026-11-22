@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Cookie, Depends, Query, Request, Response
+from pathlib import Path
+
+from fastapi import APIRouter, Cookie, Depends, Header, Query, Request, Response
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -182,8 +184,9 @@ def get_site_media_file(
     q: int = Query(default=82, ge=40, le=100),
     fm: str | None = Query(default=None),
     site_access_token: str | None = Cookie(default=None, alias=SITE_ACCESS_COOKIE_NAME),
+    x_accel_enabled: str | None = Header(default=None, alias="X-Accel-Enabled"),
     db: Session = Depends(get_db),
-) -> FileResponse:
+) -> Response:
     SiteAccessService(db).require_media_access(asset_id, site_access_token)
     service = SiteQueryService(db)
     asset = service.site_media_asset(asset_id)
@@ -192,11 +195,36 @@ def get_site_media_file(
         variant = media_service.render_variant_file(asset, width=w, quality=q, fmt=fm)
         if variant is not None:
             variant_path, variant_mime = variant
-            return FileResponse(
-                variant_path,
-                media_type=variant_mime,
-                headers={"Cache-Control": "private, max-age=604800"},
+            return _media_file_response(
+                path=variant_path,
+                mime_type=variant_mime,
+                via_nginx=str(x_accel_enabled or "").strip() == "1",
             )
 
     file_path = media_service.resolve_file_path(asset)
-    return FileResponse(file_path, media_type=asset.mime_type)
+    return _media_file_response(
+        path=file_path,
+        mime_type=asset.mime_type,
+        via_nginx=str(x_accel_enabled or "").strip() == "1",
+    )
+
+
+def _media_file_response(*, path: Path, mime_type: str, via_nginx: bool) -> Response:
+    """Отдать файл витрины.
+
+    Когда запрос прошёл через nginx, файл отдаёт сам nginx: приложение только
+    проверяет доступ и отвечает внутренним редиректом. Так изображение не
+    проходит через Python и уходит клиенту напрямую с диска.
+    """
+    cache_control = {"Cache-Control": "private, max-age=604800"}
+    if via_nginx:
+        internal_path = MediaAssetService.internal_media_path(path)
+        if internal_path is not None:
+            # Кэширование ответа задаёт nginx в своей внутренней локации,
+            # поэтому здесь его не дублируем.
+            return Response(
+                content=b"",
+                media_type=mime_type,
+                headers={"X-Accel-Redirect": internal_path},
+            )
+    return FileResponse(path, media_type=mime_type, headers=cache_control)
