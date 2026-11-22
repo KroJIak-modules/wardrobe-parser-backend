@@ -27,6 +27,11 @@ from app.services.catalog.designer_support import normalize_designer_text, slugi
 from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
 from app.services.catalog.product_query_service import ProductQueryService
 from app.services.catalog.product_visibility_service import ProductVisibilityService
+from app.services.catalog.showcase_state_cache import (
+    DESIGNER_STATE_CACHE_KEY,
+    TAXONOMY_STATE_CACHE_KEY,
+    state_cache,
+)
 from app.services.catalog.taxonomy_service import TaxonomyService
 
 
@@ -271,6 +276,7 @@ class AdminEditorService:
         sync = DesignerCatalogSyncService(self.db)
         if reconcile:
             sync.reconcile(sync_product_links=False)
+            state_cache().invalidate()
         count_by_source_name = sync.source_brand_product_counts()
         mapping_rows = self.db.query(DesignerSourceName).all()
         mapping_by_source_name = {
@@ -446,6 +452,7 @@ class AdminEditorService:
 
         self.db.flush()
         self._designer_editor_state_cache = None
+        state_cache().invalidate()
         return self.list_designer_editor_state(reconcile=False)
 
     def delete_designer(self, designer_id: int) -> dict:
@@ -495,6 +502,7 @@ class AdminEditorService:
         ProductVisibilityService(self.db).refresh_source_brands(affected_source_brands)
         self.db.flush()
         self._designer_editor_state_cache = None
+        state_cache().invalidate()
         return self.list_designer_editor_state(reconcile=False)
 
     def set_designer_source_enabled(self, *, source_brand: str, include_in_designers: bool) -> dict:
@@ -523,12 +531,28 @@ class AdminEditorService:
         ProductVisibilityService(self.db).refresh_source_brands(source_names)
         self.db.flush()
         self._designer_editor_state_cache = None
+        state_cache().invalidate()
         return {
             "source_brand": normalized_source_brand,
             "include_in_designers": bool(include_in_designers),
         }
 
     def list_taxonomy_editor_state(self) -> dict:
+        cached = state_cache().get(TAXONOMY_STATE_CACHE_KEY)
+        if isinstance(cached, dict):
+            taxonomy_payload = cached
+        else:
+            taxonomy_payload = self._build_taxonomy_payload()
+            state_cache().set(TAXONOMY_STATE_CACHE_KEY, taxonomy_payload)
+        return self._with_designer_directory(taxonomy_payload)
+
+    def _build_taxonomy_payload(self) -> dict:
+        """Таксономия витрины: разделы, категории, каталоги и скрытые товары.
+
+        Считается один раз на процесс: сборка стоит около двух секунд,
+        а витрина запрашивает её в каждом HTTP-запросе. Меняется только
+        при правках в админке, которые сбрасывают кэш.
+        """
         filters_state = self.taxonomy.get_state()
         filter_assignment_rebuild = ProductFilterAssignmentService(self.db).get_rebuild_status()
         filter_rows = self.taxonomy.repo.list_filters()
@@ -670,6 +694,29 @@ class AdminEditorService:
 
         categories_payload = self._sort_category_payloads(categories_payload)
 
+        return {
+            "filters": filters_payload,
+            "categories": categories_payload,
+            "custom_catalogs": custom_catalogs_payload,
+            "filter_assignment_rebuild": filter_assignment_rebuild,
+            "hidden_product_ids": [
+                int(product_id)
+                for product_id, in (
+                    self.db.query(Product.id)
+                    .filter(Product.lifecycle_status == "active")
+                    .filter(Product.visibility_status == "hidden")
+                    .order_by(Product.id.asc())
+                    .all()
+                )
+            ],
+        }
+
+    def _with_designer_directory(self, taxonomy_payload: dict) -> dict:
+        """Дополнить таксономию каталогом дизайнеров.
+
+        Счётчики по брендам считаются заново: новый бренд должен появиться
+        в списке сразу, а не после истечения срока кэша.
+        """
         designer_state = self.list_designer_editor_state()
         product_count_by_designer = defaultdict(int)
         for row in designer_state["rows"]:
@@ -690,21 +737,8 @@ class AdminEditorService:
         designer_directory.sort(key=lambda item: (str(item["label"]), str(item["id"])))
 
         return {
-            "filters": filters_payload,
-            "categories": categories_payload,
-            "custom_catalogs": custom_catalogs_payload,
+            **taxonomy_payload,
             "designer_directory": designer_directory,
-            "filter_assignment_rebuild": filter_assignment_rebuild,
-            "hidden_product_ids": [
-                int(product_id)
-                for product_id, in (
-                    self.db.query(Product.id)
-                    .filter(Product.lifecycle_status == "active")
-                    .filter(Product.visibility_status == "hidden")
-                    .order_by(Product.id.asc())
-                    .all()
-                )
-            ],
         }
 
     def get_filter_assignment_rebuild_status(self) -> dict:
@@ -927,4 +961,5 @@ class AdminEditorService:
         self.db.flush()
         # Скрытие товаров меняет публичные счётчики брендов.
         self._designer_editor_state_cache = None
+        state_cache().invalidate()
         return self.list_taxonomy_editor_state()

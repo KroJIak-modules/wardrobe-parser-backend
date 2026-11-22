@@ -36,6 +36,7 @@ from app.schemas.taxonomy import (
     TaxonomyWriteState,
 )
 from app.services.catalog.filter_assignment_service import ProductFilterAssignmentService
+from app.services.catalog.showcase_state_cache import state_cache
 
 
 @dataclass(frozen=True, slots=True)
@@ -756,6 +757,8 @@ class TaxonomyService:
                     )
 
             self._schedule_filter_assignment_update(filter_assignment_update_plan)
+            # Таксономия изменилась — состояние витрины пересчитать заново.
+            state_cache().invalidate()
             if commit:
                 self.db.commit()
         except HTTPException:

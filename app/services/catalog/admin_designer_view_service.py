@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import NotFoundError
@@ -10,6 +12,7 @@ from app.repositories.admin_designer_views import AdminDesignerViewRepository
 from app.repositories.catalog_again import AdminAgainViewRepository
 from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSyncService
 from app.services.catalog.designer_support import normalize_designer_text
+from app.services.catalog.showcase_state_cache import state_cache
 
 
 class AdminDesignerViewService:
@@ -20,6 +23,10 @@ class AdminDesignerViewService:
         self.again_views = AdminAgainViewRepository(db)
 
     def apply_new_flags_to_editor_payload(self, payload: dict) -> dict:
+        # Payload может прийти из кэша состояния витрины, а флаги is_new и
+        # is_again вычисляются для конкретного администратора и меняют его
+        # содержимое. Поэтому работаем с копией, иначе флаги залипнут в кэше.
+        payload = copy.deepcopy(payload)
         rows = payload.get("rows") if isinstance(payload, dict) else None
         designers = payload.get("designers") if isinstance(payload, dict) else None
         if not isinstance(rows, list) or not isinstance(designers, list):
@@ -90,6 +97,7 @@ class AdminDesignerViewService:
             raise NotFoundError("Бренд-источник не найден")
         self.views.mark_brand_viewed(admin_user_id=self.admin_user_id, source_name=normalized_brand)
         self.db.commit()
+        state_cache().invalidate()
 
     def mark_designer_viewed(self, designer_id: int) -> None:
         designer_exists = (
@@ -99,13 +107,16 @@ class AdminDesignerViewService:
             raise NotFoundError("Дизайнер не найден")
         self.views.mark_designer_viewed(admin_user_id=self.admin_user_id, designer_id=int(designer_id))
         self.db.commit()
+        state_cache().invalidate()
 
     def mark_all_brands_viewed(self) -> int:
         marked = self.views.mark_all_brands_viewed(admin_user_id=self.admin_user_id)
         self.db.commit()
+        state_cache().invalidate()
         return marked
 
     def mark_all_designers_viewed(self) -> int:
         marked = self.views.mark_all_designers_viewed(admin_user_id=self.admin_user_id)
         self.db.commit()
+        state_cache().invalidate()
         return marked

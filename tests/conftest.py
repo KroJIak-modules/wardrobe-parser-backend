@@ -15,6 +15,19 @@ def _quoted_ident(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+@pytest.fixture(autouse=True)
+def _reset_showcase_state_cache():
+    """Кэш состояния витрины живёт в процессе, а тесты меняют каталог напрямую.
+
+    Без сброса тест наследует состояние предыдущего.
+    """
+    from app.services.catalog.showcase_state_cache import state_cache
+
+    state_cache().invalidate()
+    yield
+    state_cache().invalidate()
+
+
 def _maintenance_url(database_url: str) -> URL:
     url = make_url(database_url)
     maintenance_db = "postgres" if (url.database or "").strip() != "postgres" else "template1"

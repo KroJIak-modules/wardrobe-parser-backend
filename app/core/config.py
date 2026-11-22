@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     dedup_bucket_product_cap: int = Field(default=50, ge=2, le=500, validation_alias="DEDUP_BUCKET_PRODUCT_CAP")
     dedup_pair_scan_cap: int = Field(default=25000, ge=100, le=1_000_000, validation_alias="DEDUP_PAIR_SCAN_CAP")
     pricing_bybit_rate_auto_enabled: bool = Field(default=True)
+    showcase_state_cache_ttl_sec: int = Field(default=60, ge=1, le=3600, validation_alias="SHOWCASE_STATE_CACHE_TTL_SEC")
     pricing_bybit_rate_cache_sec: int = Field(default=300, ge=30, le=86400)
     pricing_bybit_rate_timeout_sec: float = Field(default=12.0, ge=1.0, le=60.0)
     pricing_bybit_fiat: str = Field(default="RUB", validation_alias="PRICING_BYBIT_FIAT")

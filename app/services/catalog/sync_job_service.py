@@ -19,6 +19,7 @@ from app.services.catalog.designer_catalog_sync_service import DesignerCatalogSy
 from app.services.catalog.sync_error_humanizer import humanize_sync_error, normalize_sync_error_code
 from app.services.catalog.product_ingest_service import ProductIngestService
 from app.services.catalog.source_registry_service import SourceRegistryService
+from app.services.catalog.showcase_state_cache import state_cache
 
 
 LOGGER = logging.getLogger(__name__)
@@ -603,6 +604,9 @@ class SyncJobService:
                     job.current_stage_detail = "Все выбранные источники обработаны"
                 job.current_stage_updated_at = cls._utcnow()
             DesignerCatalogSyncService(db).reconcile(sync_product_links=True, track_reappearance=True)
+            # Реконсиляция меняет состав дизайнеров и счётчики по брендам —
+            # кэш состояния витрины сбрасываем явно, а не ждём истечения срока.
+            state_cache().invalidate()
             db.commit()
         except Exception as exc:
             db.rollback()

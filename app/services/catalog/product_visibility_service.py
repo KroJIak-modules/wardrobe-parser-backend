@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.models import DesignerSourceName, Product, ProductListing, ProductPresentation, SourceSetting
 from app.services.catalog.designer_support import normalize_designer_text
+from app.services.catalog.showcase_state_cache import state_cache
 
 
 class ProductVisibilityService:
@@ -70,6 +71,10 @@ class ProductVisibilityService:
                 product.visibility_status = expected_status
                 changed_product_ids.append(int(product.id))
         self.db.flush()
+        if changed_product_ids:
+            # Публичность товаров изменилась — счётчики по брендам в кэше
+            # состояния витрины больше не действительны.
+            state_cache().invalidate()
         return changed_product_ids
 
     def refresh_source_ids(self, source_ids: Iterable[int]) -> list[int]:
