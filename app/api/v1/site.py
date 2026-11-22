@@ -158,8 +158,14 @@ def quote_site_cart(
 
 
 @router.get("/designers", response_model=SiteDesignersResponse, dependencies=[Depends(require_site_access)])
-def get_site_designers(db: Session = Depends(get_db)) -> SiteDesignersResponse:
-    return SiteQueryService(db).designers()
+def get_site_designers(
+    designer: str = Query(default="", description="Выбранные дизайнеры через запятую"),
+    db: Session = Depends(get_db),
+) -> SiteDesignersResponse:
+    # Выбранных дизайнеров показываем в списке, даже если у них сейчас нет
+    # публичных товаров: иначе выбор нельзя ни увидеть, ни снять.
+    selected_slugs = [item.strip() for item in str(designer or "").split(",") if item.strip()]
+    return SiteQueryService(db).designers(selected_slugs=selected_slugs)
 
 
 @router.get("/products/{product_path}", response_model=SiteProductResponse, dependencies=[Depends(require_site_access)])

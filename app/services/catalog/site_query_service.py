@@ -900,8 +900,8 @@ class SiteQueryService:
             image_url=self._site_catalog_image_url(row),
         )
 
-    def designers(self) -> SiteDesignersResponse:
-        payload = self.preview.designers_directory()
+    def designers(self, *, selected_slugs: Iterable[str] = ()) -> SiteDesignersResponse:
+        payload = self.preview.designers_directory(selected_slugs=selected_slugs)
         return SiteDesignersResponse(
             alphabet=[str(item) for item in payload.get("alphabet") or []],
             entries=[

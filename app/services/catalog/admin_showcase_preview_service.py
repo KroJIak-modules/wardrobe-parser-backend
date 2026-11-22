@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Iterable, Literal
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -270,8 +270,22 @@ class AdminShowcasePreviewService:
             return first
         return "#"
 
-    def _build_designers_directory_entries(self) -> list[dict]:
+    def _designer_labels_by_slug(self) -> dict[str, str]:
+        """Названия всех дизайнеров по их slug."""
+        labels: dict[str, str] = {}
+        for designer in self.designer_state.get("designers") or []:
+            if not isinstance(designer, dict):
+                continue
+            designer_id = str(designer.get("id") or "").strip()
+            slug = str(self.designer_slugs_by_id.get(designer_id) or "").strip()
+            label = self._normalize_text(designer.get("name"))
+            if slug and label:
+                labels.setdefault(slug, label)
+        return labels
+
+    def _build_designers_directory_entries(self, selected_slugs: Iterable[str] = ()) -> list[dict]:
         entries = []
+        seen_slugs: set[str] = set()
         for item in self.taxonomy_state.get("designer_directory") or []:
             label = self._normalize_text(item.get("label"))
             slug = self._designer_slug_from_directory_item(item)
@@ -285,11 +299,34 @@ class AdminShowcasePreviewService:
                     "letter": self._letter_for_designer(label),
                 }
             )
+            seen_slugs.add(slug)
+        # Выбранные дизайнеры показываем всегда. В каталоге бренд с выключенным
+        # отображением или без публичных товаров в список дизайнеров не попадает,
+        # но выбор пользователя обязан быть виден и подчёркнут.
+        missing = [
+            str(slug).strip()
+            for slug in selected_slugs
+            if str(slug).strip() and str(slug).strip() not in seen_slugs
+        ]
+        if missing:
+            labels_by_slug = self._designer_labels_by_slug()
+            for slug in missing:
+                label = labels_by_slug.get(slug)
+                if not label:
+                    continue
+                entries.append(
+                    {
+                        "id": "",
+                        "slug": slug,
+                        "label": label,
+                        "letter": self._letter_for_designer(label),
+                    }
+                )
         entries.sort(key=lambda item: (str(item["label"]).casefold(), str(item["slug"])))
         return entries
 
-    def designers_directory(self) -> dict:
-        entries = self._build_designers_directory_entries()
+    def designers_directory(self, selected_slugs: Iterable[str] = ()) -> dict:
+        entries = self._build_designers_directory_entries(selected_slugs=selected_slugs)
         available = {str(entry["letter"]) for entry in entries}
         alphabet = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
         if "#" in available:
