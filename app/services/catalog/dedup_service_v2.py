@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from decimal import Decimal
 from difflib import SequenceMatcher
+import re
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -17,6 +18,26 @@ from app.services.catalog.site_catalog_sort_price_service import SiteCatalogSort
 
 class DedupServiceV2:
     _DECISION_ACTIONS = {"combine", "keep_left", "keep_right", "reject"}
+    _EVIDENCE_STOP_WORDS = frozenset("the and for with from this that made size sizes measurements measurement shoulder chest sleeve length waist returns return shipping delivery product collection model black white grey blue brown red green cotton polyester leather jacket shirt hoodie pants jeans material fabric fit small medium large inch inches sale drop new arrival group mens womens men women unisex".split())
+    _EVIDENCE_TOKEN_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
+
+    @classmethod
+    def _evidence_words(cls, text: str | None) -> set[str]:
+        return {word for word in cls._EVIDENCE_TOKEN_RE.findall(str(text or "").casefold()) if word not in cls._EVIDENCE_STOP_WORDS}
+
+    @classmethod
+    def _evidence_tags(cls, tags: Any) -> set[str]:
+        if not isinstance(tags, list):
+            return set()
+        result: set[str] = set()
+        for raw in tags:
+            tag = cls._norm(str(raw))
+            if not tag or re.search(r"\d|:|%", tag):
+                continue
+            words = cls._evidence_words(tag)
+            if words:
+                result.add(" ".join(sorted(words)))
+        return result
 
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -157,6 +178,8 @@ class DedupServiceV2:
             "designer_name": designer_name,
             "source_designer_name": source_designer_name,
             "display_designer_name": designer_name or source_designer_name,
+            "source_description_text": str(getattr(row, "source_description_text", "") or ""),
+            "source_tags": getattr(row, "source_tags", None) or [],
             "url": (str(getattr(row, "url", "") or "").strip() or None) if ingest_mode != "manual" else None,
             "price_summary": self._row_price_summary(
                 price=variant_price,
@@ -197,6 +220,8 @@ class DedupServiceV2:
             "designer_name": designer_name,
             "source_designer_name": source_designer_name,
             "display_designer_name": designer_name or source_designer_name,
+            "source_description_text": str(getattr(listing, "source_description_text", "") or ""),
+            "source_tags": getattr(listing, "source_tags", None) or [],
             "url": (str(getattr(listing, "url", "") or "").strip() or None) if listing is not None and ingest_mode != "manual" else None,
             "price_summary": self._source_price_summary_for_listing(listing),
             "visibility_status": str(getattr(product, "visibility_status", "") or "visible"),
@@ -242,6 +267,16 @@ class DedupServiceV2:
         if left.get("effective_weight_grams") and right.get("effective_weight_grams") and left["effective_weight_grams"] == right["effective_weight_grams"]:
             reasons.append("same_weight")
             ratio += 0.05
+        title_words = self._evidence_words(left_title) | self._evidence_words(right_title)
+        description_words = (self._evidence_words(left.get("source_description_text")) & self._evidence_words(right.get("source_description_text"))) - title_words
+        shared_tags = self._evidence_tags(left.get("source_tags")) & self._evidence_tags(right.get("source_tags"))
+        # Do not reward a description word again when the same word is a tag.
+        shared_tags = {tag for tag in shared_tags if not set(tag.split()) <= (description_words | title_words)}
+        if description_words:
+            reasons.append("shared_description_words")
+        if shared_tags:
+            reasons.append("shared_source_tags")
+        ratio += min(0.075, min(0.04, 0.01 * len(description_words)) + min(0.04, 0.01 * len(shared_tags)))
         return min(ratio, 0.99), reasons
 
     @staticmethod

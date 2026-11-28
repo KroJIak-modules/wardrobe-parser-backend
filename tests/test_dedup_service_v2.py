@@ -5,6 +5,31 @@ from types import SimpleNamespace
 from app.services.catalog.dedup_service_v2 import DedupServiceV2
 
 
+def test_description_and_tags_add_at_most_0075_without_double_counting():
+    service = DedupServiceV2.__new__(DedupServiceV2)
+    left = {"title": "Special bomber", "source_description_text": "embroidered dragon detachable asymmetric metallic", "source_tags": ["quilted", "reversible", "oversized", "distressed", "embroidered"]}
+    right = {**left}
+    # Use different titles to avoid the 0.99 overall score ceiling.
+    left["title"] = "Special bomber jacket"
+    right["title"] = "Special bomber coat"
+    baseline, _ = service._candidate_score({"title": left["title"]}, {"title": right["title"]})
+    score, reasons = service._candidate_score(left, right)
+    assert abs(score - baseline - 0.075) < 1e-9
+    assert "shared_description_words" in reasons
+    assert "shared_source_tags" in reasons
+
+
+def test_evidence_excludes_title_and_service_tags():
+    service = DedupServiceV2.__new__(DedupServiceV2)
+    left = {"title": "Dragon bomber jacket", "source_description_text": "Dragon bomber jacket size cotton", "source_tags": ["BF26-50", "group:1", "new-arrival"]}
+    right = {**left, "title": "Dragon bomber coat"}
+    score, reasons = service._candidate_score(left, right)
+    baseline, _ = service._candidate_score({"title": left["title"]}, {"title": right["title"]})
+    assert score == baseline
+    assert "shared_description_words" not in reasons
+    assert "shared_source_tags" not in reasons
+
+
 def _product(product_id: int, *, primary_listing_id: int) -> SimpleNamespace:
     return SimpleNamespace(
         id=int(product_id),

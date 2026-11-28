@@ -574,6 +574,8 @@ class CatalogProductRepository:
                 ProductListing.ingest_mode.label("ingest_mode"),
                 ProductListing.url.label("url"),
                 ProductListing.source_title.label("source_title"),
+                ProductListing.source_description_text.label("source_description_text"),
+                ProductListing.source_tags.label("source_tags"),
                 ProductListing.source_designer_raw.label("source_designer_raw"),
                 ProductListing.source_weight_grams.label("source_weight_grams"),
                 SourceSetting.show_images.label("show_images"),
